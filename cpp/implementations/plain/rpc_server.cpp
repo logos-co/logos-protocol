@@ -44,12 +44,22 @@ bool RpcServerTcp::start()
 
 void RpcServerTcp::stop()
 {
-    std::lock_guard<std::mutex> g(m_mu);
-    m_stopped = true;
-    boost::system::error_code ignore;
-    m_acceptor.close(ignore);
-    for (auto& c : m_conns) c->stop("server stopped");
-    m_conns.clear();
+    // Move the connection list OUT under the lock, then release it before
+    // stopping each connection. conn->stop() fails the connection, which
+    // synchronously invokes its error handler (set in doAccept) — and that
+    // handler locks m_mu to erase itself from m_conns. Holding m_mu across the
+    // stop() call would re-enter this non-recursive mutex on the same thread and
+    // self-deadlock. The handler's erase is then a harmless no-op (the list it
+    // scans is already empty).
+    std::vector<std::shared_ptr<TcpConnection>> conns;
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_stopped = true;
+        boost::system::error_code ignore;
+        m_acceptor.close(ignore);
+        conns.swap(m_conns);
+    }
+    for (auto& c : conns) c->stop("server stopped");
 }
 
 void RpcServerTcp::doAccept()
@@ -118,12 +128,17 @@ bool RpcServerSsl::start()
 
 void RpcServerSsl::stop()
 {
-    std::lock_guard<std::mutex> g(m_mu);
-    m_stopped = true;
-    boost::system::error_code ignore;
-    m_acceptor.close(ignore);
-    for (auto& c : m_conns) c->stop("server stopped");
-    m_conns.clear();
+    // See RpcServerTcp::stop — release m_mu before stopping connections so the
+    // per-connection error handler (which re-locks m_mu) can't self-deadlock.
+    std::vector<std::shared_ptr<SslConnection>> conns;
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_stopped = true;
+        boost::system::error_code ignore;
+        m_acceptor.close(ignore);
+        conns.swap(m_conns);
+    }
+    for (auto& c : conns) c->stop("server stopped");
 }
 
 void RpcServerSsl::doAccept()

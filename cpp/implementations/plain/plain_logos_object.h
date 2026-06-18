@@ -5,6 +5,8 @@
 
 #include "rpc_connection.h"
 
+#include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,10 +53,25 @@ public:
     quintptr id() const override;
 
 private:
+    // Deferred ("multi") completion rendezvous. A multi provider returns a
+    // pending sentinel (logos::pendingCallKey) from callMethod and later pushes
+    // the real result as a logos::callCompleteEvent event keyed by callId. We
+    // subscribe to that event EAGERLY (before any call can defer) so a completion
+    // racing ahead of the waiter is buffered, then block the caller until the
+    // matching callId lands. The completion arrives on the connection's IO
+    // thread; the caller waits on another thread — m_completionMu/Cv bridge them.
+    void ensureCompletionSub();
+    QVariant awaitCompletion(const QString& callId, int timeoutMs);
+
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;
     std::mutex                           m_mu;
     std::vector<std::pair<QString, EventCallback>> m_subs;
+
+    std::mutex                           m_completionMu;
+    std::condition_variable              m_completionCv;
+    std::map<QString, QVariant>          m_completions;
+    bool                                 m_completionSubscribed = false;
 };
 
 } // namespace logos::plain

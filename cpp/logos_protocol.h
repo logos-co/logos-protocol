@@ -50,9 +50,15 @@
  * =========================================================================== */
 
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
-#define LOGOS_PROTOCOL_VERSION_MINOR 1
+// 0.2: per-module concurrent dispatch ("multi"). Additive/back-compatible — a
+// multi module returns a deferred-completion sentinel from callMethod and pushes
+// the result as a __logos_call_complete__ event (see logos_async_dispatch.h);
+// the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
+// load and forward multi modules without modification. A pre-0.2 *consumer*
+// would see the raw sentinel rather than awaiting it — graceful, not a crash.
+#define LOGOS_PROTOCOL_VERSION_MINOR 2
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.1.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.2.0"
 
 #ifdef __cplusplus
 extern "C" {

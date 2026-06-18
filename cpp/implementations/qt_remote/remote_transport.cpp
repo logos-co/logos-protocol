@@ -1,15 +1,18 @@
 #include "remote_transport.h"
+#include "../../logos_async_dispatch.h"
 #include <QRemoteObjectRegistryHost>
 #include <QRemoteObjectNode>
 #include <QRemoteObjectReplica>
 #include <QRemoteObjectPendingCall>
 #include <QRemoteObjectPendingCallWatcher>
 #include <QTimer>
+#include <QEventLoop>
 #include <QDebug>
 #include <QUrl>
 #include <QMetaObject>
 #include <QTime>
 #include <QJsonArray>
+#include <QVariantMap>
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 
@@ -51,6 +54,28 @@ public:
         : m_replica(replica), m_helper(nullptr)
     {
         qDebug() << "[LogosObject] Created RemoteLogosObject wrapping QRemoteObjectReplica" << reinterpret_cast<quintptr>(replica);
+        if (m_replica) {
+            // Eager event wiring — a deferred ("multi") call's result arrives as a
+            // completion event, so the channel must be live even when the caller
+            // never subscribes to a user event. onEvent() reuses this same helper.
+            m_helper = new RemoteEventHelper();
+            QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
+                             m_helper, SLOT(onEventResponse(QString,QVariantList)));
+            m_helper->addCallback(logos::callCompleteEvent(),
+                [this](const QString&, const QVariantList& data) {
+                    if (data.size() != 2) return;
+                    const QString id = data.at(0).toString();
+                    const QVariant result = data.at(1);
+                    m_completions.insert(id, result);
+                    if (QEventLoop* loop = m_completionWaiters.value(id, nullptr))
+                        loop->quit();                       // wake a sync waiter
+                    if (m_asyncCompletionCbs.contains(id)) {  // fire an async waiter
+                        auto cb = m_asyncCompletionCbs.take(id);
+                        m_completions.remove(id);
+                        if (cb) cb(result);
+                    }
+                });
+        }
     }
 
     ~RemoteLogosObject() override {
@@ -92,7 +117,10 @@ public:
             return QVariant();
         }
 
-        return pendingCall.returnValue();
+        // A "multi" provider may have deferred the result (returned a pending
+        // sentinel); resolveDeferred waits for the completion event, or returns
+        // the value unchanged for an ordinary (synchronous) result.
+        return resolveDeferred(pendingCall.returnValue(), timeoutMs);
     }
 
     void callMethodAsync(const QString& authToken,
@@ -135,7 +163,7 @@ public:
 
         // Success handler -- delivers result on the consumer's thread
         QObject::connect(watcher, &QRemoteObjectPendingCallWatcher::finished,
-                         watcher, [callback, timer](QRemoteObjectPendingCallWatcher* w) {
+                         watcher, [this, callback, timer, timeoutMs](QRemoteObjectPendingCallWatcher* w) {
             timer->stop(); // cancel timeout
             QVariant result;
             if (w->error() == QRemoteObjectPendingCall::NoError) {
@@ -143,8 +171,26 @@ public:
             } else {
                 qWarning() << "RemoteLogosObject: async callMethod error:" << w->error();
             }
-            callback(result);
             w->deleteLater();
+            // A "multi" provider may have deferred the result: wait for the
+            // completion event instead of delivering the pending sentinel.
+            if (result.typeId() == QMetaType::QVariantMap) {
+                const QVariantMap m = result.toMap();
+                if (m.contains(logos::pendingCallKey())) {
+                    const QString callId = m.value(logos::pendingCallKey()).toString();
+                    if (m_completions.contains(callId)) { callback(m_completions.take(callId)); return; }
+                    m_asyncCompletionCbs.insert(callId, callback);
+                    // Bound the wait: deliver an empty result once if it never lands.
+                    QTimer::singleShot(timeoutMs, m_helper, [this, callId]() {
+                        if (m_asyncCompletionCbs.contains(callId)) {
+                            auto cb = m_asyncCompletionCbs.take(callId);
+                            if (cb) cb(QVariant());
+                        }
+                    });
+                    return;
+                }
+            }
+            callback(result);
         }, Qt::QueuedConnection);
 
         // Timeout handler -- stops the watcher and delivers empty result
@@ -241,8 +287,38 @@ public:
     quintptr id() const override { return reinterpret_cast<quintptr>(m_replica); }
 
 private:
+    // Resolve a possibly-deferred result. If `rv` is a pending sentinel from a
+    // "multi" provider, wait (up to timeoutMs) for the completion event keyed by
+    // callId, pumping the consumer event loop; otherwise return `rv` unchanged.
+    QVariant resolveDeferred(const QVariant& rv, int timeoutMs)
+    {
+        if (rv.typeId() != QMetaType::QVariantMap) return rv;
+        const QVariantMap m = rv.toMap();
+        if (!m.contains(logos::pendingCallKey())) return rv;
+        const QString callId = m.value(logos::pendingCallKey()).toString();
+        // The completion can arrive during the call's own waitForFinished above.
+        if (m_completions.contains(callId)) return m_completions.take(callId);
+        QEventLoop loop;
+        m_completionWaiters.insert(callId, &loop);
+        QTimer timer;
+        timer.setSingleShot(true);
+        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+        timer.start(timeoutMs > 0 ? timeoutMs : 30000);
+        loop.exec();
+        m_completionWaiters.remove(callId);
+        if (m_completions.contains(callId)) return m_completions.take(callId);
+        qWarning() << "RemoteLogosObject: deferred call" << callId << "timed out";
+        return QVariant();
+    }
+
     QObject* m_replica;
     RemoteEventHelper* m_helper;
+    // Deferred ("multi") completions delivered over the event channel, keyed by
+    // callId: buffered results + sync (QEventLoop) and async (callback) waiters.
+    // Touched only on the consumer event-loop thread.
+    QHash<QString, QVariant> m_completions;
+    QHash<QString, QEventLoop*> m_completionWaiters;
+    QHash<QString, AsyncResultCallback> m_asyncCompletionCbs;
 };
 
 // ── RemoteTransportHost ──────────────────────────────────────────────────────

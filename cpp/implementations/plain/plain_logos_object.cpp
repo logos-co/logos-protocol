@@ -1,11 +1,13 @@
 #include "plain_logos_object.h"
 
+#include "logos_async_dispatch.h"
 #include "qvariant_rpc_value.h"
 
 #include <QCoreApplication>
 #include <QDebug>
 #include <QMetaObject>
 #include <QTimer>
+#include <QVariantMap>
 
 #include <chrono>
 #include <future>
@@ -33,6 +35,10 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
 {
     if (!m_conn || !m_conn->isOpen()) return QVariant();
 
+    // Subscribe to the completion channel BEFORE sending, so a "multi" provider's
+    // completion can't race ahead of the waiter (it's buffered either way).
+    ensureCompletionSub();
+
     CallMessage msg;
     msg.id        = m_conn->nextId();
     msg.authToken = authToken.toStdString();
@@ -52,7 +58,52 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
                    << "failed:" << QString::fromStdString(res.err);
         return QVariant();
     }
-    return rpcValueToQVariant(res.value);
+    const QVariant value = rpcValueToQVariant(res.value);
+    // A "multi" provider may have deferred: it returned a pending sentinel and
+    // pushes the real result as a completion event. Wait for it, keyed by callId.
+    if (value.typeId() == QMetaType::QVariantMap) {
+        const QVariantMap m = value.toMap();
+        if (m.contains(logos::pendingCallKey()))
+            return awaitCompletion(m.value(logos::pendingCallKey()).toString(), timeoutMs);
+    }
+    return value;
+}
+
+void PlainLogosObject::ensureCompletionSub()
+{
+    {
+        std::lock_guard<std::mutex> g(m_completionMu);
+        if (m_completionSubscribed) return;
+        m_completionSubscribed = true;
+    }
+    // Reuse the normal event subscription path (tracked in m_subs, so
+    // disconnectEvents() tears it down). The handler fires on the connection's
+    // IO thread; it buffers the result and wakes any waiter.
+    onEvent(logos::callCompleteEvent(), [this](const QString&, const QVariantList& data) {
+        if (data.size() != 2) return;
+        const QString callId = data.at(0).toString();
+        {
+            std::lock_guard<std::mutex> g(m_completionMu);
+            m_completions[callId] = data.at(1);
+        }
+        m_completionCv.notify_all();
+    });
+}
+
+QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs)
+{
+    std::unique_lock<std::mutex> lk(m_completionMu);
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 30000);
+    const bool got = m_completionCv.wait_until(lk, deadline,
+        [&] { return m_completions.count(callId) > 0; });
+    if (!got) {
+        qWarning() << "PlainLogosObject: deferred call" << callId << "timed out";
+        return QVariant();
+    }
+    const QVariant result = m_completions[callId];
+    m_completions.erase(callId);
+    return result;
 }
 
 namespace {
@@ -95,6 +146,8 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
         return;
     }
 
+    ensureCompletionSub();
+
     CallMessage msg;
     msg.id        = m_conn->nextId();
     msg.authToken = authToken.toStdString();
@@ -110,7 +163,7 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
     // future iteration can fold this wait into the shared Asio
     // io_context (the connection already runs on it) so we don't spin
     // up a thread per pending RPC.
-    std::thread([fut, timeoutMs, callback = std::move(callback)]() mutable {
+    std::thread([this, fut, timeoutMs, callback = std::move(callback)]() mutable {
         if (fut->wait_for(std::chrono::milliseconds(timeoutMs))
             != std::future_status::ready) {
             postToQtEventLoop(std::move(callback), QVariant());
@@ -118,6 +171,13 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
         }
         auto res = fut->get();
         QVariant value = res.ok ? rpcValueToQVariant(res.value) : QVariant();
+        // Resolve a "multi" provider's deferred completion (sentinel → wait for
+        // the completion event) right here on the waiter thread.
+        if (value.typeId() == QMetaType::QVariantMap) {
+            const QVariantMap m = value.toMap();
+            if (m.contains(logos::pendingCallKey()))
+                value = awaitCompletion(m.value(logos::pendingCallKey()).toString(), timeoutMs);
+        }
         postToQtEventLoop(std::move(callback), std::move(value));
     }).detach();
 }

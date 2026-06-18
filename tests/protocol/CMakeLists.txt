@@ -19,6 +19,8 @@ add_executable(protocol_tests
     test_rpc_framing.cpp
     test_json_codec.cpp
     test_cbor_codec.cpp
+    # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
+    test_concurrent_dispatch.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).
