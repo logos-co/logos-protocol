@@ -164,6 +164,63 @@ protected:
         host.reset();
         return peak;
     }
+
+    // Fire N concurrent calls from a SINGLE thread via the ASYNC consumer path
+    // (callMethodAsync) — the fan-out pattern a real driver module uses through
+    // the generated work_async() client: it fires N non-blocking calls without
+    // waiting between them, so all N are in flight before any completes. This
+    // exercises PlainLogosObject::callMethodAsync, which resolves a "multi"
+    // provider's pending sentinel on its waiter thread (the sync peakOverlap
+    // above only covers the blocking callMethod path). Returns the peak overlap.
+    int peakOverlapAsync(bool multi, int n)
+    {
+        LogosTransportConfig cfg;
+        cfg.protocol = LogosProtocol::Tcp;
+        cfg.host = "127.0.0.1";
+        cfg.port = 0;
+
+        auto host = std::make_unique<PlainTransportHost>(cfg);
+        EXPECT_TRUE(host->start());
+
+        SlowProvider provider(multi);
+        ModuleProxy proxy(&provider);
+        proxy.saveToken(QStringLiteral("core"), QStringLiteral("tok"));
+        EXPECT_TRUE(host->publishObject("slow_mod", &proxy));
+
+        const QString endpoint = host->endpoint();
+        const uint16_t port = endpoint.mid(endpoint.lastIndexOf(':') + 1).toUShort();
+
+        LogosTransportConfig ccfg = cfg;
+        ccfg.port = port;
+        auto conn = std::make_unique<PlainTransportConnection>(ccfg);
+        EXPECT_TRUE(conn->connectToHost());
+
+        LogosObject* obj = conn->requestObject("slow_mod", 2000);
+        EXPECT_NE(obj, nullptr);
+        if (!obj) return -1;
+
+        // Fire n async calls back-to-back from this one thread. None blocks, so
+        // all n reach the provider before any returns — a "multi" provider runs
+        // them at once; a "single" one serializes them.
+        std::atomic<int> done{0};
+        for (int i = 0; i < n; ++i) {
+            obj->callMethodAsync(QStringLiteral("tok"), QStringLiteral("slow"),
+                                 QVariantList{ 300 }, 5000,
+                                 [&done](const QVariant&) { done.fetch_add(1); });
+        }
+
+        // Pump the host event loop until every async callback has fired.
+        for (int i = 0; i < 1000 && done.load() < n; ++i) {
+            QCoreApplication::processEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_EQ(done.load(), n);
+
+        const int peak = provider.maxConcurrent();
+        obj->release();
+        host.reset();
+        return peak;
+    }
 };
 
 TEST_F(ConcurrentDispatchTest, MultiProviderOverlaps)
@@ -174,4 +231,17 @@ TEST_F(ConcurrentDispatchTest, MultiProviderOverlaps)
 TEST_F(ConcurrentDispatchTest, SingleProviderSerializes)
 {
     EXPECT_EQ(peakOverlap(/*multi=*/false), 1);
+}
+
+TEST_F(ConcurrentDispatchTest, MultiProviderOverlapsAsync)
+{
+    // The fan-out pattern over the async consumer path: one thread fires 4
+    // non-blocking calls; the "multi" provider runs all 4 concurrently.
+    EXPECT_EQ(peakOverlapAsync(/*multi=*/true, /*n=*/4), 4);
+}
+
+TEST_F(ConcurrentDispatchTest, SingleProviderSerializesAsync)
+{
+    // The same fan-out at a "single" provider serializes — peak 1.
+    EXPECT_EQ(peakOverlapAsync(/*multi=*/false, /*n=*/4), 1);
 }

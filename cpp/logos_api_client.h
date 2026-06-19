@@ -8,6 +8,7 @@
 #include <QMap>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
@@ -282,6 +283,17 @@ private:
     // so any old constructor that doesn't list this field still
     // leaves a defined value.
     LogosAPIConsumer* m_capability_consumer = nullptr;
+
+    // Per-target queue of continuations waiting on an in-flight async
+    // requestModule handshake. The FIRST async call to an un-tokened target
+    // starts exactly one handshake; concurrent calls to the same target queue
+    // here and all drain with the single minted token when it resolves. Without
+    // this coalescing a fan-out of N first-calls fires N racing handshakes whose
+    // distinct tokens overwrite each other on the target — so already-dispatched
+    // calls carry a superseded token and get rejected. Touched only on the
+    // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
+    // lock. Appended last per the ABI note above; defaults to empty.
+    QMap<QString, std::vector<std::function<void(const QString&)>>> m_pendingHandshakes;
 };
 
 #endif // LOGOS_API_CLIENT_H

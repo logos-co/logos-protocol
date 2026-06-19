@@ -168,43 +168,56 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
     QString token = getToken(objectName);
 
     if (token.isEmpty() && objectName != "capability_module" && m_capability_consumer) {
-        // Async-chain: dispatch the requestModule call asynchronously,
-        // and only fire the real method's invokeRemoteMethodAsync from
-        // its callback. The previous version called `requestModule`
-        // synchronously here, which made the "async" entry point
-        // block its caller for the full requestModule round-trip
-        // (a real perf hit when capability_module has any latency).
+        // Async-chain: dispatch the requestModule call asynchronously, and only
+        // fire the real method's invokeRemoteMethodAsync from its callback. The
+        // previous version called `requestModule` synchronously here, which made
+        // the "async" entry point block its caller for the full round-trip.
         //
-        // Lifetime: the inner callback captures m_consumer through a
-        // QPointer guard. If the LogosAPIClient (and thus its
-        // QObject-parented m_consumer) is destroyed while the
-        // requestModule round-trip is still in flight, the QPointer
-        // goes null and the inner dispatch is suppressed instead of
-        // dereferencing dangling memory.
+        // COALESCE concurrent first-calls behind ONE handshake. A driver that
+        // fans out N async calls to an un-tokened target before any completes
+        // would otherwise fire N separate requestModule handshakes; each mints a
+        // distinct token and informs the target, and the later inform OVERWRITES
+        // the earlier token there (the target stores one token per caller). The
+        // already-dispatched calls then carry a superseded token and the target
+        // rejects them as unauthorized. So only the first caller starts the
+        // handshake; the rest queue and all drain with the single minted token.
+        // (The sync path can't hit this — it blocks per call, so handshakes
+        // never overlap.) m_pendingHandshakes is touched only on the owner
+        // thread, reached above, so no lock is needed.
+        m_pendingHandshakes[objectName].push_back(
+            [this, objectName, methodName, args, timeout, cb = std::move(callback)]
+            (const QString& tok) mutable {
+                m_consumer->invokeRemoteMethodAsync(tok, objectName, methodName, args,
+                                                    std::move(cb), timeout);
+            });
+        if (m_pendingHandshakes[objectName].size() > 1)
+            return;  // a handshake for this target is already in flight
+
         const QString capabilityToken = getToken("capability_module");
         const QString origin = m_origin_module;
-        QPointer<LogosAPIConsumer> consumer = m_consumer;
-        auto outerCallback = std::move(callback);
+        // Lifetime: capture the client through a QPointer guard. If it (and its
+        // QObject-parented consumers + the pending queue) is destroyed while the
+        // requestModule round-trip is in flight, the guard goes null and we drop
+        // the queued continuations instead of dereferencing dangling memory.
+        QPointer<LogosAPIClient> self(this);
         m_capability_consumer->invokeRemoteMethodAsync(
             capabilityToken,
             QStringLiteral("capability_module"),
             QStringLiteral("requestModule"),
             QVariantList() << origin << objectName,
-            [consumer, objectName, methodName, args, timeout,
-             outerCallback = std::move(outerCallback)]
-            (const QVariant& tokenResult) mutable {
-                if (!consumer) {
-                    // Client was destroyed mid-flight. Honour the
-                    // contract by firing the outer callback with an
-                    // invalid QVariant so callers don't deadlock
-                    // waiting for a result that'll never come.
-                    if (outerCallback) outerCallback(QVariant{});
-                    return;
-                }
-                consumer->invokeRemoteMethodAsync(
-                    tokenResult.toString(),
-                    objectName, methodName, args,
-                    std::move(outerCallback), timeout);
+            [self, objectName](const QVariant& tokenResult) mutable {
+                if (!self) return;  // client destroyed mid-flight
+                const QString tok = tokenResult.toString();
+                // Drain every continuation queued for this target with the one
+                // minted token — the target was informed of exactly this token.
+                // An empty tok (handshake failed) still flows through: the
+                // consumer call is then rejected and each callback fires with an
+                // invalid QVariant, so callers never hang.
+                auto it = self->m_pendingHandshakes.find(objectName);
+                if (it == self->m_pendingHandshakes.end()) return;
+                std::vector<std::function<void(const QString&)>> calls = std::move(it.value());
+                self->m_pendingHandshakes.erase(it);
+                for (auto& c : calls) c(tok);
             },
             timeout);
         return;
