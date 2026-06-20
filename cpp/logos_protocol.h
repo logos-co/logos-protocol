@@ -139,9 +139,11 @@ typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
  * flow (this library dials `capability_module` transparently the first time
  * a target requires a token — every language gets that flow for free).
  *
- * The calling thread becomes the client's owner thread; with the Qt Remote
- * Objects transport it must run a Qt event loop. Returns NULL on invalid
- * arguments.
+ * The client is owned by the application's (main/event-loop) thread when a
+ * QCoreApplication exists, so callers may create and use it from any thread —
+ * including a "multi" module's worker threads — and outbound calls are marshaled
+ * onto the event-loop thread transparently. With no QCoreApplication the calling
+ * thread becomes the owner. Returns NULL on invalid arguments.
  */
 lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,

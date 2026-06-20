@@ -11,10 +11,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <QCoreApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMetaType>
 #include <QString>
+#include <QThread>
 #include <QVariant>
 #include <QVariantList>
 
@@ -198,11 +200,47 @@ lp_client* lp_client_create(const char* target_module,
     handle->origin = QString::fromUtf8(origin_module);
     handle->guard = std::make_shared<CbGuard>();
     // No QObject parent: the handle owns the client. Constructed on the
-    // calling thread, which becomes the owner thread (see header contract).
+    // calling thread (see below for why that does not become the owner thread).
     handle->client = new LogosAPIClient(handle->target, handle->origin,
                                         &TokenManager::instance(),
                                         targetCfg, capabilityCfg);
+
+    // Re-home the client onto the application's (main/event-loop) thread.
+    //
+    // LogosAPIClient::invokeRemoteMethod marshals every call onto the client's
+    // owner thread via runOnOwnerThread (logos_thread_marshal.h), whose contract
+    // is that the owner thread runs a Qt event loop. A "multi" module (concurrency
+    // == "multi") first touches its lp clients from a *worker* thread — the
+    // generated glue dispatches each call on a detached std::thread with no event
+    // loop. If such a worker became the owner, a synchronous outbound call to
+    // another "multi" module (whose reply is a deferred pending-sentinel resolved
+    // over QtRO) would block in RemoteLogosObject::resolveDeferred's nested
+    // QEventLoop with no loop to pump the completion event → 30s timeout →
+    // METHOD_FAILED. Owning the client on the application thread instead makes
+    // runOnOwnerThread marshal the call onto the pumping main thread, where the
+    // deferred completion is delivered and the nested wait resolves — the same
+    // configuration single-mode and worker-thread IPC already rely on.
+    //
+    // moveToThread is valid here: the client has no parent and we are still on
+    // its current (creating) thread. Its consumers are QObject children, so they
+    // move with it; replicas are acquired lazily later, on the new owner thread.
+    // When there is no QCoreApplication (e.g. a pure non-Qt plain-transport
+    // consumer) the client keeps its creating-thread affinity — that path's
+    // completion wait is a thread-safe condvar and needs no event loop.
+    if (QCoreApplication* app = QCoreApplication::instance()) {
+        if (handle->client->thread() != app->thread())
+            handle->client->moveToThread(app->thread());
+    }
     return handle;
+}
+
+// Test-support (not part of the public C ABI): the thread the client's QObjects
+// are affined to. Used by logos-protocol's own gtests to assert the owner-thread
+// re-homing above. extern "C++" so it keeps C++ linkage (matching the test's
+// declaration) even though it sits inside this file's extern "C" block.
+extern "C++" QThread* lp_client_owner_thread(lp_client* client)
+{
+    return (client && client->client) ? client->client->thread() : nullptr;
 }
 
 void lp_client_destroy(lp_client* client)

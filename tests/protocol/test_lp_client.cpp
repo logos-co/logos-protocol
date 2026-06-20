@@ -6,12 +6,18 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QThread>
 #include <QVariant>
 
 #include <atomic>
 #include <string>
+#include <thread>
 
 #include <nlohmann/json.hpp>
+
+// Test-support hook (defined in logos_protocol.cpp, not part of the public C
+// ABI): the thread the lp client's QObjects are affined to.
+QThread* lp_client_owner_thread(lp_client* client);
 
 // Exercises the consumer C ABI end-to-end over the mock transport — the
 // same calls any non-C++ SDK makes. No C++ SDK types cross these tests'
@@ -235,4 +241,30 @@ TEST_F(LpClientTest, ProviderGroundworkSurface)
     EXPECT_EQ(lp_provider_register(nullptr, dispatch, nullptr, nullptr, nullptr),
               LP_ERR_INVALID_ARG);
     lp_provider_destroy(nullptr);  // no-op
+}
+
+// A client created off the main thread (as a "multi" module does — its glue
+// dispatches each call on a worker std::thread, and the first outbound call
+// lazily creates the client there) must still be owned by the application's
+// event-loop thread. Otherwise a synchronous outbound call to another "multi"
+// module would wait for the deferred completion in a nested QEventLoop on a
+// loop-less worker and time out. See lp_client_create in logos_protocol.cpp.
+TEST_F(LpClientTest, ClientCreatedOffMainThreadIsOwnedByAppThread)
+{
+    QThread* const appThread = QCoreApplication::instance()->thread();
+    ASSERT_EQ(QThread::currentThread(), appThread);  // the test runs on it
+
+    lp_client* client = nullptr;
+    QThread* workerThread = nullptr;
+    std::thread worker([&]() {
+        workerThread = QThread::currentThread();
+        client = lp_client_create("test_module", "origin", nullptr, nullptr);
+    });
+    worker.join();
+
+    ASSERT_NE(client, nullptr);
+    LpClientGuard guard(client);
+    EXPECT_NE(workerThread, appThread);                       // it really was off-thread
+    EXPECT_EQ(lp_client_owner_thread(client), appThread);     // …yet re-homed to the app thread
+    EXPECT_NE(lp_client_owner_thread(client), workerThread);
 }
