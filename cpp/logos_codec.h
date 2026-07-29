@@ -44,6 +44,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -276,6 +277,15 @@ template <> struct Codec<nlohmann::json, void> {
 };
 
 // int / uint — every C++ integral spelling, bool excluded (specialised above).
+//
+// Signedness is part of the type, so it is checked. `is_number_integer()` is
+// true for a negative, and `.get<uint64_t>()` on -1 wraps to 18446744073709551615
+// with no exception — a silent sign flip on a nominal value. Range is checked for
+// the same reason: `.get<T>()` on a narrower T truncates rather than throwing.
+//
+// This rejects rather than coerces, matching the rest of the codec: a value the
+// declared type cannot represent must not reach business logic wearing a
+// different one.
 template <class T>
 struct Codec<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>> {
     static nlohmann::json to(T v) { return v; }
@@ -283,7 +293,28 @@ struct Codec<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, boo
     {
         if (!j.is_number_integer() && !j.is_number_unsigned())
             typeError(path, "integer", j);
-        return j.get<T>();
+
+        if constexpr (std::is_unsigned_v<T>) {
+            // A negative literal parses as number_integer, never number_unsigned.
+            if (j.is_number_integer() && !j.is_number_unsigned() && j.get<int64_t>() < 0)
+                typeError(path, "unsigned integer", j);
+            const uint64_t u = j.get<uint64_t>();
+            if (u > static_cast<uint64_t>(std::numeric_limits<T>::max()))
+                typeError(path, "unsigned integer in range", j);
+            return static_cast<T>(u);
+        } else {
+            if (j.is_number_unsigned()) {
+                const uint64_t u = j.get<uint64_t>();
+                if (u > static_cast<uint64_t>(std::numeric_limits<T>::max()))
+                    typeError(path, "signed integer in range", j);
+                return static_cast<T>(u);
+            }
+            const int64_t i = j.get<int64_t>();
+            if (i < static_cast<int64_t>(std::numeric_limits<T>::min()) ||
+                i > static_cast<int64_t>(std::numeric_limits<T>::max()))
+                typeError(path, "signed integer in range", j);
+            return static_cast<T>(i);
+        }
     }
 };
 
