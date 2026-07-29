@@ -61,10 +61,10 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
     const QVariant value = rpcValueToQVariant(res.value);
     // A "multi" provider may have deferred: it returned a pending sentinel and
     // pushes the real result as a completion event. Wait for it, keyed by callId.
-    if (value.typeId() == QMetaType::QVariantMap) {
-        const QVariantMap m = value.toMap();
-        if (m.contains(logos::pendingCallKey()))
-            return awaitCompletion(m.value(logos::pendingCallKey()).toString(), timeoutMs);
+    {
+        QString callId;
+        if (logos::isPendingCallSentinel(value, &callId))
+            return awaitCompletion(callId, timeoutMs);
     }
     return value;
 }
@@ -173,10 +173,10 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
         QVariant value = res.ok ? rpcValueToQVariant(res.value) : QVariant();
         // Resolve a "multi" provider's deferred completion (sentinel → wait for
         // the completion event) right here on the waiter thread.
-        if (value.typeId() == QMetaType::QVariantMap) {
-            const QVariantMap m = value.toMap();
-            if (m.contains(logos::pendingCallKey()))
-                value = awaitCompletion(m.value(logos::pendingCallKey()).toString(), timeoutMs);
+        {
+            QString callId;
+            if (logos::isPendingCallSentinel(value, &callId))
+                value = awaitCompletion(callId, timeoutMs);
         }
         postToQtEventLoop(std::move(callback), std::move(value));
     }).detach();

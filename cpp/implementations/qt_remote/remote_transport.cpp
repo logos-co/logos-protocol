@@ -206,10 +206,9 @@ public:
             w->deleteLater();
             // A "multi" provider may have deferred the result: wait for the
             // completion event instead of delivering the pending sentinel.
-            if (result.typeId() == QMetaType::QVariantMap) {
-                const QVariantMap m = result.toMap();
-                if (m.contains(logos::pendingCallKey())) {
-                    const QString callId = m.value(logos::pendingCallKey()).toString();
+            {
+                QString callId;
+                if (logos::isPendingCallSentinel(result, &callId)) {
                     if (m_completions.contains(callId)) { callback(m_completions.take(callId)); return; }
                     m_asyncCompletionCbs.insert(callId, callback);
                     // Bound the wait: deliver an empty result once if it never lands.
@@ -360,10 +359,8 @@ private:
     // callId, pumping the consumer event loop; otherwise return `rv` unchanged.
     QVariant resolveDeferred(const QVariant& rv, int timeoutMs)
     {
-        if (rv.typeId() != QMetaType::QVariantMap) return rv;
-        const QVariantMap m = rv.toMap();
-        if (!m.contains(logos::pendingCallKey())) return rv;
-        const QString callId = m.value(logos::pendingCallKey()).toString();
+        QString callId;
+        if (!logos::isPendingCallSentinel(rv, &callId)) return rv;
         // The completion can arrive during the call's own waitForFinished above.
         if (m_completions.contains(callId)) return m_completions.take(callId);
         QEventLoop loop;

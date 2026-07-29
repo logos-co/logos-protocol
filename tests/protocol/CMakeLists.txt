@@ -46,6 +46,10 @@ add_executable(protocol_tests
     test_socket_paths.cpp
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
+    # The in-band pending-call sentinel's shape check. Detection used to be a
+    # bare contains(), so any user map carrying the key hung the call for the
+    # full timeout. Includes what the guard does NOT close.
+    test_pending_sentinel.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
