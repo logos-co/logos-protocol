@@ -22,9 +22,14 @@ RpcValue fromJsonValue(const QJsonValue& v)
     case QJsonValue::Double: {
         double d = v.toDouble();
         double intPart = 0.0;
+        // Strict `<` on the upper bound: double(int64max) rounds UP to exactly
+        // 2^63, so `d <= double(int64max)` admitted d == 2^63, and int64_t(d) on
+        // an out-of-range double is undefined behaviour — saturating to int64max
+        // on arm64, INT64_MIN on x86-64. The lower bound needs no such care:
+        // double(int64min) is exactly -2^63 and representable.
         if (std::modf(d, &intPart) == 0.0 &&
             d >= double(std::numeric_limits<int64_t>::min()) &&
-            d <= double(std::numeric_limits<int64_t>::max()))
+            d < 9223372036854775808.0)   // 2^63, i.e. int64max + 1
             return RpcValue{int64_t(d)};
         return RpcValue{d};
     }
@@ -53,6 +58,12 @@ QJsonValue toJsonValue(const RpcValue& v)
     if (v.isNull())   return QJsonValue(QJsonValue::Null);
     if (v.isBool())   return QJsonValue(v.asBool());
     if (v.isInt())    return QJsonValue(static_cast<double>(v.asInt()));
+    // QJsonValue has no unsigned primitive and its double cannot hold the band
+    // above int64max exactly. This path only carries method-introspection
+    // METADATA (parameter descriptors), never payload values, so the lossy cast
+    // is acceptable here — but without this branch a uint64 would fall through
+    // to Null, which is worse than imprecise.
+    if (v.isUInt())   return QJsonValue(static_cast<double>(v.asUInt()));
     if (v.isDouble()) return QJsonValue(v.asDouble());
     if (v.isString()) return QJsonValue(QString::fromStdString(v.asString()));
     if (v.isBytes()) {
@@ -126,7 +137,10 @@ RpcValue qvariantToRpcValue(const QVariant& v)
     case QMetaType::ULongLong:
     case QMetaType::UShort:
     case QMetaType::UChar:
-        return RpcValue{int64_t(v.toULongLong())};
+        // makeInteger, not int64_t(): a LIDL `uint` above int64max used to wrap
+        // to -1 here, silently and in every direction. Values that fit int64_t
+        // still take the int64_t alternative, so nothing else changes.
+        return RpcValue::makeInteger(v.toULongLong());
     case QMetaType::Float:
     case QMetaType::Double:
         return RpcValue{v.toDouble()};
@@ -181,6 +195,7 @@ QVariant rpcValueToQVariant(const RpcValue& v)
     if (v.isNull())   return QVariant();
     if (v.isBool())   return QVariant(v.asBool());
     if (v.isInt())    return QVariant(static_cast<qlonglong>(v.asInt()));
+    if (v.isUInt())   return QVariant(static_cast<qulonglong>(v.asUInt()));
     if (v.isDouble()) return QVariant(v.asDouble());
     if (v.isString()) return QVariant(QString::fromStdString(v.asString()));
     if (v.isBytes()) {

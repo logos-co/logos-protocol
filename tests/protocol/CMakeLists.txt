@@ -35,6 +35,11 @@ add_executable(protocol_tests
     test_rpc_framing.cpp
     test_json_codec.cpp
     test_cbor_codec.cpp
+    # uint64 across the plain wire. RpcValue had no unsigned alternative, so a
+    # value above int64max wrapped to -1 independently in each direction; no
+    # plain-tier test used an integer outside int32 range. Also pins the
+    # off-by-one in the QJsonValue::Double -> int64 guard.
+    test_plain_uint64.cpp
     # Qt-free socket-access + stale-socket reaper helpers (multi-user local
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
     # reapStaleSockets never touching live sockets or regular files.

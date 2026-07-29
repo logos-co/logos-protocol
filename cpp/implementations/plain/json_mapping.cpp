@@ -36,6 +36,7 @@ json valueToJson(const RpcValue& v)
     if (v.isNull())   return nullptr;
     if (v.isBool())   return v.asBool();
     if (v.isInt())    return v.asInt();
+    if (v.isUInt())   return v.asUInt();   // > int64max: nlohmann keeps it as number_unsigned
     if (v.isDouble()) return v.asDouble();
     if (v.isString()) return v.asString();
     if (v.isBytes())  return logos::bytesToJson(v.asBytes().data);
@@ -56,7 +57,12 @@ RpcValue jsonToValue(const json& j)
 {
     if (j.is_null())    return RpcValue{std::monostate{}};
     if (j.is_boolean()) return RpcValue{j.get<bool>()};
-    if (j.is_number_integer() || j.is_number_unsigned())
+    // is_number_unsigned() is checked FIRST and routed through makeInteger:
+    // .get<int64_t>() on a value above int64max wraps silently (2^64-1 -> -1)
+    // with no exception, so a correct peer's uint64 used to arrive as -1.
+    if (j.is_number_unsigned())
+        return RpcValue::makeInteger(j.get<uint64_t>());
+    if (j.is_number_integer())
         return RpcValue{j.get<int64_t>()};
     if (j.is_number_float()) return RpcValue{j.get<double>()};
     if (j.is_string())       return RpcValue{j.get<std::string>()};
