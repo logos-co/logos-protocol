@@ -220,3 +220,72 @@ TEST(Codec, CheckedDecodeRejectsCorruptInput)
     EXPECT_FALSE(logos::b64UrlDecodeChecked("AH-A_wQQQ??", out));
     EXPECT_FALSE(logos::b64UrlDecodeChecked("A", out));        // impossible length
 }
+
+// ---------------------------------------------------------------------------
+// Adopted from logos-cpp-sdk tests/sdk/test_logos_json_bytes.cpp, which tested
+// b64UrlEncode / bytesToJson back when logos_json.h carried its own copies of
+// them. Those copies are gone (logos-cpp-sdk#117), so the coverage belongs with
+// the canonical definitions rather than in a repo that would have to reach
+// across for them.
+//
+// What these pin is not academic: a wrong alphabet, a stray '=', or a botched
+// tail group silently corrupts every binary payload in the system, and the
+// code-generation tests assert on generated source TEXT and cannot see it.
+// ---------------------------------------------------------------------------
+
+TEST(CodecBytes, RoundTripsEveryByteValue)
+{
+    std::vector<uint8_t> all(256);
+    for (int i = 0; i < 256; ++i) all[i] = static_cast<uint8_t>(i);
+
+    EXPECT_EQ(logos::b64UrlDecode(logos::b64UrlEncode(all)), all);
+}
+
+TEST(CodecBytes, UsesTheUrlSafeAlphabetAndOmitsPadding)
+{
+    // 0xFB 0xFF encodes to the two characters that differ between the standard
+    // and URL-safe alphabets ('+/' vs '-_'), and a 2-byte input is where a
+    // padding-emitting encoder would append '='.
+    const std::string enc = logos::b64UrlEncode({0xFB, 0xFF});
+
+    EXPECT_EQ(enc.find('+'), std::string::npos);
+    EXPECT_EQ(enc.find('/'), std::string::npos);
+    EXPECT_EQ(enc.find('='), std::string::npos);
+}
+
+TEST(CodecBytes, TailGroupsOfEveryLengthSurvive)
+{
+    for (size_t n = 0; n <= 5; ++n) {
+        std::vector<uint8_t> v(n);
+        for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(0xA0 + i);
+        EXPECT_EQ(logos::b64UrlDecode(logos::b64UrlEncode(v)), v) << "length " << n;
+    }
+}
+
+TEST(CodecBytes, EmbeddedNulSurvives)
+{
+    // The reason bytes are tagged at all: a plain JSON string cannot carry this.
+    const std::vector<uint8_t> v{'a', 0, 'b', 0, 'c'};
+
+    EXPECT_EQ(logos::b64UrlDecode(logos::b64UrlEncode(v)), v);
+}
+
+TEST(CodecBytes, BytesToJsonEmitsTheCanonicalTag)
+{
+    const nlohmann::json j = logos::bytesToJson({'h', 'i'});
+
+    ASSERT_TRUE(j.is_object());
+    EXPECT_EQ(j.size(), 1u);
+    ASSERT_TRUE(j.contains("_bytes"));
+    EXPECT_TRUE(j["_bytes"].is_string());
+    EXPECT_TRUE(logos::isTaggedBytes(j));
+}
+
+// The decoder is deliberately tolerant of padding a peer may have emitted.
+// The cdylib backend used to carry a SECOND decoder that bailed on any
+// non-alphabet character, so padded input silently produced an empty vector —
+// the two disagreed, and this test is what the surviving one must satisfy.
+TEST(CodecBytes, DecodeAcceptsPaddedInput)
+{
+    EXPECT_EQ(logos::b64UrlDecode("Zm9vYg=="), (std::vector<uint8_t>{'f', 'o', 'o', 'b'}));
+}
