@@ -6,6 +6,11 @@ add_executable(protocol_tests
     test_protocol_version.cpp
     test_json_convert_bytes.cpp
     test_universal_provider_dispatch.cpp
+    # Event payload fidelity across the universal -> Qt bridge
+    # (setEventListenerStdBridge). Every Qt-free provider emits through that one
+    # conversion; test_universal_provider_dispatch references it only to satisfy
+    # the pure virtual and asserts nothing about payloads.
+    test_event_payload_fidelity.cpp
     test_lp_client.cpp
     # The canonical LIDL <-> JSON codec (cpp/logos_codec.h): one implementation
     # of an encoding that used to exist six times with divergent semantics.
