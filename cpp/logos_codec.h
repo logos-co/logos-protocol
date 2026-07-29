@@ -43,6 +43,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -286,11 +287,38 @@ template <> struct Codec<nlohmann::json, void> {
 // This rejects rather than coerces, matching the rest of the codec: a value the
 // declared type cannot represent must not reach business logic wearing a
 // different one.
+//
+// A WHOLE-VALUED float is not such a value. JSON does not distinguish 3 from
+// 3.0, and every encoder that sees a whole double may emit either — which is
+// exactly the reasoning Codec<double> already gives for accepting an integral
+// number. The two directions have to agree, so 3.0 decodes as 3 while 3.7 is
+// still refused. A CLI that types its arguments by parsing (logoscore's does)
+// produces 3.0 for `3.0`, so refusing it breaks callers over a spelling.
 template <class T>
 struct Codec<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>> {
     static nlohmann::json to(T v) { return v; }
     static T from(const nlohmann::json& j, const std::string& path)
     {
+        if (j.is_number_float()) {
+            const double d = j.get<double>();
+            double intPart = 0.0;
+            if (std::modf(d, &intPart) != 0.0)
+                typeError(path, "integer", j);
+            // Strict bounds: double(int64max) rounds UP to 2^63, so `<=` would
+            // admit a value the cast cannot represent (undefined behaviour).
+            if constexpr (std::is_unsigned_v<T>) {
+                if (d < 0.0 || d >= 18446744073709551616.0)   // 2^64
+                    typeError(path, "unsigned integer in range", j);
+            } else {
+                if (d < -9223372036854775808.0 || d >= 9223372036854775808.0)  // ±2^63
+                    typeError(path, "signed integer in range", j);
+            }
+            const auto whole = static_cast<long double>(d);
+            if (whole < static_cast<long double>(std::numeric_limits<T>::min()) ||
+                whole > static_cast<long double>(std::numeric_limits<T>::max()))
+                typeError(path, "integer in range", j);
+            return static_cast<T>(d);
+        }
         if (!j.is_number_integer() && !j.is_number_unsigned())
             typeError(path, "integer", j);
 
