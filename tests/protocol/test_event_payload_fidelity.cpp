@@ -184,6 +184,34 @@ TEST(EventPayloadFidelity, MultipleParametersKeepOrderAndTypes)
     EXPECT_EQ(cap.args[2].toBool(), true);
 }
 
+// Converging on the method path's helper also converges its SIGNEDNESS rule:
+// nlohmannArgsToQVariantList classifies every non-negative integer as unsigned,
+// so a LIDL `int` event argument now arrives as ULongLong rather than LongLong.
+// That is what nlohmannToQVariant (methods) and the cdylib emitTrampoline
+// already did, so this makes the surfaces agree — but it is an observable
+// metatype change, pinned here so it stays a decision rather than a side effect.
+// Value-level reads (toLongLong/toULongLong) are unaffected either way.
+TEST(EventPayloadFidelity, NonNegativeIntegerCarriesUnsignedMetatype)
+{
+    const Captured cap = captureEvent("intEvent", "[42]");
+
+    ASSERT_EQ(cap.args.size(), 1);
+    EXPECT_EQ(cap.args[0].typeId(), QMetaType::ULongLong);
+    EXPECT_EQ(cap.args[0].toLongLong(), 42);
+    EXPECT_EQ(cap.args[0].toULongLong(), 42ULL);
+}
+
+// A negative integer keeps the signed metatype — the classification is by value,
+// not by declared LIDL type, so this is the other half of the rule.
+TEST(EventPayloadFidelity, NegativeIntegerCarriesSignedMetatype)
+{
+    const Captured cap = captureEvent("intEvent", "[-42]");
+
+    ASSERT_EQ(cap.args.size(), 1);
+    EXPECT_EQ(cap.args[0].typeId(), QMetaType::LongLong);
+    EXPECT_EQ(cap.args[0].toLongLong(), -42);
+}
+
 TEST(EventPayloadFidelity, DoubleStaysDouble)
 {
     const Captured cap = captureEvent("doubleEvent", "[3.5]");
