@@ -207,7 +207,8 @@ inline std::vector<uint8_t> bytesFromJson(const nlohmann::json& j)
 //   number        -> its decimal text as bytes (QVariant(int)->QByteArray parity)
 //   array of ints -> those byte values
 // Providers decode arguments with this; everything else uses the canonical form.
-inline std::vector<uint8_t> bytesFromJsonLenient(const nlohmann::json& j)
+inline std::vector<uint8_t> bytesFromJsonLenient(const nlohmann::json& j,
+                                                const std::string& path = "")
 {
     if (isTaggedBytes(j))
         return b64UrlDecode(j["_bytes"].get<std::string>());
@@ -227,7 +228,7 @@ inline std::vector<uint8_t> bytesFromJsonLenient(const nlohmann::json& j)
                 out.push_back(static_cast<uint8_t>(e.get<int64_t>() & 0xff));
         return out;
     }
-    detail::typeError("", "bytes", j);
+    detail::typeError(path, "bytes", j);
 }
 
 // ── the generic value codec ────────────────────────────────────────────────
@@ -245,9 +246,13 @@ template <class T, class Enable = void> struct Codec;
 // bstr — a FULL specialisation, so it wins over the generic vector<T> below.
 template <> struct Codec<std::vector<uint8_t>, void> {
     static nlohmann::json to(const std::vector<uint8_t>& v) { return bytesToJson(v); }
-    static std::vector<uint8_t> from(const nlohmann::json& j, const std::string&)
+    static std::vector<uint8_t> from(const nlohmann::json& j, const std::string& path)
     {
-        return bytesFromJsonLenient(j);
+        // The path is threaded through so a bad bstr nested in a container
+        // reports "[0].payload" rather than a bare "value" — the generated
+        // cdylib codec used to carry that detail in its own copy, and this is
+        // what lets that copy be deleted without losing the diagnostic.
+        return bytesFromJsonLenient(j, path);
     }
 };
 
