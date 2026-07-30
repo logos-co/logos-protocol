@@ -44,8 +44,6 @@ set(PROTOCOL_SOURCES
     logos_provider_interface.h
     logos_json_convert.cpp
     logos_json_convert.h
-    logos_qt_arg_decode.cpp
-    logos_qt_arg_decode.h
     logos_transport.h
     logos_transport.cpp
     logos_transport_config.h
@@ -226,7 +224,6 @@ install(FILES
     logos_json_convert.h
     # The Qt face of the codec. Generated provider dispatch includes it, so it
     # ships with the library's headers for the same reason logos_codec.h does.
-    logos_qt_arg_decode.h
     logos_transport.h
     logos_transport_config.h
     logos_transport_config_json.h

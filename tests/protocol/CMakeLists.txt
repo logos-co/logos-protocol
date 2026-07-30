@@ -22,11 +22,6 @@ add_executable(protocol_tests
     # Pins the contract — accepted shapes, rejected shapes, and bytes staying
     # tagged at any nesting depth.
     test_codec.cpp
-    # The Qt FACE of that codec (cpp/logos_qt_arg_decode.h): decoding an
-    # incoming RPC argument into the Qt type a provider method declares, which
-    # both Qt provider sites (the generated dispatch and the QMetaObject one)
-    # now route through instead of coercing with QVariant::convert.
-    test_qt_arg_decode.cpp
     # Owner-thread anchoring for lp clients: a client created from a worker
     # thread (the generated bind_<iface>() wrapper is lazy, so the first caller
     # wins) must still be serviced by the Qt main thread's event loop instead of
