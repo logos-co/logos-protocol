@@ -28,6 +28,11 @@ versioned boundary instead of re-wrapping the C++/Qt SDK.
 - **Token manager**, transport/registry factories, mode config
   (remote/local/mock), and the canonical QVariant↔JSON conversion used at
   the QRO boundary.
+- **The canonical value codec** — `logos_codec.h` (the one LIDL↔JSON
+  encoding) plus its Qt face `logos_qt_arg_decode.h`, which decodes an
+  incoming RPC argument into the Qt type a provider method declares. Both
+  Qt provider sites use it, so a Qt-typed module refuses a hostile argument
+  on the same rule as a cdylib or Rust one instead of coercing it.
 
 `logos-cpp-sdk` layers the typed C++ developer API (`LogosAPI`, module
 context, code generator, provider base classes) on top of this repo.
