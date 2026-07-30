@@ -5,6 +5,11 @@ add_executable(protocol_tests
     # New protocol-level tests
     test_protocol_version.cpp
     test_json_convert_bytes.cpp
+    # The `result` half of the canonical converter pair: qvariantToNlohmann has
+    # always owned LogosResult -> JSON; jsonToLogosResult is its inverse, and
+    # the state it exists to protect is an ABSENT error (which no
+    # std::string-typed intermediate can carry).
+    test_json_convert_result.cpp
     test_universal_provider_dispatch.cpp
     # Event payload fidelity across the universal -> Qt bridge
     # (setEventListenerStdBridge). Every Qt-free provider emits through that one

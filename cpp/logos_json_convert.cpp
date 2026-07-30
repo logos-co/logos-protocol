@@ -158,6 +158,22 @@ QVariant nlohmannToQVariant(const nlohmann::json& j)
     return QVariant();
 }
 
+LogosResult jsonToLogosResult(const nlohmann::json& j)
+{
+    LogosResult r;
+    r.success = false;
+    if (!j.is_object()) return r;
+    if (j.contains("success") && j["success"].is_boolean())
+        r.success = j["success"].get<bool>();
+    // Both payload fields recurse through the canonical decoder, so a `value`
+    // carrying bytes / nested integers / containers comes back with the same
+    // shape qvariantToNlohmann sent, and a null `error` stays an invalid
+    // QVariant rather than becoming an empty QString.
+    if (j.contains("value")) r.value = nlohmannToQVariant(j["value"]);
+    if (j.contains("error")) r.error = nlohmannToQVariant(j["error"]);
+    return r;
+}
+
 QVariantList nlohmannArgsToQVariantList(const nlohmann::json& args)
 {
     QVariantList result;
