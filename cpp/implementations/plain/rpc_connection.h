@@ -182,6 +182,14 @@ void RpcConnection<Stream>::doRead()
         boost::asio::bind_executor(m_strand,
             [self](const boost::system::error_code& ec, std::size_t n) {
                 if (ec) { self->fail(ec.message()); return; }
+                // fail() may have run on another thread while this read was in
+                // flight. Before the close moved onto the strand it aborted the
+                // read immediately, so a stopped connection could not deliver
+                // one more frame; now the socket stays open until the strand
+                // gets to it, and a frame arriving in that gap would be
+                // dispatched into an IncomingCallHandler its owner may already
+                // have torn down. The connection is dead either way — drop it.
+                if (self->m_stopped.load()) return;
                 try {
                     self->m_reader.append(self->m_readBuf.data(), n);
                     MessageType tag;
