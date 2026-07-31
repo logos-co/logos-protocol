@@ -5,9 +5,11 @@
 #include "rpc_connection.h"
 #include "wire_codec.h"
 
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/strand.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -39,7 +41,11 @@ public:
                  std::shared_ptr<IWireCodec> codec,
                  IncomingCallHandler* handler);
 
-    // Start accepting. Returns false if bind fails.
+    // Start accepting. Returns false if bind fails. Synchronous through
+    // listen(), so boundPort() is valid the moment it returns true; the accept
+    // loop itself is armed on m_strand (see closeAcceptorOnStrand). Callers
+    // must not overlap start() with stop() — PlainTransportHost serializes
+    // them under its own mutex.
     bool start();
 
     // Actual bound port (useful when the caller requested port=0).
@@ -48,9 +54,16 @@ public:
     void stop();
 
 private:
+    // MUST run on m_strand — see closeAcceptorOnStrand().
     void doAccept();
+    void closeAcceptor();
+    void closeAcceptorOnStrand();
 
     boost::asio::ip::tcp::acceptor    m_acceptor;
+    // Serializes every operation on m_acceptor after listen(): the accept
+    // initiations and the close. Same reason RpcConnection has one for its
+    // stream — asio acceptors are "Shared objects: Unsafe".
+    boost::asio::strand<boost::asio::any_io_executor> m_strand;
     std::shared_ptr<IWireCodec>       m_codec;
     IncomingCallHandler*              m_handler;
     std::string                       m_host;
@@ -80,14 +93,20 @@ public:
                  std::shared_ptr<IWireCodec> codec,
                  IncomingCallHandler* handler);
 
+    // See RpcServerTcp::start().
     bool start();
     uint16_t boundPort() const { return m_boundPort; }
     void stop();
 
 private:
+    // MUST run on m_strand — see closeAcceptorOnStrand().
     void doAccept();
+    void closeAcceptor();
+    void closeAcceptorOnStrand();
 
     boost::asio::ip::tcp::acceptor   m_acceptor;
+    // See RpcServerTcp::m_strand.
+    boost::asio::strand<boost::asio::any_io_executor> m_strand;
     boost::asio::ssl::context        m_sslCtx;
     std::shared_ptr<IWireCodec>      m_codec;
     IncomingCallHandler*             m_handler;
