@@ -9,6 +9,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/strand.hpp>
@@ -112,6 +113,10 @@ private:
     void writeFrame(std::vector<uint8_t> frame);
     void doWrite();
     void fail(const std::string& reason);
+
+    // Close the socket. MUST run on m_strand — see closeStreamOnStrand().
+    void closeStream();
+    void closeStreamOnStrand();
 
     Stream                                       m_stream;
     std::shared_ptr<IWireCodec>                  m_codec;
@@ -364,6 +369,10 @@ void RpcConnection<Stream>::writeFrame(std::vector<uint8_t> frame)
     if (m_stopped.load()) return;
     auto self = this->shared_from_this();
     boost::asio::post(m_strand, [self, frame = std::move(frame)]() mutable {
+        // Re-check inside the strand: the load above is a hint, and fail()
+        // can land between it and this handler. Without this the queued
+        // frame would start an async_write on a socket fail() is closing.
+        if (self->m_stopped.load()) return;
         self->m_writeQueue.push_back(std::move(frame));
         if (!self->m_writing) {
             self->m_writing = true;
@@ -375,6 +384,10 @@ void RpcConnection<Stream>::writeFrame(std::vector<uint8_t> frame)
 template <typename Stream>
 void RpcConnection<Stream>::doWrite()
 {
+    // Runs on m_strand. fail() may have closed the socket already (via a
+    // close it dispatched onto this same strand); starting another write
+    // would only produce a bad_descriptor completion.
+    if (m_stopped.load()) { m_writing = false; return; }
     auto self = this->shared_from_this();
     boost::asio::async_write(m_stream,
         boost::asio::buffer(m_writeQueue.front()),
@@ -388,6 +401,60 @@ void RpcConnection<Stream>::doWrite()
                     self->doWrite();
                 }
             }));
+}
+
+template <typename Stream>
+void RpcConnection<Stream>::closeStream()
+{
+    boost::system::error_code ignore;
+    try {
+        // lowest_layer() works for plain asio::ip::tcp::socket (returns
+        // itself) and for asio::ssl::stream (returns the underlying TCP
+        // socket). Closing the lowest layer tears the stack down cleanly
+        // without needing protocol-specific shutdown sequences.
+        m_stream.lowest_layer().close(ignore);
+    } catch (...) {}
+}
+
+template <typename Stream>
+void RpcConnection<Stream>::closeStreamOnStrand()
+{
+    // Asio sockets are NOT safe for concurrent use ("Shared objects:
+    // Unsafe"), and close() is no exception: it runs
+    // cleanup_descriptor_data(), which nulls the reactor's per-descriptor
+    // state. Every other touch of m_stream in this class is serialized on
+    // m_strand — start()/writeFrame() post onto it, doRead()/doWrite()
+    // complete through bind_executor(m_strand, …). A strand serializes
+    // *handlers*; a raw call made from outside it is not covered.
+    //
+    // fail() is reached from both sides: from the io thread (a read/write
+    // handler that saw an error, already inside the strand) and from an
+    // arbitrary caller thread (stop(), ~PlainTransportConnection,
+    // RpcServer::stop()). Closing on the caller's thread let close() run
+    // concurrently with an in-flight doWrite() initiating async_write on
+    // the io thread, and the reactor dereferenced the descriptor state the
+    // close had just nulled → SIGSEGV inside
+    // reactive_socket_service_base::start_op().
+    //
+    // dispatch() (not post()) is deliberate: when fail() is already running
+    // inside the strand it invokes closeStream() inline, so the io-thread
+    // error path keeps its current synchronous behaviour and cannot
+    // deadlock on itself. From any other thread it queues onto the strand
+    // and returns immediately — never blocking, so teardown cannot hang.
+    //
+    // The lambda keeps a shared_ptr to this connection, so a close queued
+    // from a destructor still finds a live object. Should the io_context be
+    // stopped before the queued close runs, the socket is still closed when
+    // the connection (and with it m_stream) is destroyed.
+    std::shared_ptr<RpcConnection<Stream>> self;
+    try { self = this->shared_from_this(); } catch (...) {}
+    if (!self) {
+        // No owning shared_ptr — the object is mid-destruction, so no other
+        // thread can still be holding it to run a stream operation.
+        closeStream();
+        return;
+    }
+    boost::asio::dispatch(m_strand, [self] { self->closeStream(); });
 }
 
 template <typename Stream>
@@ -417,14 +484,7 @@ void RpcConnection<Stream>::fail(const std::string& reason)
         try { p->set_value(std::move(r)); } catch (...) {}
     }
 
-    boost::system::error_code ignore;
-    try {
-        // lowest_layer() works for plain asio::ip::tcp::socket (returns
-        // itself) and for asio::ssl::stream (returns the underlying TCP
-        // socket). Closing the lowest layer tears the stack down cleanly
-        // without needing protocol-specific shutdown sequences.
-        m_stream.lowest_layer().close(ignore);
-    } catch (...) {}
+    closeStreamOnStrand();
 
     // Notify the dispatch handler so it can drop any subscriptions still
     // keyed to this connection. Without this, a connection that drops
