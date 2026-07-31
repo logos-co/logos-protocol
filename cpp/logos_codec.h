@@ -22,6 +22,7 @@
 // COMPOSITION — generic, no whitelist
 //   [T]        std::vector<T>                              for any supported T
 //   {tstr: T}  std::map / std::unordered_map<std::string,T> for any supported T
+//   ?T         std::optional<T>                            for any supported T
 //   ...at any depth. Bytes stay tagged wherever they occur, so [bstr], [[bstr]],
 //   {tstr: [bstr]} and bytes nested inside a map all encode canonically without
 //   anything having to enumerate the combination.
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -406,6 +408,57 @@ template <class T> struct Codec<std::map<std::string, T>, void>
 template <class T> struct Codec<std::unordered_map<std::string, T>, void>
     : MapCodec<std::unordered_map<std::string, T>> {};
 
+// ?T — an optional slot. TWO-state, never three: a value of T, or empty.
+//
+// Optional is two-state because "one LIDL type <-> one type per language" leaves
+// no room for anything else: every target has exactly ONE empty inhabitant
+// (Rust None, C++ std::nullopt, an invalid QVariant, JS undefined), so a wire
+// form that tried to distinguish "absent" from "present-but-null" would have
+// nowhere to land it. std::nullopt is that inhabitant here.
+//
+// DECODE IS LIBERAL, ENCODE IS CANONICAL — round-tripping CANONICALISES, it does
+// not preserve the input byte for byte:
+//   * in  — absent and explicit null are the SAME state. A missing record field
+//           is materialised as a null json by the record decoder before it ever
+//           reaches a Codec, so both spellings arrive here as is_null() and both
+//           yield nullopt. (In a REQUIRED slot null keeps meaning "wrong type",
+//           because Codec<T> for a non-optional T still rejects it — nothing
+//           below changes that.)
+//   * out — exactly one spelling: null.
+//
+// LAYERING — key omission is NOT this layer's job, and must not be moved here.
+// Empty is spelled by OMITTING the key where the slot is NAMED (a record field)
+// and by null where the slot is POSITIONAL (a method argument, a return value,
+// an event parameter — those have no key to omit, and arity must never change).
+// A Codec only ever sees a VALUE; it cannot see the slot the value sits in, so
+// it emits the positional spelling. Skipping the key for a nullopt field belongs
+// to the record emitter (logos-cpp-sdk), which is the only code that knows there
+// IS a key. Making `to()` return "nothing" instead would also be unimplementable
+// one level down: an optional inside a [T] must still occupy its array position.
+//
+// A PRESENT VALUE IS STILL TYPE-CHECKED. Optional widens the accepted domain by
+// exactly one inhabitant (empty); it does not switch checking off. Anything that
+// is not null goes through Codec<T> unchanged, so a wrong-typed present value
+// throws CodecError with the same path it would have thrown on in a required
+// slot.
+template <class T> struct Codec<std::optional<T>, void> {
+    static nlohmann::json to(const std::optional<T>& v)
+    {
+        // Nested optionals collapse (optional<optional<T>> has one empty
+        // spelling, not two) — which is the two-state rule holding at depth
+        // rather than an accident of this implementation.
+        if (!v.has_value()) return nlohmann::json();  // null
+        return Codec<T>::to(*v);
+    }
+    static std::optional<T> from(const nlohmann::json& j, const std::string& path)
+    {
+        if (j.is_null()) return std::nullopt;
+        // Path is passed through unchanged: `?T` names no step of its own, so a
+        // failure inside an optional field reports the field, not "field.?".
+        return std::optional<T>(Codec<T>::from(j, path));
+    }
+};
+
 } // namespace detail
 
 // Encode a LIDL value of static type T into its canonical JSON form.
@@ -443,6 +496,22 @@ T fromJson(const nlohmann::json& j, const std::string& path)
 //
 // An unsupported target type leaves Codec<T> incomplete, so the failure is a
 // compile error naming the type at the call site, never a silent fallback.
+//
+// ONE TARGET IT CANNOT SERVE: std::optional<X>. std::optional's own converting
+// constructor optional(U&&) is a viable candidate for a JsonArg argument, and it
+// binds an RVALUE REFERENCE to the proxy prvalue, which out-ranks this
+// const-lvalue-qualified conversion function before template partial ordering is
+// ever consulted. The compiler therefore decodes X — not std::optional<X> — so
+// an EMPTY optional (null) comes back as a wrong-typed X and throws. Making this
+// operator rvalue-qualified only turns that into an ambiguity, and an operator
+// written specifically for std::optional still loses to the constructor; there
+// is no signature that wins.
+//
+// Optional parameters must therefore be decoded by NAMING the type —
+// logos::fromJson<std::optional<X>>(j, path) — which is what the cdylib backend
+// already emits for every parameter. The test
+// CodecOptional.JsonArgCannotDeliverOptionalsNameTheTypeInstead
+// pins the behaviour so it cannot be rediscovered the hard way.
 class JsonArg {
 public:
     JsonArg(const nlohmann::json& value, std::string path)
