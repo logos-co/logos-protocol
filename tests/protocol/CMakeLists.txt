@@ -55,6 +55,11 @@ add_executable(protocol_tests
     # bare contains(), so any user map carrying the key hung the call for the
     # full timeout. Includes what the guard does NOT close.
     test_pending_sentinel.cpp
+    # Teardown race: fail() must close the socket on the connection's strand,
+    # not on the caller's thread — a caller-thread close ran concurrently with
+    # the io thread initiating async_write and segfaulted inside asio's
+    # reactor. Also guards the fix against leaking descriptors or hanging.
+    test_rpc_connection_teardown.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
