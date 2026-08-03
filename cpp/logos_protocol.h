@@ -189,6 +189,16 @@ int lp_invoke(lp_client* client,
  * Asynchronous variant of lp_invoke. Returns LP_OK if the call was
  * dispatched; `cb` then fires exactly once with the result (from the
  * client's owner thread). Safe to call from any thread.
+ *
+ * `cb` carries the same outcome the sync twin splits across its return code
+ * and out-params: ok != 0 → `json` is the result JSON value; ok == 0 → `json`
+ * is the canonical error object lp_invoke would have written to
+ * out_error_json (e.g. code "object_unavailable" when the target module is
+ * not loaded). A LP_OK return therefore means "dispatched", never "succeeded"
+ * — the outcome is only known in the callback.
+ *
+ * Argument/handle validation still fails synchronously with
+ * LP_ERR_INVALID_ARG and `cb` is NOT called in that case.
  */
 int lp_invoke_async(lp_client* client,
                     const char* method,

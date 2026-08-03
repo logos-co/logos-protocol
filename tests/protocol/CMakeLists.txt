@@ -28,6 +28,14 @@ add_executable(protocol_tests
     # falling out on replica-acquire timeouts.
     test_lp_client_owner_thread.cpp
     test_call_error.cpp
+    # The ASYNC half of the same channel. lp_invoke_async subscribed with the
+    # value-only transport overload and hard-coded cb(1, ...), so a failed call
+    # reached lp_result_cb as a success carrying a default value — the exact
+    # thing lp_result_cb's own doc comment (and its sync twin lp_invoke) says
+    # cannot happen. Matched pair: a failing call must report ok=0 with the
+    # canonical error object, a succeeding one must still report ok=1 with its
+    # value. Both over a real (plain TCP) transport.
+    test_lp_invoke_async_error.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
