@@ -39,10 +39,12 @@ private:
 
 } // anonymous namespace
 
-class LocalLogosObject : public LogosObject {
+class LocalLogosObject : public LogosObject, public LogosObjectErrorChannel {
 public:
-    explicit LocalLogosObject(ModuleProxy* proxy)
-        : m_proxy(proxy), m_helper(nullptr)
+    // objectName is carried purely so a failure can name the module it belongs
+    // to (logos::CallError::origin).
+    LocalLogosObject(ModuleProxy* proxy, QString objectName)
+        : m_proxy(proxy), m_helper(nullptr), m_objectName(std::move(objectName))
     {
         qDebug() << "[LogosObject] Created LocalLogosObject wrapping ModuleProxy" << reinterpret_cast<quintptr>(proxy);
     }
@@ -52,31 +54,62 @@ public:
         delete m_helper;
     }
 
+    // Adapters over the error-carrying implementations: they discard the
+    // diagnosis, which is exactly what these entry points have always done.
     QVariant callMethod(const QString& authToken,
                         const QString& methodName,
                         const QVariantList& args,
-                        int /*timeoutMs*/) override
+                        int timeoutMs) override
     {
-        if (!m_proxy) return QVariant();
-        qDebug() << "[LogosObject] LocalLogosObject::callMethod" << methodName << "args:" << args.size();
-        return m_proxy->callRemoteMethod(authToken, methodName, args);
+        return callMethodWithError(authToken, methodName, args, timeoutMs, nullptr);
     }
 
     void callMethodAsync(const QString& authToken,
                          const QString& methodName,
                          const QVariantList& args,
-                         int /*timeoutMs*/,
+                         int timeoutMs,
                          AsyncResultCallback callback) override
     {
         if (!callback) return;
+        callMethodAsyncWithError(authToken, methodName, args, timeoutMs,
+            [cb = std::move(callback)](QVariant v, const logos::CallError&) mutable {
+                cb(std::move(v));
+            });
+    }
+
+    // In-process direct dispatch: there is no wire to drop and no deadline to
+    // miss, so a vanished ModuleProxy is the only failure this transport has.
+    QVariant callMethodWithError(const QString& authToken,
+                                 const QString& methodName,
+                                 const QVariantList& args,
+                                 int /*timeoutMs*/,
+                                 logos::CallError* err) override
+    {
+        if (err) err->clear();
         if (!m_proxy) {
-            QTimer::singleShot(0, [callback]() { callback(QVariant()); });
+            if (err) *err = proxyGoneError();
+            return QVariant();
+        }
+        qDebug() << "[LogosObject] LocalLogosObject::callMethod" << methodName << "args:" << args.size();
+        return m_proxy->callRemoteMethod(authToken, methodName, args);
+    }
+
+    void callMethodAsyncWithError(const QString& authToken,
+                                  const QString& methodName,
+                                  const QVariantList& args,
+                                  int /*timeoutMs*/,
+                                  AsyncResultErrorCallback callback) override
+    {
+        if (!callback) return;
+        if (!m_proxy) {
+            const logos::CallError e = proxyGoneError();
+            QTimer::singleShot(0, [callback, e]() { callback(QVariant(), e); });
             return;
         }
         ModuleProxy* proxy = m_proxy;
         QTimer::singleShot(0, [proxy, authToken, methodName, args, callback]() {
             QVariant result = proxy->callRemoteMethod(authToken, methodName, args);
-            callback(result);
+            callback(result, logos::CallError{});
         });
     }
 
@@ -134,8 +167,16 @@ public:
     quintptr id() const override { return reinterpret_cast<quintptr>(m_proxy); }
 
 private:
+    logos::CallError proxyGoneError() const
+    {
+        const std::string origin = m_objectName.toStdString();
+        return logos::callErrorObjectUnavailable(
+            origin, "module '" + origin + "' is no longer registered locally");
+    }
+
     ModuleProxy* m_proxy;
     EventHelper* m_helper;
+    QString m_objectName;
 };
 
 // ── LocalTransportHost ───────────────────────────────────────────────────────
@@ -188,7 +229,7 @@ LogosObject* LocalTransportConnection::requestObject(const QString& objectName, 
     }
 
     qDebug() << "[LogosObject] LocalTransportConnection: returning LocalLogosObject for:" << objectName;
-    return new LocalLogosObject(proxy);
+    return new LocalLogosObject(proxy, objectName);
 }
 
 #include "local_transport.moc"

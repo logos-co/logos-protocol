@@ -23,7 +23,7 @@ namespace logos::plain {
 // Owns a shared_ptr<RpcConnectionBase>; the transport layer hands the
 // connection over after opening the socket. release() stops the connection.
 // -----------------------------------------------------------------------------
-class PlainLogosObject : public LogosObject {
+class PlainLogosObject : public LogosObject, public LogosObjectErrorChannel {
 public:
     PlainLogosObject(std::string objectName,
                      std::shared_ptr<RpcConnectionBase> conn);
@@ -39,6 +39,21 @@ public:
                          const QVariantList& args,
                          int timeoutMs,
                          AsyncResultCallback callback) override;
+
+    // LogosObjectErrorChannel — the real implementations. The two LogosObject
+    // entry points above are thin adapters that discard the error, so there is
+    // exactly ONE call path per direction and the two front doors cannot drift.
+    QVariant callMethodWithError(const QString& authToken,
+                                 const QString& methodName,
+                                 const QVariantList& args,
+                                 int timeoutMs,
+                                 logos::CallError* err) override;
+
+    void callMethodAsyncWithError(const QString& authToken,
+                                  const QString& methodName,
+                                  const QVariantList& args,
+                                  int timeoutMs,
+                                  AsyncResultErrorCallback callback) override;
 
     bool informModuleToken(const QString& authToken,
                            const QString& moduleName,
@@ -61,7 +76,12 @@ private:
     // matching callId lands. The completion arrives on the connection's IO
     // thread; the caller waits on another thread — m_completionMu/Cv bridge them.
     void ensureCompletionSub();
-    QVariant awaitCompletion(const QString& callId, int timeoutMs);
+    // `err` (optional) receives the timeout when the completion never lands —
+    // a deferred call that gives up is a timeout like any other, and used to be
+    // reported as a null result.
+    QVariant awaitCompletion(const QString& callId, int timeoutMs,
+                             const QString& methodName = QString(),
+                             logos::CallError* err = nullptr);
 
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;

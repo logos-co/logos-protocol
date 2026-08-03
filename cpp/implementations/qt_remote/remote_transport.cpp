@@ -57,10 +57,13 @@ private:
 
 } // anonymous namespace
 
-class RemoteLogosObject : public LogosObject {
+class RemoteLogosObject : public LogosObject, public LogosObjectErrorChannel {
 public:
-    explicit RemoteLogosObject(QObject* replica)
-        : m_replica(replica), m_helper(nullptr)
+    // objectName is carried purely so a failure can name the module it belongs
+    // to — logos::CallError::origin, the same field the acquire-time error and
+    // lp_invoke's out_error_json already fill in.
+    RemoteLogosObject(QObject* replica, QString objectName)
+        : m_replica(replica), m_helper(nullptr), m_objectName(std::move(objectName))
     {
         qDebug() << "[LogosObject] Created RemoteLogosObject wrapping QRemoteObjectReplica" << reinterpret_cast<quintptr>(replica);
         if (m_replica) {
@@ -96,7 +99,9 @@ public:
                         // first (mirrors the QPointer guard in invokeRemoteMethodAsync).
                         if (cb)
                             QTimer::singleShot(0, m_helper,
-                                [cb = std::move(cb), result]() { cb(result); });
+                                [cb = std::move(cb), result]() {
+                                    cb(result, logos::CallError{});
+                                });
                     }
                 });
         }
@@ -115,13 +120,32 @@ public:
         }
     }
 
+    // Adapter over the error-carrying implementation: discards the diagnosis,
+    // which is exactly what this entry point has always done.
     QVariant callMethod(const QString& authToken,
                         const QString& methodName,
                         const QVariantList& args,
                         int timeoutMs) override
     {
+        return callMethodWithError(authToken, methodName, args, timeoutMs, nullptr);
+    }
+
+    QVariant callMethodWithError(const QString& authToken,
+                                 const QString& methodName,
+                                 const QVariantList& args,
+                                 int timeoutMs,
+                                 logos::CallError* err) override
+    {
+        if (err) err->clear();
+        const std::string origin = m_objectName.toStdString();
+        const std::string method = methodName.toStdString();
+
         if (!m_replica) {
             qWarning() << "RemoteLogosObject: Cannot call method on null replica";
+            if (err)
+                *err = logos::callErrorObjectUnavailable(
+                    origin, "replica for '" + origin + "' is gone (module unloaded"
+                            " or transport dropped)");
             return QVariant();
         }
         qDebug() << "[LogosObject] RemoteLogosObject::callMethod" << methodName << "args:" << args.size();
@@ -139,22 +163,41 @@ public:
 
         if (!success) {
             qWarning() << "RemoteLogosObject: Failed to invoke callRemoteMethod on replica";
+            if (err)
+                *err = logos::callErrorCallFailed(
+                    origin, "replica did not accept callRemoteMethod for '"
+                            + method + "'");
             return QVariant();
         }
 
         pendingCall.waitForFinished(timeoutMs);
 
-        if (!pendingCall.isFinished() || pendingCall.error() != QRemoteObjectPendingCall::NoError) {
-            qWarning() << "RemoteLogosObject: callRemoteMethod failed or timed out:" << pendingCall.error();
+        // Two distinct outcomes that used to collapse into one empty QVariant:
+        // the deadline elapsed with the call still in flight (timeout), and QtRO
+        // itself failed the call (transport).
+        if (!pendingCall.isFinished()) {
+            qWarning() << "RemoteLogosObject: callRemoteMethod timed out";
+            if (err) *err = logos::callErrorTimeout(origin, method, timeoutMs);
+            return QVariant();
+        }
+        if (pendingCall.error() != QRemoteObjectPendingCall::NoError) {
+            qWarning() << "RemoteLogosObject: callRemoteMethod failed:" << pendingCall.error();
+            if (err)
+                *err = logos::callErrorTransport(
+                    origin, "QtRO call to '" + origin + "." + method
+                            + "' failed with error "
+                            + std::to_string(static_cast<int>(pendingCall.error())));
             return QVariant();
         }
 
         // A "multi" provider may have deferred the result (returned a pending
         // sentinel); resolveDeferred waits for the completion event, or returns
         // the value unchanged for an ordinary (synchronous) result.
-        return resolveDeferred(pendingCall.returnValue(), timeoutMs);
+        return resolveDeferred(pendingCall.returnValue(), timeoutMs, methodName, err);
     }
 
+    // Adapter over the error-carrying implementation: discards the diagnosis,
+    // which is exactly what this entry point has always done.
     void callMethodAsync(const QString& authToken,
                          const QString& methodName,
                          const QVariantList& args,
@@ -162,8 +205,27 @@ public:
                          AsyncResultCallback callback) override
     {
         if (!callback) return;
+        callMethodAsyncWithError(authToken, methodName, args, timeoutMs,
+            [cb = std::move(callback)](QVariant v, const logos::CallError&) mutable {
+                cb(std::move(v));
+            });
+    }
+
+    void callMethodAsyncWithError(const QString& authToken,
+                                  const QString& methodName,
+                                  const QVariantList& args,
+                                  int timeoutMs,
+                                  AsyncResultErrorCallback callback) override
+    {
+        if (!callback) return;
+        const std::string origin = m_objectName.toStdString();
+        const std::string method = methodName.toStdString();
+
         if (!m_replica) {
-            QTimer::singleShot(0, [callback]() { callback(QVariant()); });
+            const logos::CallError e = logos::callErrorObjectUnavailable(
+                origin, "replica for '" + origin + "' is gone (module unloaded"
+                        " or transport dropped)");
+            QTimer::singleShot(0, [callback, e]() { callback(QVariant(), e); });
             return;
         }
 
@@ -182,7 +244,9 @@ public:
 
         if (!success) {
             qWarning() << "RemoteLogosObject: Failed to invoke callRemoteMethod on replica (async)";
-            QTimer::singleShot(0, [callback]() { callback(QVariant()); });
+            const logos::CallError e = logos::callErrorCallFailed(
+                origin, "replica did not accept callRemoteMethod for '" + method + "'");
+            QTimer::singleShot(0, [callback, e]() { callback(QVariant(), e); });
             return;
         }
 
@@ -195,39 +259,50 @@ public:
 
         // Success handler -- delivers result on the consumer's thread
         QObject::connect(watcher, &QRemoteObjectPendingCallWatcher::finished,
-                         watcher, [this, callback, timer, timeoutMs](QRemoteObjectPendingCallWatcher* w) {
+                         watcher, [this, callback, timer, timeoutMs, origin, method](QRemoteObjectPendingCallWatcher* w) {
             timer->stop(); // cancel timeout
             QVariant result;
+            logos::CallError err;
             if (w->error() == QRemoteObjectPendingCall::NoError) {
                 result = w->returnValue();
             } else {
                 qWarning() << "RemoteLogosObject: async callMethod error:" << w->error();
+                err = logos::callErrorTransport(
+                    origin, "QtRO call to '" + origin + "." + method
+                            + "' failed with error "
+                            + std::to_string(static_cast<int>(w->error())));
             }
             w->deleteLater();
             // A "multi" provider may have deferred the result: wait for the
             // completion event instead of delivering the pending sentinel.
-            {
+            if (err.ok()) {
                 QString callId;
                 if (logos::isPendingCallSentinel(result, &callId)) {
-                    if (m_completions.contains(callId)) { callback(m_completions.take(callId)); return; }
+                    if (m_completions.contains(callId)) {
+                        callback(m_completions.take(callId), logos::CallError{});
+                        return;
+                    }
                     m_asyncCompletionCbs.insert(callId, callback);
-                    // Bound the wait: deliver an empty result once if it never lands.
-                    QTimer::singleShot(timeoutMs, m_helper, [this, callId]() {
+                    // Bound the wait: a completion that never lands is a timeout,
+                    // reported as one instead of as an empty result.
+                    QTimer::singleShot(timeoutMs, m_helper, [this, callId, origin, method, timeoutMs]() {
                         if (m_asyncCompletionCbs.contains(callId)) {
                             auto cb = m_asyncCompletionCbs.take(callId);
-                            if (cb) cb(QVariant());
+                            if (cb)
+                                cb(QVariant(),
+                                   logos::callErrorTimeout(origin, method, timeoutMs));
                         }
                     });
                     return;
                 }
             }
-            callback(result);
+            callback(result, err);
         }, Qt::QueuedConnection);
 
-        // Timeout handler -- stops the watcher and delivers empty result
-        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, callback]() {
+        // Timeout handler -- stops the watcher and reports the elapsed deadline
+        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, callback, origin, method, timeoutMs]() {
             qWarning() << "RemoteLogosObject: async callMethod timed out";
-            callback(QVariant());
+            callback(QVariant(), logos::callErrorTimeout(origin, method, timeoutMs));
             watcher->deleteLater(); // also destroys the timer (child)
         });
 
@@ -357,7 +432,9 @@ private:
     // Resolve a possibly-deferred result. If `rv` is a pending sentinel from a
     // "multi" provider, wait (up to timeoutMs) for the completion event keyed by
     // callId, pumping the consumer event loop; otherwise return `rv` unchanged.
-    QVariant resolveDeferred(const QVariant& rv, int timeoutMs)
+    QVariant resolveDeferred(const QVariant& rv, int timeoutMs,
+                             const QString& methodName = QString(),
+                             logos::CallError* err = nullptr)
     {
         QString callId;
         if (!logos::isPendingCallSentinel(rv, &callId)) return rv;
@@ -373,6 +450,10 @@ private:
         m_completionWaiters.remove(callId);
         if (m_completions.contains(callId)) return m_completions.take(callId);
         qWarning() << "RemoteLogosObject: deferred call" << callId << "timed out";
+        if (err)
+            *err = logos::callErrorTimeout(m_objectName.toStdString(),
+                                           methodName.toStdString(),
+                                           timeoutMs > 0 ? timeoutMs : 30000);
         return QVariant();
     }
 
@@ -383,7 +464,8 @@ private:
     // Touched only on the consumer event-loop thread.
     QHash<QString, QVariant> m_completions;
     QHash<QString, QEventLoop*> m_completionWaiters;
-    QHash<QString, AsyncResultCallback> m_asyncCompletionCbs;
+    QHash<QString, AsyncResultErrorCallback> m_asyncCompletionCbs;
+    QString m_objectName;
 };
 
 // ── RemoteTransportHost ──────────────────────────────────────────────────────
@@ -538,7 +620,7 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
 
     qDebug() << "[LogosObject] RemoteTransportConnection: returning RemoteLogosObject for:" << objectName;
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
-    return new RemoteLogosObject(replica);
+    return new RemoteLogosObject(replica, objectName);
 }
 
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }

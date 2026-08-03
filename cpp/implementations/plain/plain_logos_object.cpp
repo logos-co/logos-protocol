@@ -33,7 +33,24 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
                                       const QVariantList& args,
                                       int timeoutMs)
 {
-    if (!m_conn || !m_conn->isOpen()) return QVariant();
+    // Adapter over the error-carrying implementation: discards the diagnosis,
+    // which is exactly what this entry point has always done.
+    return callMethodWithError(authToken, methodName, args, timeoutMs, nullptr);
+}
+
+QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
+                                               const QString& methodName,
+                                               const QVariantList& args,
+                                               int timeoutMs,
+                                               logos::CallError* err)
+{
+    if (err) err->clear();
+    if (!m_conn || !m_conn->isOpen()) {
+        if (err)
+            *err = logos::callErrorTransport(
+                m_objectName, "connection to '" + m_objectName + "' is not open");
+        return QVariant();
+    }
 
     // Subscribe to the completion channel BEFORE sending, so a "multi" provider's
     // completion can't race ahead of the waiter (it's buffered either way).
@@ -50,12 +67,22 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
 
     if (fut.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
         qWarning() << "PlainLogosObject::callMethod: timeout for" << methodName;
+        if (err)
+            *err = logos::callErrorTimeout(m_objectName, methodName.toStdString(),
+                                           timeoutMs);
         return QVariant();
     }
     auto res = fut.get();
     if (!res.ok) {
         qWarning() << "PlainLogosObject::callMethod:" << methodName
                    << "failed:" << QString::fromStdString(res.err);
+        // res.errCode / res.err have been on the wire since the plain transport
+        // existed; this is the first caller to keep them. MODULE_NOT_LOADED in
+        // particular is how "the module isn't there" reaches us on this
+        // transport — requestObject never checks publication — so without this
+        // the single most common failure was reported as a null result.
+        if (err)
+            *err = logos::callErrorFromWire(m_objectName, res.errCode, res.err);
         return QVariant();
     }
     const QVariant value = rpcValueToQVariant(res.value);
@@ -64,7 +91,7 @@ QVariant PlainLogosObject::callMethod(const QString& authToken,
     {
         QString callId;
         if (logos::isPendingCallSentinel(value, &callId))
-            return awaitCompletion(callId, timeoutMs);
+            return awaitCompletion(callId, timeoutMs, methodName, err);
     }
     return value;
 }
@@ -90,15 +117,21 @@ void PlainLogosObject::ensureCompletionSub()
     });
 }
 
-QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs)
+QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs,
+                                           const QString& methodName,
+                                           logos::CallError* err)
 {
     std::unique_lock<std::mutex> lk(m_completionMu);
+    const auto effectiveMs = timeoutMs > 0 ? timeoutMs : 30000;
     const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 30000);
+        + std::chrono::milliseconds(effectiveMs);
     const bool got = m_completionCv.wait_until(lk, deadline,
         [&] { return m_completions.count(callId) > 0; });
     if (!got) {
         qWarning() << "PlainLogosObject: deferred call" << callId << "timed out";
+        if (err)
+            *err = logos::callErrorTimeout(m_objectName, methodName.toStdString(),
+                                           effectiveMs);
         return QVariant();
     }
     const QVariant result = m_completions[callId];
@@ -118,14 +151,15 @@ namespace {
 // process, regardless of which worker thread completed the future.
 // If the application has shut down (instance() is null), we drop the
 // callback rather than invoke it from an arbitrary thread.
-void postToQtEventLoop(PlainLogosObject::AsyncResultCallback callback,
-                       QVariant result)
+void postToQtEventLoop(PlainLogosObject::AsyncResultErrorCallback callback,
+                       QVariant result, logos::CallError err)
 {
     QCoreApplication* app = QCoreApplication::instance();
     if (!app) return;
     QMetaObject::invokeMethod(app,
-        [callback = std::move(callback), result = std::move(result)]() mutable {
-            callback(result);
+        [callback = std::move(callback), result = std::move(result),
+         err = std::move(err)]() mutable {
+            callback(result, err);
         },
         Qt::QueuedConnection);
 }
@@ -138,11 +172,29 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
                                        int timeoutMs,
                                        AsyncResultCallback callback)
 {
+    // Adapter over the error-carrying implementation: discards the diagnosis,
+    // which is exactly what this entry point has always done.
+    if (!callback) return;
+    callMethodAsyncWithError(authToken, methodName, args, timeoutMs,
+        [cb = std::move(callback)](QVariant v, const logos::CallError&) mutable {
+            cb(std::move(v));
+        });
+}
+
+void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
+                                                const QString& methodName,
+                                                const QVariantList& args,
+                                                int timeoutMs,
+                                                AsyncResultErrorCallback callback)
+{
     if (!callback) return;
     if (!m_conn || !m_conn->isOpen()) {
         // Defer even the failure path — LogosObject's contract requires
         // callbacks on a subsequent event-loop iteration, never inline.
-        postToQtEventLoop(std::move(callback), QVariant());
+        postToQtEventLoop(std::move(callback), QVariant(),
+                          logos::callErrorTransport(
+                              m_objectName,
+                              "connection to '" + m_objectName + "' is not open"));
         return;
     }
 
@@ -163,22 +215,33 @@ void PlainLogosObject::callMethodAsync(const QString& authToken,
     // future iteration can fold this wait into the shared Asio
     // io_context (the connection already runs on it) so we don't spin
     // up a thread per pending RPC.
-    std::thread([this, fut, timeoutMs, callback = std::move(callback)]() mutable {
+    const std::string method = methodName.toStdString();
+    std::thread([this, fut, timeoutMs, methodName, method,
+                 callback = std::move(callback)]() mutable {
         if (fut->wait_for(std::chrono::milliseconds(timeoutMs))
             != std::future_status::ready) {
-            postToQtEventLoop(std::move(callback), QVariant());
+            postToQtEventLoop(std::move(callback), QVariant(),
+                              logos::callErrorTimeout(m_objectName, method,
+                                                      timeoutMs));
             return;
         }
         auto res = fut->get();
-        QVariant value = res.ok ? rpcValueToQVariant(res.value) : QVariant();
+        if (!res.ok) {
+            postToQtEventLoop(std::move(callback), QVariant(),
+                              logos::callErrorFromWire(m_objectName, res.errCode,
+                                                       res.err));
+            return;
+        }
+        QVariant value = rpcValueToQVariant(res.value);
         // Resolve a "multi" provider's deferred completion (sentinel → wait for
         // the completion event) right here on the waiter thread.
+        logos::CallError err;
         {
             QString callId;
             if (logos::isPendingCallSentinel(value, &callId))
-                value = awaitCompletion(callId, timeoutMs);
+                value = awaitCompletion(callId, timeoutMs, methodName, &err);
         }
-        postToQtEventLoop(std::move(callback), std::move(value));
+        postToQtEventLoop(std::move(callback), std::move(value), std::move(err));
     }).detach();
 }
 

@@ -36,6 +36,20 @@ add_executable(protocol_tests
     # canonical error object, a succeeding one must still report ok=1 with its
     # value. Both over a real (plain TCP) transport.
     test_lp_invoke_async_error.cpp
+    # The rest of that channel: everything the TRANSPORT learns once acquire has
+    # already succeeded — a timeout, and MODULE_NOT_LOADED against a host that is
+    # up (which is not an acquire failure on the plain transport, because
+    # requestObject never checks publication). Both were discarded by
+    # PlainLogosObject and by the hard-coded empty CallError above it, on the
+    # SYNC path as much as the async one. Matched set: the two failures must
+    # report the canonical error object, the successes must still report their
+    # value, and the one case that genuinely cannot be fixed here (an unknown
+    # method, which every provider answers with a bare null) is pinned as-is.
+    test_call_error_after_acquire.cpp
+    # The same channel over the DEFAULT transport (LocalSocket/QtRO), so the fix
+    # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
+    # which needs no blocking provider and therefore no second event loop.
+    test_call_error_qt_remote.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

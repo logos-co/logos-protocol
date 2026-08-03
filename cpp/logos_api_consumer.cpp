@@ -141,6 +141,16 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     qDebug() << "[LogosObject] LogosAPIConsumer: calling via LogosObject::callMethod" << methodName;
     // No release() here: the handle stays cached for the next call. Released in
     // clearObjectCache() (destructor / reconnect) or evicted when stale.
+    //
+    // Prefer the error channel when the transport implements it (see
+    // LogosObjectErrorChannel in logos_object.h). Without it, `err` could only
+    // ever describe an ACQUIRE failure — everything that went wrong after the
+    // handle existed (the deadline elapsing, the connection dropping, the peer
+    // answering "not published") came back as a bare QVariant() with a clean
+    // err, i.e. reported as a method that returned null.
+    if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin))
+        return channel->callMethodWithError(authToken, methodName, args,
+                                            timeout.ms, err);
     return plugin->callMethod(authToken, methodName, args, timeout.ms);
 }
 
@@ -216,6 +226,23 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
     // before the transport callback fires, the callback is silently dropped and
     // the handle is released by the destructor's clearObjectCache(), not here.
     QPointer<LogosAPIConsumer> self(this);
+
+    // Prefer the error channel when the transport implements it. The lambda
+    // below used to take only `QVariant result` and hand the caller a
+    // hard-coded empty logos::CallError — so once acquire had succeeded, every
+    // async outcome was reported as a success, whatever actually happened.
+    if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin)) {
+        channel->callMethodAsyncWithError(authToken, methodName, args, timeout.ms,
+            [callback, self](QVariant result, const logos::CallError& err) {
+                if (!self)
+                    return;
+                callback(std::move(result), err);
+            });
+        return;
+    }
+
+    // Transport without an error channel (the mock): unchanged behaviour —
+    // the value, and no diagnosis to give.
     plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
         [callback, self](QVariant result) {
             if (!self)
