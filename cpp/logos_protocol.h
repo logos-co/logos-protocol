@@ -193,9 +193,22 @@ int lp_invoke(lp_client* client,
  * `cb` carries the same outcome the sync twin splits across its return code
  * and out-params: ok != 0 → `json` is the result JSON value; ok == 0 → `json`
  * is the canonical error object lp_invoke would have written to
- * out_error_json (e.g. code "object_unavailable" when the target module is
- * not loaded). A LP_OK return therefore means "dispatched", never "succeeded"
- * — the outcome is only known in the callback.
+ * out_error_json. A LP_OK return therefore means "dispatched", never
+ * "succeeded" — the outcome is only known in the callback.
+ *
+ * WHAT ok == 0 COVERS, precisely, because "the same outcome as the sync twin"
+ * is a statement about PARITY and not about completeness. Reported: failure to
+ * acquire the target ("object_unavailable"), a call that exceeds its deadline,
+ * a rejected auth token, and MODULE_NOT_LOADED from a host that is up. Both
+ * twins report all four; neither did before.
+ *
+ * NOT reported, and it is not an oversight: an unknown method name. Every
+ * provider flavour answers one with a bare null, byte-identical to a method
+ * that legitimately returns null, so the distinction does not exist on the
+ * wire to be reported. Closing it needs a provider-contract change across the
+ * SDKs, not a transport change here. A provider's own rejection of well-formed
+ * arguments ("dispatch_failed") is likewise NOT folded in by either twin — it
+ * arrives as a result, and the generated wrappers fold it.
  *
  * Argument/handle validation still fails synchronously with
  * LP_ERR_INVALID_ARG and `cb` is NOT called in that case.
