@@ -26,6 +26,20 @@ PlainLogosObject::PlainLogosObject(std::string objectName,
 PlainLogosObject::~PlainLogosObject()
 {
     disconnectEvents();
+    joinWaiters();
+}
+
+void PlainLogosObject::joinWaiters()
+{
+    std::vector<std::thread> waiters;
+    {
+        std::lock_guard<std::mutex> g(m_waiterMu);
+        waiters.swap(m_waiters);
+    }
+    for (auto& t : waiters) {
+        if (t.joinable())
+            t.join();
+    }
 }
 
 QVariant PlainLogosObject::callMethod(const QString& authToken,
@@ -215,34 +229,45 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
     // future iteration can fold this wait into the shared Asio
     // io_context (the connection already runs on it) so we don't spin
     // up a thread per pending RPC.
+    //
+    // The thread is JOINed in joinWaiters() (destructor / release), not
+    // detached: capturing `this` for awaitCompletion / m_objectName is
+    // only safe while the object is alive, and release() used to
+    // `delete this` while a waiter could still be mid-flight.
+    const std::string objectName = m_objectName;
     const std::string method = methodName.toStdString();
-    std::thread([this, fut, timeoutMs, methodName, method,
-                 callback = std::move(callback)]() mutable {
-        if (fut->wait_for(std::chrono::milliseconds(timeoutMs))
-            != std::future_status::ready) {
-            postToQtEventLoop(std::move(callback), QVariant(),
-                              logos::callErrorTimeout(m_objectName, method,
-                                                      timeoutMs));
-            return;
-        }
-        auto res = fut->get();
-        if (!res.ok) {
-            postToQtEventLoop(std::move(callback), QVariant(),
-                              logos::callErrorFromWire(m_objectName, res.errCode,
-                                                       res.err));
-            return;
-        }
-        QVariant value = rpcValueToQVariant(res.value);
-        // Resolve a "multi" provider's deferred completion (sentinel → wait for
-        // the completion event) right here on the waiter thread.
-        logos::CallError err;
-        {
-            QString callId;
-            if (logos::isPendingCallSentinel(value, &callId))
-                value = awaitCompletion(callId, timeoutMs, methodName, &err);
-        }
-        postToQtEventLoop(std::move(callback), std::move(value), std::move(err));
-    }).detach();
+    // Register under the lock BEFORE the thread can outrun release(): a
+    // detach-then-push left a window where delete this raced the waiter.
+    {
+        std::lock_guard<std::mutex> g(m_waiterMu);
+        m_waiters.emplace_back([this, objectName, fut, timeoutMs, methodName, method,
+                                callback = std::move(callback)]() mutable {
+            if (fut->wait_for(std::chrono::milliseconds(timeoutMs))
+                != std::future_status::ready) {
+                postToQtEventLoop(std::move(callback), QVariant(),
+                                  logos::callErrorTimeout(objectName, method,
+                                                          timeoutMs));
+                return;
+            }
+            auto res = fut->get();
+            if (!res.ok) {
+                postToQtEventLoop(std::move(callback), QVariant(),
+                                  logos::callErrorFromWire(objectName, res.errCode,
+                                                           res.err));
+                return;
+            }
+            QVariant value = rpcValueToQVariant(res.value);
+            // Resolve a "multi" provider's deferred completion (sentinel → wait for
+            // the completion event) right here on the waiter thread.
+            logos::CallError err;
+            {
+                QString callId;
+                if (logos::isPendingCallSentinel(value, &callId))
+                    value = awaitCompletion(callId, timeoutMs, methodName, &err);
+            }
+            postToQtEventLoop(std::move(callback), std::move(value), std::move(err));
+        });
+    }
 }
 
 bool PlainLogosObject::informModuleToken(const QString& authToken,
@@ -329,7 +354,12 @@ void PlainLogosObject::release()
     // the connection for every other holder too, so just unsubscribe our
     // own events and drop our reference — the connection stays alive
     // until PlainTransportConnection itself is destroyed.
+    //
+    // joinWaiters() before delete: in-flight async waiters capture `this`
+    // (for awaitCompletion). Detaching them used to let release() free the
+    // object under a still-running waiter.
     disconnectEvents();
+    joinWaiters();
     m_conn.reset();
     delete this;
 }

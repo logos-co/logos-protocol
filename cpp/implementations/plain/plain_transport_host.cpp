@@ -11,7 +11,10 @@
 #include <QMetaObject>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/version.hpp>
 #include <openssl/ssl.h>
@@ -210,6 +213,30 @@ PlainTransportHost::~PlainTransportHost()
     }
     if (tcp) tcp->stop();
     if (ssl) ssl->stop();
+
+    // Quiesce the I/O thread before this host (an IncomingCallHandler) is
+    // destroyed. Server-side RpcConnections hold a RAW `IncomingCallHandler*`
+    // back to us; a read completion racing this teardown runs
+    // RpcConnection::fail() on the I/O thread, which calls
+    // m_handler->onConnectionClosed(this). stop() above closes the sockets but
+    // does NOT wait for an already-executing fail() — so without this barrier
+    // the handler can be freed mid-call (a use-after-free that surfaced as a
+    // flaky SIGSEGV, including on macOS CI in CallErrorAfterAcquireTest right
+    // after a preceding live-host test tore its PlainTransportHost down).
+    // There is a single shared I/O thread, so a task posted now runs only after
+    // every in-flight/queued connection handler has completed; blocking on it
+    // guarantees no callback still references this host. Skip when we're ON
+    // the I/O thread (the in-flight handler is our own caller) to avoid
+    // self-deadlock.
+    if (tcp || ssl) {
+        auto& ioc = IoContextPool::shared().ioContext();
+        if (!ioc.get_executor().running_in_this_thread()) {
+            std::promise<void> drained;
+            auto fut = drained.get_future();
+            boost::asio::post(ioc, [&drained] { drained.set_value(); });
+            fut.wait_for(std::chrono::seconds(5)); // safety-bounded; work-guard keeps the thread alive
+        }
+    }
 }
 
 bool PlainTransportHost::start()

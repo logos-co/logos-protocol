@@ -257,10 +257,34 @@ public:
         auto* timer = new QTimer(watcher);
         timer->setSingleShot(true);
 
+        // Exactly-once gate. The finished handler and the timeout timer can
+        // both be queued around the same moment; without a guard that races
+        // into a double callback, which violates callMethodAsyncWithError's
+        // contract and is a latent double-free for every consumer. The same
+        // gate wraps the deferred-completion path so a late completion cannot
+        // deliver after the initial timeout already has (or vice versa).
+        auto delivered = std::make_shared<std::atomic_bool>(false);
+        AsyncResultErrorCallback deliverOnce =
+            [delivered, callback = std::move(callback)](QVariant result,
+                                                       const logos::CallError& err) mutable {
+                if (delivered->exchange(true))
+                    return;
+                if (callback)
+                    callback(std::move(result), err);
+            };
+
         // Success handler -- delivers result on the consumer's thread
         QObject::connect(watcher, &QRemoteObjectPendingCallWatcher::finished,
-                         watcher, [this, callback, timer, timeoutMs, origin, method](QRemoteObjectPendingCallWatcher* w) {
+                         watcher, [this, deliverOnce, timer, timeoutMs, origin, method, delivered](QRemoteObjectPendingCallWatcher* w) {
             timer->stop(); // cancel timeout
+            // Timeout may already have won the race and deleteLater'd us; if
+            // the slot still runs, do not enter the deferred-completion path
+            // or we would arm a second delivery after the caller already saw
+            // a timeout.
+            if (delivered->load()) {
+                w->deleteLater();
+                return;
+            }
             QVariant result;
             logos::CallError err;
             if (w->error() == QRemoteObjectPendingCall::NoError) {
@@ -279,10 +303,10 @@ public:
                 QString callId;
                 if (logos::isPendingCallSentinel(result, &callId)) {
                     if (m_completions.contains(callId)) {
-                        callback(m_completions.take(callId), logos::CallError{});
+                        deliverOnce(m_completions.take(callId), logos::CallError{});
                         return;
                     }
-                    m_asyncCompletionCbs.insert(callId, callback);
+                    m_asyncCompletionCbs.insert(callId, deliverOnce);
                     // Bound the wait: a completion that never lands is a timeout,
                     // reported as one instead of as an empty result.
                     QTimer::singleShot(timeoutMs, m_helper, [this, callId, origin, method, timeoutMs]() {
@@ -296,13 +320,13 @@ public:
                     return;
                 }
             }
-            callback(result, err);
+            deliverOnce(result, err);
         }, Qt::QueuedConnection);
 
         // Timeout handler -- stops the watcher and reports the elapsed deadline
-        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, callback, origin, method, timeoutMs]() {
+        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, deliverOnce, origin, method, timeoutMs]() {
             qWarning() << "RemoteLogosObject: async callMethod timed out";
-            callback(QVariant(), logos::callErrorTimeout(origin, method, timeoutMs));
+            deliverOnce(QVariant(), logos::callErrorTimeout(origin, method, timeoutMs));
             watcher->deleteLater(); // also destroys the timer (child)
         });
 

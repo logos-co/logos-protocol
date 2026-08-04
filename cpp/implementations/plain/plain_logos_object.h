@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -83,6 +84,11 @@ private:
                              const QString& methodName = QString(),
                              logos::CallError* err = nullptr);
 
+    // Join every per-call waiter before tearing the object down. callMethodAsync
+    // used to detach those threads, so release()/delete racing an in-flight
+    // wait was a use-after-free on `this` (m_objectName, awaitCompletion, …).
+    void joinWaiters();
+
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;
     std::mutex                           m_mu;
@@ -92,6 +98,9 @@ private:
     std::condition_variable              m_completionCv;
     std::map<QString, QVariant>          m_completions;
     bool                                 m_completionSubscribed = false;
+
+    std::mutex                           m_waiterMu;
+    std::vector<std::thread>             m_waiters;
 };
 
 } // namespace logos::plain

@@ -207,4 +207,11 @@ TEST_F(LpInvokeAsyncErrorTest, LiveTargetStillReportsOkWithItsValue)
     // Let the deferred client teardown run before the host goes away.
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     host.reset();
+    // Drain any QueuedConnection onCall invokes that PlainTransportHost
+    // posted to `proxy` before stop() returned. Without this, those
+    // slots can fire after `proxy` is destroyed at scope exit — a UAF
+    // that corrupts the heap and segfaults the *next* test (seen on
+    // macOS as CallErrorAfterAcquireTest.AsyncSuccessStillReportsTheValue
+    // crashing with no output of its own).
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
 }
