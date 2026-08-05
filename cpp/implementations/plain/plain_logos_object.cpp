@@ -44,6 +44,25 @@ constexpr std::chrono::milliseconds kWaitSlice(25);
 
 enum class WaitOutcome { Ready, TimedOut, Cancelled };
 
+// ── the one rule both waits follow ──────────────────────────────────────────
+//
+// AN ANSWER ALREADY IN HAND BEATS A CONCURRENT STOP. The stop only decides what
+// happens when there is nothing to hand over.
+//
+// The two sites used to resolve this in opposite directions — this one tested
+// the flag before polling, so an already-ready future was still reported as
+// transport_error, while awaitCompletion deliberately preferred a completion
+// that had landed. Both were commented as deliberate, and they cannot both be
+// right, so: the callback fires either way (postToQtEventLoop copies everything
+// it delivers, precisely so a released handle costs it nothing), which means the
+// only thing a stop can change is what the callback SAYS. Reporting
+// transport_error while the true answer sits in the future is a failure that did
+// not happen, and that code is not inert — callers re-acquire, retry and log on
+// it. Preferring the answer is also free: it is already there, so nothing waits
+// for it. The teardown-latency bound is untouched, because the flag is still
+// checked before every sleep, and a stop with no answer in hand still wins
+// immediately.
+//
 // The interruptible form of `fut.wait_for(milliseconds(timeoutMs))`.
 //
 // The overall deadline is computed once, so slicing does not stretch the
@@ -54,27 +73,23 @@ WaitOutcome waitForResult(std::future<ResultMessage>& fut, int timeoutMs,
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
-        // Checked BEFORE sleeping, so a stop that already happened costs
+        // Poll FIRST, with a zero wait: an answer in hand beats both a
+        // concurrent stop and the deadline. This is also what makes a
+        // non-positive timeout behave as the single unsliced wait_for did —
+        // one poll, then give up — and what reports a future that went ready
+        // during the last slice.
+        if (fut.wait_for(clock::duration::zero()) == std::future_status::ready)
+            return WaitOutcome::Ready;
+        // Checked before sleeping, so a stop that already happened costs
         // nothing, and after every slice, so one that arrives mid-wait costs at
-        // most kWaitSlice. A pending stop beats a result that landed in the
-        // same tick on purpose: the caller has released the handle and is no
-        // longer interested in the answer.
+        // most kWaitSlice.
         if (stopping.load(std::memory_order_acquire))
             return WaitOutcome::Cancelled;
 
         const auto remaining = deadline - clock::now();
-        const bool expired = remaining <= clock::duration::zero();
-        // At (or past) the deadline, poll once with a zero wait rather than
-        // giving up blind — that is what the single unsliced wait_for did for a
-        // non-positive timeout, and a future that is already ready must still
-        // be reported as ready.
-        const auto slice = expired
-            ? clock::duration::zero()
-            : std::min<clock::duration>(kWaitSlice, remaining);
-        if (fut.wait_for(slice) == std::future_status::ready)
-            return WaitOutcome::Ready;
-        if (expired)
+        if (remaining <= clock::duration::zero())
             return WaitOutcome::TimedOut;
+        fut.wait_for(std::min<clock::duration>(kWaitSlice, remaining));
     }
 }
 
@@ -129,21 +144,86 @@ void PlainLogosObject::stopWaiters()
     m_completionCv.notify_all();
 }
 
+void PlainLogosObject::publishFinishedWaiter(std::uint64_t id)
+{
+    std::lock_guard<std::mutex> g(m_waiterMu);
+    m_finishedWaiters.push_back(id);
+}
+
+void PlainLogosObject::reapFinishedWaiters()
+{
+    // Only ids a waiter published are taken, and publishing is that waiter's
+    // last act — so everything moved into `done` has already stopped touching
+    // this object, and joining it is effectively instant.
+    std::vector<std::thread> done;
+    {
+        std::lock_guard<std::mutex> g(m_waiterMu);
+        std::vector<std::uint64_t> keep;
+        for (const std::uint64_t id : m_finishedWaiters) {
+            const auto it = m_waiters.find(id);
+            if (it == m_waiters.end())
+                continue;   // teardown already took this one
+            if (it->second.get_id() == std::this_thread::get_id()) {
+                // Unreachable today — callbacks are delivered on the Qt event
+                // loop, so a waiter thread never re-enters this class — but a
+                // thread that joined itself would terminate the process, and
+                // this is one comparison. Leave it registered; teardown, which
+                // runs on somebody else's thread, will collect it.
+                keep.push_back(id);
+                continue;
+            }
+            done.push_back(std::move(it->second));
+            m_waiters.erase(it);
+        }
+        m_finishedWaiters.swap(keep);
+    }
+    // Joined with NO lock held. Not just hygiene — this is THE deadlock this
+    // whole mechanism can introduce: a reaper holding m_waiterMu while it joins
+    // a waiter that is itself blocked on m_waiterMu trying to publish would
+    // wedge the process. Holding no lock across a join makes that impossible by
+    // construction rather than by argument, whatever a waiter does on its way
+    // out. stopAndJoinWaiters() keeps the same discipline for the same reason.
+    for (auto& t : done) {
+        if (t.joinable())
+            t.join();
+    }
+}
+
 void PlainLogosObject::stopAndJoinWaiters()
 {
     stopWaiters();
 
-    std::vector<std::thread> waiters;
+    std::map<std::uint64_t, std::thread> waiters;
     {
         std::lock_guard<std::mutex> g(m_waiterMu);
         waiters.swap(m_waiters);
     }
     // Joined with NO lock held: a waiter on its way out still takes
-    // m_completionMu (awaitCompletion) and m_waiterMu is what a concurrent
-    // callMethodAsyncWithError needs to see the stop flag.
-    for (auto& t : waiters) {
+    // m_completionMu (awaitCompletion) and then m_waiterMu (to publish), and
+    // m_waiterMu is also what a concurrent callMethodAsyncWithError needs in
+    // order to see the stop flag.
+    //
+    // Everything outstanding is joined by id-independent brute force, so this
+    // needs no cooperation from the reaper: a waiter that publishes while this
+    // loop runs simply leaves a stale id behind, and its thread is joined here
+    // anyway.
+    //
+    // A waiter that a concurrent reaper is in the middle of joining is NOT in
+    // this map, and that is still safe. The invariant is not "every waiter has
+    // been joined by the time this returns" but the thing that invariant was
+    // ever for: NO WAITER TOUCHES THIS OBJECT AFTER THIS RETURNS. An entry
+    // leaves m_waiters only once its thread has published, and publishing is
+    // that thread's last access — all it has left to do is unwind.
+    for (auto& entry : waiters) {
+        std::thread& t = entry.second;
         if (t.joinable())
             t.join();
+    }
+    // Cleared after the joins, so the stale ids just described go too. Nothing
+    // can be added afterwards: m_stopping is set, so no new waiter registers.
+    {
+        std::lock_guard<std::mutex> g(m_waiterMu);
+        m_finishedWaiters.clear();
     }
 }
 
@@ -252,8 +332,9 @@ QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs,
             || m_stopping.load(std::memory_order_relaxed);
     });
 
-    // A completion that actually landed beats a concurrent stop: there is a real
-    // answer in hand, so hand it over rather than manufacture an error.
+    // A completion that actually landed beats a concurrent stop — the same rule
+    // the future wait follows (see waitForResult): there is a real answer in
+    // hand, so hand it over rather than manufacture an error.
     const auto it = m_completions.find(callId);
     if (it != m_completions.end()) {
         const QVariant result = it->second;
@@ -359,33 +440,66 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
     // io_context (the connection already runs on it) so we don't spin
     // up a thread per pending RPC.
     //
-    // The thread is JOINed in stopAndJoinWaiters() (destructor / release), not
-    // detached: capturing `this` for awaitCompletion / m_stopping is
-    // only safe while the object is alive, and release() used to
+    // The thread is JOINed — in reapFinishedWaiters() once it has finished, or
+    // in stopAndJoinWaiters() (destructor / release) if teardown gets there
+    // first — never detached: capturing `this` for awaitCompletion /
+    // m_stopping is only safe while the object is alive, and release() used to
     // `delete this` while a waiter could still be mid-flight.
     const std::string objectName = m_objectName;
     const std::string method = methodName.toStdString();
+    // Retire the previous calls' waiters before adding one. Done HERE rather
+    // than by the waiters themselves because a thread cannot join itself; done
+    // BEFORE taking m_waiterMu because it joins, and joining under that lock is
+    // the deadlock described in reapFinishedWaiters().
+    reapFinishedWaiters();
     // Register under the lock BEFORE the thread can outrun release(): a
     // detach-then-push left a window where delete this raced the waiter.
     {
         std::lock_guard<std::mutex> g(m_waiterMu);
         if (m_stopping.load(std::memory_order_acquire)) {
-            // Teardown has already swapped m_waiters out, so a thread pushed
-            // now would never be joined — exactly the dangling waiter this
-            // whole mechanism exists to prevent. Answer as a cancelled call
-            // instead, which keeps the exactly-once contract either way.
+            // Refuse rather than register: teardown has already swapped
+            // m_waiters out, so a thread pushed now would never be joined.
+            //
+            // To be honest about what this branch is: it is NOT a reachable
+            // window that got closed. m_stopping is raised only by teardown
+            // (release() / the destructor), so a thread that can read it as
+            // true here is already calling a method on an object whose
+            // destructor is running — this very load is the use-after-free, and
+            // nothing inside this function can repair that. Reproduced as a
+            // SIGSEGV, on this branch and on its parent alike. It is kept
+            // because it costs one predictable branch on a path that already
+            // does a socket write, and because failing this way — one callback,
+            // with the same error a cancelled call gets — is strictly better
+            // than pushing a thread nobody will ever join, should some future
+            // caller of stopWaiters() make the state legitimately observable.
             postToQtEventLoop(std::move(callback), QVariant(),
                               callErrorReleased(objectName, method));
             return;
         }
-        m_waiters.emplace_back([this, objectName, fut, timeoutMs, methodName, method,
-                                callback = std::move(callback)]() mutable {
+        const std::uint64_t waiterId = m_nextWaiterId++;
+        std::thread waiter([this, waiterId, objectName, fut, timeoutMs, methodName, method,
+                            callback = std::move(callback)]() mutable {
             // Everything reached through `this` below (m_stopping,
             // awaitCompletion's m_completionMu / m_completions) is safe only
-            // because stopAndJoinWaiters() joins this thread before the object
-            // dies. Everything handed to postToQtEventLoop is a COPY, because
-            // that delivery happens after this thread has returned — i.e.
-            // possibly after the object is gone. Keep it that way.
+            // because this thread is joined before the object dies — by the
+            // reaper if it finishes first, by stopAndJoinWaiters() otherwise.
+            // Everything handed to postToQtEventLoop is a COPY, because that
+            // delivery happens after this thread has returned — i.e. possibly
+            // after the object is gone. Keep it that way.
+            //
+            // Declared FIRST so it destructs LAST: publishing this waiter's id
+            // is what permits somebody else to join and drop it, so it must
+            // come after every access to the object, on every exit path
+            // (four returns below, plus anything that throws). What runs after
+            // it is the unwinding of the captures above, none of which belongs
+            // to the object: a string, a shared_ptr to the call's future, and a
+            // callback that has already been moved out.
+            struct PublishOnExit {
+                PlainLogosObject* self;
+                std::uint64_t     id;
+                ~PublishOnExit() { self->publishFinishedWaiter(id); }
+            } publishOnExit{this, waiterId};
+
             const WaitOutcome outcome = waitForResult(*fut, timeoutMs, m_stopping);
             if (outcome == WaitOutcome::Cancelled) {
                 // A cancelled call still DELIVERS, exactly once. Returning
@@ -425,6 +539,7 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
             }
             postToQtEventLoop(std::move(callback), std::move(value), std::move(err));
         });
+        m_waiters.emplace(waiterId, std::move(waiter));
     }
 }
 
@@ -518,7 +633,8 @@ void PlainLogosObject::release()
     // object under a still-running waiter — and merely joining them made
     // release() block for the rest of the call's timeout, so they are asked to
     // stop first. Each abandoned call still delivers its callback, once, with
-    // callErrorReleased.
+    // callErrorReleased. Waiters that already finished were reaped as the
+    // calls after them were issued; this collects whatever is left.
     disconnectEvents();
     stopAndJoinWaiters();
     m_conn.reset();

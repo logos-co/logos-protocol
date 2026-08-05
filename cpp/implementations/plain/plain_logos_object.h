@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -102,6 +103,17 @@ private:
     // because the flag has to be published under m_completionMu (see the .cpp).
     void stopWaiters();
 
+    // Join and drop the waiters that have already FINISHED, so a handle that
+    // outlives its calls does not accumulate them. Called on every async spawn
+    // (a call pays for the corpse of an earlier one) and from
+    // stopAndJoinWaiters(). Cheap: a join on an already-returned thread is a
+    // couple of syscalls, and only ids a waiter itself published are touched.
+    void reapFinishedWaiters();
+    // A waiter's FINAL act — see the scope guard in callMethodAsyncWithError.
+    // After this returns, that thread never touches the object again, which is
+    // what makes it safe for someone else to join and drop it.
+    void publishFinishedWaiter(std::uint64_t id);
+
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;
     std::mutex                           m_mu;
@@ -112,8 +124,26 @@ private:
     std::map<QString, QVariant>          m_completions;
     bool                                 m_completionSubscribed = false;
 
+    // The waiter registry. KEYED, not a plain vector, because a thread cannot
+    // join itself: a waiter can therefore never retire its own entry, and a
+    // vector left only one moment to clear it — teardown — so every completed
+    // call parked a finished-but-unjoined thread (~one page of resident memory
+    // each) for the whole life of the handle. The production shape is one
+    // cached handle per module reused for every call (logos_api_consumer.cpp),
+    // so that grew without bound. Now a waiter publishes its id into
+    // m_finishedWaiters as its last act and the next spawn (or teardown) joins
+    // and erases it: see reapFinishedWaiters().
+    //
+    // Retention is bounded by the waiters that finish after the LAST spawn,
+    // i.e. by peak in-flight concurrency, not by call count.
+    //
+    // The real fix is still the TODO in callMethodAsyncWithError — fold the
+    // wait into the shared Asio io_context and have no thread per pending RPC
+    // at all. This makes the interim honest, it does not replace that.
     std::mutex                           m_waiterMu;
-    std::vector<std::thread>             m_waiters;
+    std::map<std::uint64_t, std::thread> m_waiters;
+    std::vector<std::uint64_t>           m_finishedWaiters;
+    std::uint64_t                        m_nextWaiterId = 0;
     // Read lock-free by the sliced future wait and under m_completionMu by
     // awaitCompletion's predicate; written under m_completionMu so the
     // condition-variable side cannot miss it. Never cleared — an object that

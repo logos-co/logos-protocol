@@ -59,6 +59,15 @@ add_executable(protocol_tests
     # returns turns a stall into a hang), and the join that keeps `this` alive
     # under the waiter is still there.
     test_plain_object_teardown.cpp
+    # The other half of the same mechanism: what a COMPLETED call leaves behind.
+    # A waiter cannot join itself, so while the registry was a plain vector the
+    # only thing that ever emptied it was teardown, and every finished call
+    # parked an unjoined thread (~one page of resident memory) for the life of
+    # the handle — unbounded under the cached-handle shape LogosAPIConsumer
+    # actually uses. Pins the registry not growing with call count, the
+    # reap-vs-publish race not deadlocking, and teardown still joining what is
+    # left.
+    test_plain_waiter_reaping.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
