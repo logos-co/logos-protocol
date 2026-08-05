@@ -231,10 +231,23 @@ PlainTransportHost::~PlainTransportHost()
     if (tcp || ssl) {
         auto& ioc = IoContextPool::shared().ioContext();
         if (!ioc.get_executor().running_in_this_thread()) {
-            std::promise<void> drained;
-            auto fut = drained.get_future();
-            boost::asio::post(ioc, [&drained] { drained.set_value(); });
-            fut.wait_for(std::chrono::seconds(5)); // safety-bounded; work-guard keeps the thread alive
+            // The promise is shared, NOT captured by reference. The wait below is
+            // bounded, so on timeout this frame returns while the posted task is
+            // still queued — a by-reference capture would then set_value() on a
+            // destroyed stack object, which is the very failure mode this barrier
+            // exists to prevent.
+            auto drained = std::make_shared<std::promise<void>>();
+            auto fut = drained->get_future();
+            boost::asio::post(ioc, [drained] { drained->set_value(); });
+            // Bounded so a wedged I/O thread cannot hang teardown — but a timeout
+            // means the barrier did NOT hold and we are about to free an
+            // IncomingCallHandler a connection may still call back into. Say so:
+            // silently proceeding is how this class of crash stays unexplained.
+            if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+                qWarning() << "PlainTransportHost: I/O drain timed out after 5s;"
+                           << "tearing down anyway — a connection callback may still"
+                           << "reference this host (see the barrier comment above)";
+            }
         }
     }
 }
