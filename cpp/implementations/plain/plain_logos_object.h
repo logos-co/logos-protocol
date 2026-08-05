@@ -5,6 +5,7 @@
 
 #include "rpc_connection.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -77,17 +78,29 @@ private:
     // matching callId lands. The completion arrives on the connection's IO
     // thread; the caller waits on another thread — m_completionMu/Cv bridge them.
     void ensureCompletionSub();
-    // `err` (optional) receives the timeout when the completion never lands —
-    // a deferred call that gives up is a timeout like any other, and used to be
-    // reported as a null result.
+    // `err` (optional) receives the reason when no completion lands: the
+    // timeout when the deadline elapses (a deferred call that gives up is a
+    // timeout like any other, and used to be reported as a null result), or a
+    // transport error when the object is released out from under the wait.
     QVariant awaitCompletion(const QString& callId, int timeoutMs,
                              const QString& methodName = QString(),
                              logos::CallError* err = nullptr);
 
-    // Join every per-call waiter before tearing the object down. callMethodAsync
-    // used to detach those threads, so release()/delete racing an in-flight
-    // wait was a use-after-free on `this` (m_objectName, awaitCompletion, …).
-    void joinWaiters();
+    // Ask every in-flight waiter to give up, then join them, then return.
+    //
+    // The JOIN is what makes the waiters safe at all: they capture `this` (they
+    // read m_stopping and call awaitCompletion), and callMethodAsync used to
+    // DETACH them, so release()/delete racing an in-flight wait was a
+    // use-after-free. But joining alone means teardown blocks for whatever is
+    // left of the call's timeout — up to 20s on the protocol default — because
+    // a waiter has no reason to return early. Hence the stop first: it costs
+    // one wait slice instead, and a cancelled call still delivers its callback
+    // exactly once (with an error), because dropping it would turn the stall
+    // into a permanent hang in the caller awaiting it.
+    void stopAndJoinWaiters();
+    // Raise the stop flag and wake anything parked on m_completionCv. Split out
+    // because the flag has to be published under m_completionMu (see the .cpp).
+    void stopWaiters();
 
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;
@@ -101,6 +114,11 @@ private:
 
     std::mutex                           m_waiterMu;
     std::vector<std::thread>             m_waiters;
+    // Read lock-free by the sliced future wait and under m_completionMu by
+    // awaitCompletion's predicate; written under m_completionMu so the
+    // condition-variable side cannot miss it. Never cleared — an object that
+    // has begun tearing down does not come back.
+    std::atomic<bool>                    m_stopping{false};
 };
 
 } // namespace logos::plain

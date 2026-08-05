@@ -50,6 +50,15 @@ add_executable(protocol_tests
     # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
     # which needs no blocking provider and therefore no second event loop.
     test_call_error_qt_remote.cpp
+    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Joining the
+    # per-call waiters closed a use-after-free but left release() blocking for
+    # the remainder of the call's timeout (up to the 20s default), because
+    # joinWaiters() could only join, never ask a waiter to stop. Pins all three
+    # halves of the fix: teardown costs one wait slice, the callback still fires
+    # EXACTLY ONCE on every outcome including cancellation (a waiter that just
+    # returns turns a stall into a hang), and the join that keeps `this` alive
+    # under the waiter is still there.
+    test_plain_object_teardown.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
