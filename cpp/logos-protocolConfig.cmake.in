@@ -14,7 +14,15 @@ include(CMakeFindDependencyMacro)
 find_dependency(Qt6 REQUIRED COMPONENTS Core RemoteObjects)
 # `system` for boost::system::error_code (Boost.Asio) — see the
 # matching note in cpp/CMakeLists.txt next to target_link_libraries.
-find_dependency(Boost REQUIRED COMPONENTS system)
+# Boost.System is header-only, and Boost 1.89 removed the compiled
+# boost_system library outright -- so requiring it as a COMPONENT hard-fails
+# there ("Could not find a package configuration file provided by
+# boost_system"). Boost 1.87 does still need the explicit request, because it
+# only exports the Boost::system target when the component is asked for.
+# Request it optionally; the imported target below already carries whichever
+# of Boost::system / Boost::headers this build actually linked against.
+find_dependency(Boost REQUIRED)
+find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 find_dependency(OpenSSL REQUIRED)
 find_dependency(nlohmann_json REQUIRED)
 

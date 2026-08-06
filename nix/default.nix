@@ -48,28 +48,11 @@ in
 
   # Common CMake flags
   cmakeFlags = [ "-GNinja" ]
-    # Cross-compiling to Windows, Qt6RemoteObjects declares a TOOL dependency:
-    #     Qt6RemoteObjectsDependencies.cmake:
-    #     set(__qt_RemoteObjects_tool_deps "Qt6RemoteObjectsTools;6.11.1")
-    # Qt6RemoteObjectsTools contains repc, which has to RUN on the build
-    # machine, so it lives in the build-platform Qt rather than the mingw one.
-    # Without these, find_package(Qt6 COMPONENTS RemoteObjects) fails with a
-    # thoroughly misleading "Expected Config file at
-    # <qtbase>/lib/cmake/Qt6RemoteObjects ... does NOT exist" -- the target
-    # config is found fine; it is the host tool package that is missing.
-    #
-    # QT_HOST_PATH is Qt's own supported knob for this, and
-    # QT_ADDITIONAL_HOST_PACKAGES_PREFIX_PATH extends it to Qt modules that
-    # nixpkgs puts in their own store paths (Qt6Config.cmake:160).
-    ++ pkgs.lib.optionals isWindows [
-      "-DQT_HOST_PATH=${pkgs.pkgsBuildBuild.qt6.qtbase}"
-      ("-DQT_ADDITIONAL_HOST_PACKAGES_PREFIX_PATH="
-        + pkgs.lib.concatStringsSep ";" [
-            "${pkgs.pkgsBuildBuild.qt6.qtbase}"
-            "${pkgs.pkgsBuildBuild.qt6.qtremoteobjects}"
-            "${pkgs.pkgsBuildBuild.qt6.qtdeclarative}"
-          ])
-    ];
+    # Qt splits its host TOOLS (repc, moc, qmltyperegistrar) into separate
+    # packages that must RUN on the build machine; logos-nix's Windows overlay
+    # exposes the flags that point Qt at them. Absent -- and so empty -- on a
+    # native build, which is why this needs no isWindows guard.
+    ++ (pkgs.logosQtCrossCmakeFlags or [ ]);
 
   # Metadata
   meta = with pkgs.lib; {
