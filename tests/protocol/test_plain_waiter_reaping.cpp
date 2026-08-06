@@ -27,6 +27,17 @@
 //      falls in teardown" is the defect itself, exactly and portably. So a
 //      sequential caller keeps ~1 and NOT ~N.
 //
+//      HOW NOISY, since two commit messages on this branch have now quoted a
+//      "bytes per call" figure off a single sample. 10k lp_invoke_async on one
+//      lp_client, run ten times, gave 0, 5, 5, 5, 7, 7, 8, 10, 13, 10 bytes per
+//      call (mean 7.0); ten more gave 3, 11, 8, 5, 8, 10, 13, 8, 3, 10 (mean
+//      7.9). One distribution, range 0-13, and the "+0.09 MiB / 10 B per call"
+//      of 8f0c60f and the "~6 B/call" offered as its correction are both draws
+//      from it — neither arithmetic was wrong. THE HONEST STATEMENT IS THAT
+//      RETENTION IS FLAT: indistinguishable from zero, RSS noise rather than a
+//      per-call rate. Quote a number off one run of this and the next run will
+//      correct you.
+//
 //   1b. AND IT DRAINS WITHOUT ANOTHER CALL. Reaping on the spawn path alone
 //      leaves the tail of a burst parked until the next call, which for a
 //      module that bursts and then goes quiet may never come: 2000 completed

@@ -542,11 +542,22 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
             //     needs a caller still issuing calls while another thread
             //     releases, which this class already treats as caller-side UB,
             //     so no test can provoke it without being red on correct code.
+            //     BE PRECISE ABOUT WHAT THAT MAKES THIS: an invariant the design
+            //     rests on, NOT a live use-after-free waiting to be hit. Under
+            //     supported use every waiter is still joined transitively — one
+            //     leaves m_waiters only via teardown (which joins it) or via a
+            //     reaper, and that reaper is either another waiter, still
+            //     registered itself because it reaps before it publishes, or the
+            //     spawn path, whose join finishes before the call returns. The
+            //     only reaper nobody waits for is that spawn path racing a
+            //     release(), i.e. the caller-side UB above.
             //     test_plain_waiter_publish_is_last.cpp therefore stops trying
             //     to provoke it and OBSERVES the accesses instead: it guards the
             //     object's non-registry state with mprotect while a waiter runs,
             //     and baits the registry with an entry planted while the waiter
-            //     is parked mid-join. Both halves are deterministic.
+            //     is parked mid-join. It pins the rule against future edits —
+            //     the TODO above moves where reaping happens — rather than
+            //     closing an open hole.
             //
             // Reaping here at all is what makes the retention bound hold for a
             // module that bursts and then goes quiet: the spawn-path reaper

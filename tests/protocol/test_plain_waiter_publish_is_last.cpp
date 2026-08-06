@@ -29,21 +29,37 @@
 // "no waiter touches this object after this returns". Publishing being last is
 // the entire reason the second sentence is true.
 //
-// So one more member access below the publish — a log line, a metric, a second
-// reap — is a use-after-free waiting for the reaper that outlives teardown.
+// WHAT THIS IS AND IS NOT. It is NOT a lurking use-after-free that this file
+// exposes. Be precise, because the window above was overstated in review: on
+// every version of this code, a supported caller's waiters are all joined
+// transitively, so "teardown returns while a reaped waiter is still unwinding"
+// is not reachable. A waiter leaves m_waiters exactly two ways, and both are
+// covered:
 //
-// WHY THIS NEEDS ITS OWN MECHANISM. That use-after-free cannot be provoked from
-// a supported caller, which is exactly why it ships green. Under supported usage
-// (calls in flight, release() from another thread) every waiter is still joined
-// transitively: a waiter is removed from m_waiters only by teardown, which joins
-// it, or by a reaper, which joins it too — and a reaper is either another waiter,
-// which is itself in m_waiters until AFTER its join returns, or the async-spawn
-// path, whose join completes before the call returns. The uncovered reaper is
-// the spawn path racing a concurrent release(), and calling a method on an
-// object another thread is releasing is caller-side UB that faults on correct
-// code too. A test built on it would be red on green code. Measured: with a
+//   * teardown takes it — and teardown joins it;
+//   * a reaper takes it — and that reaper is either ANOTHER WAITER, which is
+//     itself still registered (it reaps before it publishes), so teardown joins
+//     the reaper and therefore waits out the join it is in; or the ASYNC-SPAWN
+//     path, whose join completes before callMethodAsyncWithError returns.
+//
+// The one reaper nobody waits for is the spawn path racing a concurrent
+// release() — i.e. a caller still issuing calls on an object another thread is
+// destroying, which is caller-side UB on any version of this class and faults
+// on correct code too.
+//
+// So publish-is-last is an invariant the DESIGN RESTS ON and documents, not a
+// hole. This suite pins it against future edits — the TODO above the waiter
+// (fold the wait into the shared Asio io_context) moves where reaping happens,
+// which is exactly the kind of change that could add an access below the
+// publish. It does not close an open bug, and nothing here should be read as
+// reporting one.
+//
+// WHY THAT NEEDS ITS OWN MECHANISM. Because "no supported caller can provoke
+// it" also means no test can provoke it, so the defect ships green: with a
 // touch added after the publish, the whole of PlainObjectTeardownTest and
-// PlainWaiterReapingTest passes cleanly, including under Guard Malloc.
+// PlainWaiterReapingTest passes cleanly, including under Guard Malloc. A test
+// built on the unsupported race would be red on correct code, which is not a
+// detector.
 //
 // So this suite does not race anything. It OBSERVES the accesses directly, in
 // two halves, because the object splits cleanly into the state a waiter must
@@ -61,15 +77,41 @@
 //     running, and a SIGSEGV/SIGBUS handler RECORDS each access — faulting
 //     address, thread, and how many ids had been published at that instant — then
 //     unprotects so the access proceeds. Nothing crashes; the access is
-//     evidence, not a punishment.
-//   * A correct waiter touches that page ZERO times, before the publish or
-//     after: everything it needs from the object is either on the registry page
-//     (m_stopping, and the registry itself) or was COPIED into the closure
-//     before the thread started — objectName and method are copied for exactly
-//     this reason, see the comment on the lambda.
-//
-// A recorded access with at least one id already published is therefore an
-// access after this waiter's publish, and the test fails naming the offset.
+//     evidence, not a punishment. The handler cannot re-arm the page itself (the
+//     faulting instruction would fault forever), so the OBSERVING thread does
+//     it: it polls the registry anyway, it never touches the guarded page, and
+//     without it the first legitimate access would silently disarm the detector
+//     for the rest of the round.
+//   * WHAT THE ASSERTION IS. The invariant is "no access AFTER the publish", and
+//     that is what gets asserted: a round starts with nothing published, so a
+//     recorded access stamped `published >= 1` is one this waiter made below
+//     publishFinishedWaiter(). It is deliberately NOT "zero accesses", because
+//     zero is stricter than the rule and FALSE on a correct waiter: on the
+//     deferred/"multi" path the waiter calls awaitCompletion(), which locks
+//     m_completionMu and reads m_completions and m_objectName — all on the
+//     guarded page, all before it publishes, all legitimate. The fourth round
+//     below drives exactly that path and REQUIRES at least one such access, so
+//     the narrowing is not a loophole: it is the difference between the two
+//     halves of the object's life, and both are checked. (This file asserted
+//     zero when it landed. It was green only because none of its rounds
+//     deferred; adding one turns the strict form red on correct code, which is
+//     how the over-strictness was found.)
+//   * WHERE THE DEFERRED ROUND IS WEAKER, stated because "we relaxed the
+//     assertion" is exactly the change that can hide a dead detector. On that
+//     one round the post-publish half is best-effort rather than deterministic:
+//     a legitimate access opens the page, the re-arm is a syscall behind, and a
+//     defect firing a microsecond later slips through. Measured with a read of
+//     m_objectName added below the publish, and every round forced to run: the
+//     other four catch it 5 times in 5, the deferred round 0 times in 5 — and a
+//     variant that spins on the re-arm instead of polling records 4-24 accesses
+//     per round and still catches it 0 times in 5, so this is not a tuning
+//     problem.
+//     IT COSTS NOTHING, because FinishOnExit is ONE piece of code shared by all
+//     five exit paths. A defect below the publish is the same defect on every
+//     round, and the rounds that can see it deterministically do (25/25 for the
+//     whole test, unchanged by the narrowing — see the table). The deferred
+//     round is here to keep the assertion honest about correct code, not to add
+//     a fifth copy of the same detection.
 //
 // HALF TWO — the registry (PublishedWaiterDoesNotTouchTheRegistryAgain). The
 // page trick cannot cover m_waiterMu, m_waiters or m_finishedWaiters, because
@@ -79,22 +121,36 @@
 // Everything is driven through a fake RpcConnectionBase, so there is no socket,
 // no host, no event loop timing, and no race: the test decides exactly when the
 // call's future is satisfied, which is what lets it arm the page while the
-// waiter is parked and disarm it only once the waiter is gone.
+// waiter is parked and disarm it only once the waiter is gone. The two rounds
+// that end on a deadline (timed out, deferred) are the exception, and they wait
+// out a real clock — the budget is set so the thing that has to happen first
+// takes microseconds against hundreds of milliseconds of slack, and the deferred
+// round asserts that it did rather than assuming it.
 //
 // WHAT THE TWO HALVES DO AND DO NOT COVER, measured by rebuilding the file under
-// test with each defect and running each suite 10-40 times:
+// test with each defect and running each suite 5-30 times:
 //
 //   defect below publishFinishedWaiter()      here   teardown+reaping suites
 //   ------------------------------------      ----   -----------------------
-//   read m_objectName                         40/40                    0/10
+//   read m_objectName                         25/25                    0/10
 //   read m_conn                               10/10                    0/10
 //   read m_completions                        10/10                    0/10
 //   read m_completionSubscribed               10/10                    0/10
-//   lock m_mu                                 10/10                    0/10
-//   call reapFinishedWaiters() again          20/20                     2/2
+//   lock m_mu                                 25/25                    0/10
+//   write m_completions under m_completionMu  25/25                       -
+//   call reapFinishedWaiters() again          20/20                    9/30
 //   read m_stopping                            0/10                    0/10
 //   (publish moved ABOVE the reap)              0/5                   12/15
-//   no defect — 8f0c60f                        0/30                    0/10
+//   no defect                                  0/30                    0/10
+//
+// TAKE THE RIGHT-HAND COLUMN AS RATES, NOT AS FRACTIONS. Those suites catch
+// these by racing, so a sample is a coin count and not a constant: the re-reap
+// cell was first reported here as "2/2", which was a two-run sample printed
+// beside 10-40 run samples. Over 30 runs it is 9/30, and another 30-run sample
+// gave 12/30 — i.e. roughly one run in three, matching what reapFinishedWaiters'
+// own comment says ("about one run in four"). The left-hand column is NOT a
+// rate: those are deterministic, and anything below 1 there would be a bug in
+// this file rather than bad luck.
 //
 // The one real gap is m_stopping, the single member that shares the registry's
 // page and so cannot be guarded without guarding the publish itself. The one
@@ -110,6 +166,7 @@
 
 #include <gtest/gtest.h>
 
+#include "logos_async_dispatch.h"
 #include "logos_call_error.h"
 
 #include "plain_logos_object.h"
@@ -126,6 +183,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -204,6 +262,7 @@ Access                      gAccesses[kMaxFaults];
 std::atomic<char*>          gGuardBase{nullptr};
 std::atomic<std::size_t>    gGuardLen{0};
 std::atomic<char*>          gObjBase{nullptr};
+std::atomic<bool>           gArmed{false};   // false once a fault has let one through
 const std::vector<std::uint64_t>* gFinished = nullptr;   // on the UNguarded page
 struct sigaction            gOldSegv;
 struct sigaction            gOldBus;
@@ -234,9 +293,14 @@ void faultHandler(int /*sig*/, siginfo_t* info, void* /*uctx*/)
         // waiter in flight the only writer is the very thread stopped here.
         gAccesses[i].published = gFinished ? gFinished->size() : 0;
     }
-    // Let it through. Re-arming would need a single-step, and one recorded
-    // access is already the whole finding.
+    // Let it through: re-arming HERE would need a single-step, since the
+    // faulting instruction re-runs the moment this returns and would fault
+    // forever. Unprotect FIRST and only then drop the armed flag, so an
+    // observer racing to re-arm cannot have its mprotect(PROT_NONE) overwritten
+    // by this one — the worst interleaving then leaves the page guarded and the
+    // flag set, which is the truth.
     mprotect(base, len, PROT_READ | PROT_WRITE);
+    gArmed.store(false, std::memory_order_release);
 }
 
 void installHandlers()
@@ -260,7 +324,49 @@ bool guard(bool on)
     char* const base = gGuardBase.load(std::memory_order_acquire);
     const std::size_t len = gGuardLen.load(std::memory_order_acquire);
     if (!base) return false;
-    return mprotect(base, len, on ? PROT_NONE : (PROT_READ | PROT_WRITE)) == 0;
+    if (mprotect(base, len, on ? PROT_NONE : (PROT_READ | PROT_WRITE)) != 0)
+        return false;
+    gArmed.store(on, std::memory_order_release);
+    return true;
+}
+
+// Put the page back after a recorded access let one through. Called ONLY from
+// the observing thread, which never touches the guarded page — from anywhere
+// else this would be a way to fault on your own re-arm.
+//
+// Without it the detector is a ONE-SHOT per round: the first access disarms the
+// page and everything after it goes unseen. That was harmless while no correct
+// waiter ever touched the page, and stops being harmless the moment one
+// legitimately does — the deferred round below. What it buys, honestly: the
+// page is blind only from a fault until the next poll, instead of for the rest
+// of the round. It is NOT enough to catch a defect that fires a microsecond
+// after a legitimate access (measured — see the header), and the reason that is
+// acceptable is that FinishOnExit is shared by all five rounds, four of which
+// see it deterministically. Keep it anyway: any future legitimate access EARLY
+// in a round would otherwise silently switch that round's detector off.
+void rearmGuard()
+{
+    if (gArmed.load(std::memory_order_acquire)) return;
+    if (accessCount() >= kMaxFaults) return;   // nothing left to record
+    guard(true);
+}
+
+// THE ACTUAL INVARIANT: accesses made below publishFinishedWaiter(). Each round
+// starts with m_finishedWaiters empty (the spawn path reaps the previous round's
+// id, and the round asserts it), and one waiter runs at a time, so an access
+// stamped `published >= 1` is one this waiter made after publishing its own id.
+// Everything stamped 0 happened before the publish, where the object is still
+// alive by construction and touching it is legal.
+int postPublishAccesses(int* firstIndex = nullptr)
+{
+    const int n = std::min(accessCount(), kMaxFaults);
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (gAccesses[i].published == 0) continue;
+        if (count == 0 && firstIndex) *firstIndex = i;
+        ++count;
+    }
+    return count;
 }
 
 // ── a connection that answers exactly when the test says so ─────────────────
@@ -306,14 +412,6 @@ public:
     // Satisfy the call's future. `ok == false` produces the wire-error shape.
     void answer(std::uint64_t id, bool ok)
     {
-        std::shared_ptr<std::promise<ResultMessage>> p;
-        {
-            std::lock_guard<std::mutex> g(m_mu);
-            const auto it = m_pending.find(id);
-            if (it == m_pending.end()) return;
-            p = std::move(it->second);
-            m_pending.erase(it);
-        }
         ResultMessage r;
         r.id = id;
         r.ok = ok;
@@ -323,10 +421,41 @@ public:
             r.err = "provider said no";
             r.errCode = "CALL_FAILED";
         }
-        p->set_value(std::move(r));
+        deliver(id, std::move(r));
+    }
+
+    // Satisfy it with a "multi" provider's PENDING SENTINEL — ok, but the value
+    // says "the real result comes later, as a completion event keyed by this
+    // id". Nothing ever pushes that completion here (this connection has no
+    // event plumbing at all), so the waiter parks in awaitCompletion() until the
+    // call's own deadline, which is what the deferred round wants: a CORRECT
+    // waiter legitimately holding m_completionMu and reading m_completions and
+    // m_objectName — all on the guarded page — before it publishes.
+    void answerDeferred(std::uint64_t id, const std::string& callId)
+    {
+        RpcMap m;
+        m.emplace(logos::pendingCallKey().toStdString(), RpcValue(callId));
+        ResultMessage r;
+        r.id = id;
+        r.ok = true;
+        r.value = RpcValue(std::move(m));
+        deliver(id, std::move(r));
     }
 
 private:
+    void deliver(std::uint64_t id, ResultMessage r)
+    {
+        std::shared_ptr<std::promise<ResultMessage>> p;
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            const auto it = m_pending.find(id);
+            if (it == m_pending.end()) return;
+            p = std::move(it->second);
+            m_pending.erase(it);
+        }
+        p->set_value(std::move(r));
+    }
+
     std::mutex m_mu;
     std::map<std::uint64_t, std::shared_ptr<std::promise<ResultMessage>>> m_pending;
     std::uint64_t m_lastId = 0;
@@ -448,15 +577,34 @@ void pumpMs(int ms)
 
 // Wait — WITHOUT pumping, so nothing of ours runs on the object — until the
 // waiter has published and had time to unwind past it.
+//
+// Doubles as the re-armer. Both things it does touch only the registry page
+// (publishedCount takes m_waiterMu) or the mapping itself, never the guarded
+// page, so this is the one place from which putting the guard back is safe.
 bool waitForPublish(const GuardedObject& g, int budgetMs)
 {
     QElapsedTimer t;
     t.start();
     while (t.elapsed() < budgetMs) {
+        rearmGuard();
         if (g.publishedCount() > 0) return true;
         QThread::usleep(200);
     }
     return false;
+}
+
+// The publish is the waiter's last act, so anything it does below it lands in
+// the moments right after — which is where the guard has to be up. Poll instead
+// of sleeping so a page disarmed by a legitimate pre-publish access is back
+// before then.
+void settleGuarded(int ms)
+{
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < ms) {
+        rearmGuard();
+        QThread::usleep(200);
+    }
 }
 
 std::string describe(const Access& a, std::size_t split, std::uintptr_t testThread)
@@ -555,14 +703,26 @@ TEST_F(PlainWaiterPublishIsLastTest, DetectorRecordsADeliberateTouch)
 
 // ── 1. the invariant ────────────────────────────────────────────────────────
 //
-// Four waiters, one per exit path out of the lambda — every one of them ends in
-// the same FinishOnExit guard, and it is the guard that has to keep its hands
-// off the object once it has published.
+// Five waiters: one per return out of the lambda (answered, rejected, timed out,
+// cancelled) plus the deferred detour that awaitCompletion() adds to the
+// answered one. Every one of them ends in the same FinishOnExit guard, and it is
+// the guard that has to keep its hands off the object once it has published.
 //
 // Each round arms the state page only after the call has returned (the caller's
 // own accesses — m_conn, m_objectName, ensureCompletionSub — are legitimate and
 // happen there), and disarms it only once the waiter has published and unwound.
 // For that whole window the waiter is the only thing running against the object.
+//
+// WHAT IS ASSERTED IS "NOTHING AFTER THE PUBLISH", not "nothing at all". Four of
+// the five rounds do touch the page zero times, because objectName and method
+// are copied into the closure precisely so the waiter needs nothing from the
+// object. The DEFERRED round does not, and correctly so: a "multi" provider's
+// pending sentinel sends the waiter into awaitCompletion(), which locks
+// m_completionMu and reads m_completions and m_objectName — guarded page, before
+// the publish, entirely legal. Asserting zero would make this file red on
+// correct code, so it asserts what the rule actually says: no access stamped
+// `published >= 1`. The deferred round then requires at least one stamped 0, so
+// the looser predicate cannot be satisfied by the path simply not running.
 //
 // Pre-fix — i.e. with any member access added below publishFinishedWaiter — this
 // records an access with published >= 1 and fails naming the offset.
@@ -576,69 +736,116 @@ TEST_F(PlainWaiterPublishIsLastTest, WaiterTouchesNothingOnTheStatePageAfterPubl
     struct Round {
         const char* what;
         int         timeoutMs;
-        enum { Answer, Fail, Timeout, Cancel } how;
+        enum { Answer, Fail, Timeout, Deferred, Cancel } how;
+        // Rounds where a CORRECT waiter must reach the guarded page before it
+        // publishes. Only the deferred path does; requiring it is what keeps
+        // that round from passing vacuously if it stops deferring.
+        bool        touchesBeforePublishing;
     };
     const Round rounds[] = {
-        { "a call that ANSWERS",           5000, Round::Answer  },
-        { "a call the provider REJECTS",   5000, Round::Fail    },
-        { "a call that TIMES OUT",          150, Round::Timeout },
-        { "a call CANCELLED by teardown",  5000, Round::Cancel  },
+        { "a call that ANSWERS",           5000, Round::Answer,   false },
+        { "a call the provider REJECTS",   5000, Round::Fail,     false },
+        { "a call that TIMES OUT",          150, Round::Timeout,  false },
+        // The pending-sentinel path. The budget is the awaitCompletion deadline
+        // (no completion is ever pushed, so it runs out) and also the slack the
+        // future has to be satisfied in — microseconds are needed, 400ms given.
+        { "a DEFERRED call (pending sentinel)", 400, Round::Deferred, true },
+        { "a call CANCELLED by teardown",  5000, Round::Cancel,   false },
     };
+    constexpr int kRounds = static_cast<int>(sizeof(rounds) / sizeof(rounds[0]));
 
     int delivered = 0;
     for (const Round& r : rounds) {
         resetAccesses();
 
-        std::atomic<int> got{0};
+        // Owned by the callback, not by this frame: a bail-out below leaves the
+        // waiter to be cancelled in teardown, and its callback is delivered on a
+        // LATER event-loop iteration — after this frame is gone. A captured
+        // `&got` would be a genuine use-after-free on the way out of a failing
+        // test, which is a poor advertisement for a file about use-after-free.
+        auto got = std::make_shared<std::atomic<int>>(0);
         g.obj()->callMethodAsyncWithError(
             QString::fromLatin1(kGuardToken), QStringLiteral("ping"),
             QVariantList{ QVariant(1) }, r.timeoutMs,
-            [&got](QVariant, const logos::CallError&) { got.fetch_add(1); });
+            [got](QVariant, const logos::CallError&) { got->fetch_add(1); });
 
         // The waiter is registered (that happens under m_waiterMu inside the
         // call) and parked in waitForResult: nothing can satisfy its future
         // until the line below. Safe to close the state page over it.
         ASSERT_GT(g.waiterCount(), 0u) << r.what << ": no waiter registered";
+        // The spawn path above reaps the previous round's id, so nothing is
+        // published as this round starts — which is what makes `published >= 1`
+        // mean "after THIS waiter's publish" rather than "after some earlier
+        // waiter's".
+        ASSERT_EQ(g.publishedCount(), 0u)
+            << r.what << ": a previous round's waiter id is still published, so "
+               "the after-the-publish stamp no longer means what it says";
         ASSERT_TRUE(guard(true)) << "mprotect failed: " << strerror(errno);
 
         switch (r.how) {
         case Round::Answer:  g.conn()->answer(g.conn()->lastId(), true);  break;
         case Round::Fail:    g.conn()->answer(g.conn()->lastId(), false); break;
         case Round::Timeout: break;                 // let the deadline elapse
+        case Round::Deferred:
+            g.conn()->answerDeferred(g.conn()->lastId(), "deferred-call-1");
+            break;
         case Round::Cancel:  g.forceStopping();     // registry page, not guarded
             break;
         }
 
         const bool published = waitForPublish(g, 10000);
         // The publish is the waiter's last act; give the thread room to unwind
-        // past it, which is where a stray access would land.
-        QThread::msleep(30);
+        // past it, which is where a stray access would land — with the guard
+        // kept up for all of it.
+        settleGuarded(30);
 
         const int recorded = accessCount();
+        int firstAfter = 0;
+        const int afterPublish = postPublishAccesses(&firstAfter);
         guard(false);
 
         EXPECT_TRUE(published) << r.what << ": the waiter never published";
-        ASSERT_EQ(recorded, 0)
-            << r.what << ": the object's state page was touched while only the "
-               "waiter was running — "
-            << describe(gAccesses[0], g.split(), selfThread()) << ".\n"
-            << "If that access is below publishFinishedWaiter() in the "
-               "FinishOnExit guard (published >= 1 above), it is a use-after-free: "
-               "a reaper joining this waiter outside m_waiterMu has already taken "
-               "it out of m_waiters, so stopAndJoinWaiters() does not wait for it "
-               "and release() is free to `delete this` while it runs. Publishing "
+        ASSERT_EQ(afterPublish, 0)
+            << r.what << ": the object's state page was touched AFTER this "
+               "waiter published its id, while only the waiter was running — "
+            << describe(gAccesses[firstAfter], g.split(), selfThread()) << ".\n"
+            << "That access is below publishFinishedWaiter() in the FinishOnExit "
+               "guard, and it breaks the guarantee stopAndJoinWaiters() "
+               "documents: a reaper joining this waiter outside m_waiterMu has "
+               "already taken it out of m_waiters, so teardown does not wait for "
+               "it and release() goes on to `delete this` while it runs. No "
+               "SUPPORTED caller can reach that reaper today (see the header), "
+               "so this is the regression test for an invariant the design "
+               "rests on — not the report of a live use-after-free. Publishing "
                "must stay the last thing a waiter does.";
+
+        // A round that must have gone through the guarded page has to prove it,
+        // or it is not testing the path it names.
+        if (r.touchesBeforePublishing) {
+            ASSERT_GT(recorded, 0)
+                << r.what << ": nothing on the guarded page was touched, so "
+                   "awaitCompletion() never ran — the call did not actually "
+                   "defer (a slow machine can turn this into a plain timeout) "
+                   "and this round proves nothing about the deferred path";
+        } else {
+            EXPECT_EQ(recorded, 0)
+                << r.what << ": the guarded page was touched at all, which on "
+                   "this path a correct waiter never does — "
+                << describe(gAccesses[0], g.split(), selfThread());
+        }
 
         // Drain the queued callback so the round is provably complete.
         pumpMs(60);
-        delivered += got.load();
-        std::cout << "  " << r.what << ": published, 0 accesses to the state page"
-                  << std::endl;
+        delivered += got->load();
+        std::cout << "  " << r.what << ": published, " << recorded
+                  << " access(es) to the state page, " << afterPublish
+                  << " of them after the publish" << std::endl;
 
         if (r.how == Round::Cancel) break;   // m_stopping never clears
     }
 
-    EXPECT_EQ(delivered, 4) << "a callback went missing; the rounds did not all run";
+    EXPECT_EQ(delivered, kRounds)
+        << "a callback went missing; the rounds did not all run";
 }
 
 // ── 2. the other half of the object: the registry itself ────────────────────
@@ -651,8 +858,11 @@ TEST_F(PlainWaiterPublishIsLastTest, WaiterTouchesNothingOnTheStatePageAfterPubl
 //
 // Nothing else catches that either. It is invisible to the reaping suite (the
 // self-join guard absorbs it into a leaked registry entry rather than a crash)
-// and to the teardown suite, and racing a reaper against it catches it about one
-// run in four — measured, which is why this does not race at all.
+// and to the teardown suite, and racing a reaper against it catches it roughly
+// one run in three — 9 in 30 measured here, 12 in 30 on another 30-run sample,
+// against the "2/2" this file first printed from a two-run sample. That spread
+// IS the argument for not racing: at that rate a green run means nothing, and
+// the bait below is deterministic.
 //
 // Instead it uses the reaper's own shape against it. reapFinishedWaiters()
 // joins OUTSIDE m_waiterMu, so a waiter that has picked up somebody else's
@@ -673,9 +883,42 @@ TEST_F(PlainWaiterPublishIsLastTest, WaiterTouchesNothingOnTheStatePageAfterPubl
 // Bait 1 doubles as a check that the reap really does join with the lock free:
 // step 3 needs m_waiterMu while the join is in progress, and says so if it
 // cannot get it.
+//
+// A NOTE ON BAILING OUT, because the bait is a trap for the test as much as for
+// the waiter. Every planted thread is parked until this test opens its gate, and
+// ~PlainLogosObject joins whatever is still registered — so an early return that
+// skips a gate.open() does not fail, it WEDGES. Measured on the first version of
+// this test: remove the reap from the exit guard, ASSERT_TRUE(tookBait1) fires
+// and prints — and then the destructor blocks forever joining a thread nobody
+// will release, so the run ends as a timeout kill (exit 124) with no test result
+// at all. With the gates on a scope guard the same break reports the same
+// assertion and exits 1 in 10s, which is the tryWithRegistry budget and not a
+// hang.
+//
+// Not hypothetical, either: the TODO above the waiter (fold the wait into the
+// shared Asio io_context) moves where reaping happens, which is exactly the edit
+// that makes tookBait1 false. So the gates are opened by a scope guard on EVERY
+// exit path, and they are declared BEFORE the object so they outlive the
+// teardown that joins the threads waiting on them.
 TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain)
 {
+    // Declared first, destroyed last: ~GuardedObject joins the planted threads,
+    // and a thread parked on an already-destroyed condition_variable would be
+    // its own use-after-free.
+    Gate gate1;
+    Gate gate2;
+
     GuardedObject g;
+
+    // Destroyed BEFORE g (declared after it), so by the time the object's
+    // teardown joins the bait, both gates are open. A failed precondition below
+    // now FAILS — fast, named, with a normal exit code — instead of wedging.
+    struct OpenGatesOnExit {
+        Gate& first;
+        Gate& second;
+        ~OpenGatesOnExit() { first.open(); second.open(); }
+    } openGatesOnExit{gate1, gate2};
+
     ASSERT_TRUE(g.ok());
 
     std::mutex& mu = g.obj()->*get(PubWaiterMuTag{});
@@ -685,9 +928,6 @@ TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain
     // Far above anything m_nextWaiterId will reach in this test.
     constexpr std::uint64_t kBait1 = 1ull << 40;
     constexpr std::uint64_t kBait2 = (1ull << 40) + 1;
-
-    Gate gate1;
-    Gate gate2;
 
     // Every registry read below is a TRY-lock: if the reap ever started joining
     // with m_waiterMu held, a blocking lock here would hang the suite instead of
@@ -713,12 +953,14 @@ TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain
         finished.push_back(id);
     };
 
-    // 1. a call that cannot finish until the test says so.
-    std::atomic<int> got{0};
+    // 1. a call that cannot finish until the test says so. The counter is owned
+    // by the callback for the same reason as in the test above: on a bail-out
+    // this callback is delivered after the frame is gone.
+    auto got = std::make_shared<std::atomic<int>>(0);
     g.obj()->callMethodAsyncWithError(
         QString::fromLatin1(kGuardToken), QStringLiteral("ping"),
         QVariantList{ QVariant(1) }, 20000,
-        [&got](QVariant, const logos::CallError&) { got.fetch_add(1); });
+        [got](QVariant, const logos::CallError&) { got->fetch_add(1); });
 
     plant(kBait1, gate1);
 
@@ -765,11 +1007,14 @@ TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain
            "entry planted while it was parked mid-join is gone from m_waiters, "
            "so something below publishFinishedWaiter() in the FinishOnExit guard "
            "still touches the object.\n"
-           "That is a use-after-free. A reaper that has taken this waiter out of "
-           "m_waiters and is joining it outside the lock is not in the map "
-           "stopAndJoinWaiters() swapped, so teardown does not wait for it and "
-           "release() goes on to `delete this` while the waiter is still running. "
-           "Publishing has to stay the last thing a waiter does.";
+           "That breaks the guarantee stopAndJoinWaiters() documents. A reaper "
+           "that has taken this waiter out of m_waiters and is joining it "
+           "outside the lock is not in the map stopAndJoinWaiters() swapped, so "
+           "teardown does not wait for it and release() goes on to `delete this` "
+           "while the waiter is still running. No supported caller can reach "
+           "that reaper today — see the header — so this is a regression test "
+           "for an invariant the design rests on, not the report of a live "
+           "use-after-free. Publishing has to stay the last thing a waiter does.";
 
     // Cleanup: free bait 2 whoever ended up holding it, and retire it if the
     // registry still has it.
@@ -786,7 +1031,7 @@ TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain
     }
 
     pumpMs(50);
-    EXPECT_EQ(got.load(), 1) << "the call did not deliver exactly once";
+    EXPECT_EQ(got->load(), 1) << "the call did not deliver exactly once";
     std::cout << "  bait planted mid-join survived the publish: the waiter never "
                  "came back to the registry" << std::endl;
 }
