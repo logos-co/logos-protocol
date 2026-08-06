@@ -164,11 +164,14 @@ void PlainLogosObject::reapFinishedWaiters()
             if (it == m_waiters.end())
                 continue;   // teardown already took this one
             if (it->second.get_id() == std::this_thread::get_id()) {
-                // Unreachable today — callbacks are delivered on the Qt event
-                // loop, so a waiter thread never re-enters this class — but a
-                // thread that joined itself would terminate the process, and
-                // this is one comparison. Leave it registered; teardown, which
-                // runs on somebody else's thread, will collect it.
+                // A waiter DOES run this now, on its way out — but always
+                // BEFORE it publishes, so its own id cannot be in the list it
+                // is walking, and this branch stays unreachable. It costs one
+                // comparison, and it turns the ordering slip that would make it
+                // reachable (publishing before reaping) into a leaked entry
+                // rather than a self-join, which throws out of the noexcept
+                // destructor doing the reaping and takes the process with it.
+                // Leave it registered; the next reaper, or teardown, collects it.
                 keep.push_back(id);
                 continue;
             }
@@ -177,12 +180,24 @@ void PlainLogosObject::reapFinishedWaiters()
         }
         m_finishedWaiters.swap(keep);
     }
-    // Joined with NO lock held. Not just hygiene — this is THE deadlock this
-    // whole mechanism can introduce: a reaper holding m_waiterMu while it joins
-    // a waiter that is itself blocked on m_waiterMu trying to publish would
-    // wedge the process. Holding no lock across a join makes that impossible by
-    // construction rather than by argument, whatever a waiter does on its way
-    // out. stopAndJoinWaiters() keeps the same discipline for the same reason.
+    // Joined with NO lock held. The deadlock this whole mechanism can
+    // introduce is a reaper that holds m_waiterMu while it joins a waiter which
+    // is itself blocked on m_waiterMu trying to publish. TWO INDEPENDENT
+    // PROPERTIES each prevent it, and either one alone would be enough:
+    //
+    //   * only PUBLISHED ids are joined, and publishing is a waiter's last
+    //     access — so a thread this function joins can never be a thread that
+    //     still wants m_waiterMu;
+    //   * no join happens with a lock held, so even joining a thread that DID
+    //     still want the mutex could not shut it out.
+    //
+    // Both are kept on purpose: the filter is a property of the logic here,
+    // which a refactor can lose without looking wrong, while "no join under a
+    // lock" is structural and tends to survive one. Be precise about what that
+    // costs in testing, though — the hammer in the regression suite only wedges
+    // when BOTH are gone. A variant that joins under the lock but keeps the
+    // published-only filter passes it, measured, in the usual few hundred ms.
+    // stopAndJoinWaiters() keeps the same discipline.
     for (auto& t : done) {
         if (t.joinable())
             t.join();
@@ -447,10 +462,13 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
     // `delete this` while a waiter could still be mid-flight.
     const std::string objectName = m_objectName;
     const std::string method = methodName.toStdString();
-    // Retire the previous calls' waiters before adding one. Done HERE rather
-    // than by the waiters themselves because a thread cannot join itself; done
-    // BEFORE taking m_waiterMu because it joins, and joining under that lock is
-    // the deadlock described in reapFinishedWaiters().
+    // Retire the previous calls' waiters before adding one. The waiters reap
+    // each other too, on their way out (see the guard below) — that is what
+    // drains a burst which then goes quiet, and it is why this site is no
+    // longer the only reaper. It still earns its keep: a waiter can only reap
+    // OTHERS, so the last one to finish has nobody behind it to collect it.
+    // Done BEFORE taking m_waiterMu because it joins, and joining under that
+    // lock is the shape described in reapFinishedWaiters().
     reapFinishedWaiters();
     // Register under the lock BEFORE the thread can outrun release(): a
     // detach-then-push left a window where delete this raced the waiter.
@@ -494,11 +512,47 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
             // it is the unwinding of the captures above, none of which belongs
             // to the object: a string, a shared_ptr to the call's future, and a
             // callback that has already been moved out.
-            struct PublishOnExit {
+            //
+            // It REAPS BEFORE IT PUBLISHES, and that order is the safety
+            // argument rather than a stylistic choice. Two reasons, one of
+            // which the test suite demonstrates:
+            //
+            //   * Publishing is what makes a waiter joinable BY ANOTHER WAITER.
+            //     Reaping first keeps that relation one-way — unpublished
+            //     threads join published ones, published ones join nobody — so
+            //     it cannot contain a cycle. Inverted, two waiters that publish
+            //     in the same instant can each take the other's thread out of
+            //     m_waiters and then join it. Both are already out of the
+            //     registry, so teardown does not even wait for them; here
+            //     pthread_join detects the cycle and throws out of
+            //     reapFinishedWaiters, whose half-drained vector then destroys
+            //     a still-joinable thread — std::terminate. Measured: with the
+            //     two lines below swapped, ReapingRacesPublishingWithoutDead-
+            //     locking aborts the process, 5 runs out of 5.
+            //   * Until it publishes, this waiter is still in m_waiters, so a
+            //     concurrent teardown joins it and the object cannot be
+            //     destroyed under the reap. After publishing, a reaper can take
+            //     its thread out of the map and release() can `delete this`,
+            //     and a reaper running on the CALLER's thread (the spawn path
+            //     above) is one teardown neither knows about nor waits for — so
+            //     the touch of m_waiterMu would land on freed memory. That one
+            //     needs a caller still issuing calls while another thread
+            //     releases, which this class already treats as caller-side UB,
+            //     so it is an argument and not a demonstration; the cycle above
+            //     is the demonstration.
+            //
+            // Reaping here at all is what makes the retention bound hold for a
+            // module that bursts and then goes quiet: the spawn-path reaper
+            // only runs if another call ever comes.
+            struct FinishOnExit {
                 PlainLogosObject* self;
                 std::uint64_t     id;
-                ~PublishOnExit() { self->publishFinishedWaiter(id); }
-            } publishOnExit{this, waiterId};
+                ~FinishOnExit()
+                {
+                    self->reapFinishedWaiters();      // others, never itself
+                    self->publishFinishedWaiter(id);  // strictly last
+                }
+            } finishOnExit{this, waiterId};
 
             const WaitOutcome outcome = waitForResult(*fut, timeoutMs, m_stopping);
             if (outcome == WaitOutcome::Cancelled) {

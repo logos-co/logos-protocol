@@ -104,14 +104,23 @@ private:
     void stopWaiters();
 
     // Join and drop the waiters that have already FINISHED, so a handle that
-    // outlives its calls does not accumulate them. Called on every async spawn
-    // (a call pays for the corpse of an earlier one) and from
-    // stopAndJoinWaiters(). Cheap: a join on an already-returned thread is a
-    // couple of syscalls, and only ids a waiter itself published are touched.
+    // outlives its calls does not accumulate them. TWO call sites, which
+    // between them cover both shapes of traffic:
+    //
+    //   * every async spawn — a call pays for the corpses of earlier ones;
+    //   * every waiter as it finishes, BEFORE it publishes its own id — so a
+    //     burst drains itself instead of parking until the next call, which for
+    //     a module that bursts and goes quiet may never come.
+    //
+    // NOT called from stopAndJoinWaiters(): teardown joins by id-independent
+    // brute force and needs no published list. (It used to say otherwise here;
+    // it never did.) Cheap either way: a join on an already-returned thread is
+    // a couple of syscalls, and only ids a waiter itself published are touched.
     void reapFinishedWaiters();
     // A waiter's FINAL act — see the scope guard in callMethodAsyncWithError.
     // After this returns, that thread never touches the object again, which is
-    // what makes it safe for someone else to join and drop it.
+    // what makes it safe for someone else to join and drop it. Nothing the
+    // waiter does may follow it, its own reap least of all.
     void publishFinishedWaiter(std::uint64_t id);
 
     std::string                          m_objectName;
@@ -131,11 +140,15 @@ private:
     // each) for the whole life of the handle. The production shape is one
     // cached handle per module reused for every call (logos_api_consumer.cpp),
     // so that grew without bound. Now a waiter publishes its id into
-    // m_finishedWaiters as its last act and the next spawn (or teardown) joins
-    // and erases it: see reapFinishedWaiters().
+    // m_finishedWaiters as its last act, and both the next spawn and every
+    // OTHER waiter on its way out join and erase it: see reapFinishedWaiters().
     //
-    // Retention is bounded by the waiters that finish after the LAST spawn,
-    // i.e. by peak in-flight concurrency, not by call count.
+    // Retention tracks neither call count nor peak concurrency. A burst drains
+    // as it completes, because each waiter reaps the ones that finished before
+    // it. What survives an idle handle is only what published after the last
+    // reap — at minimum the last waiter to finish, which by construction has
+    // nobody behind it to collect it (measured: 1-2 after a 2000-call burst).
+    // The next call, or teardown, takes those.
     //
     // The real fix is still the TODO in callMethodAsyncWithError — fold the
     // wait into the shared Asio io_context and have no thread per pending RPC

@@ -24,9 +24,15 @@
 //   1. THE REGISTRY DOES NOT GROW WITH CALL COUNT. Counting threads, not bytes:
 //      RSS is a noisy proxy and its per-call constant is platform-specific,
 //      whereas "m_waiters.size() rises 1:1 with completed calls and only ever
-//      falls in teardown" is the defect itself, exactly and portably. The bound
-//      is peak in-flight concurrency, because the reaper runs on the next
-//      spawn — so a sequential caller keeps ~1 and NOT ~N.
+//      falls in teardown" is the defect itself, exactly and portably. So a
+//      sequential caller keeps ~1 and NOT ~N.
+//
+//   1b. AND IT DRAINS WITHOUT ANOTHER CALL. Reaping on the spawn path alone
+//      leaves the tail of a burst parked until the next call, which for a
+//      module that bursts and then goes quiet may never come: 2000 completed
+//      calls kept 1428 waiters and 24MiB once the handle went idle, and one
+//      further call dropped that to 1. Waiters therefore reap each other on
+//      their way out, and this pins the IDLE bound with no further spawn.
 //
 //   2. THE DEADLOCK THE FIX COULD INTRODUCE. Reaping means joining, and a
 //      reaper that joined while holding the lock a waiter needs in order to
@@ -440,6 +446,84 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
     EXPECT_LE(finalCount, size_t(4 * kInflight))
         << "finished waiters accumulated past the in-flight window";
     EXPECT_LE(peak, size_t(4 * kInflight));
+
+    obj->release();
+    pump(50);
+}
+
+// ── 1b. a burst that goes idle drains itself ────────────────────────────────
+//
+// The test above always has another call coming, which hides the case that
+// actually shows up in production: a module bursts, every call completes, and
+// then the handle goes quiet. If reaping only ever happened on the spawn path,
+// everything that finished after the LAST spawn would stay parked for the life
+// of the handle — measured at 1428 waiters and +24MiB after 2000 completed
+// calls, collapsing to 1 the moment one further call was issued.
+//
+// So the bound is read here with NO further call: the burst has to have drained
+// itself. What remains is what published after the last reap — at minimum the
+// last waiter to finish, which has nobody behind it to collect it (1 in almost
+// every run, 2 when a waiter's publish slips past the final reap). The bound
+// below is generous against that and still ~100x under the pre-fix number.
+TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
+{
+    LiveHost host;
+    ASSERT_TRUE(host.ok());
+    auto conn = connectTo(host.port());
+    ASSERT_NE(conn, nullptr);
+
+    LogosObject* obj = conn->requestObject(QStringLiteral("echo_module"), 5000);
+    ASSERT_NE(obj, nullptr);
+    auto* ch = channelFor(obj);
+    ASSERT_NE(ch, nullptr);
+    auto* plain = dynamic_cast<PlainLogosObject*>(obj);
+    ASSERT_NE(plain, nullptr);
+
+    // Issued in one go, with no pumping in between, so they really are
+    // concurrent and the tail of the burst is large.
+    constexpr int kBurst = 800;
+    Deliveries d(kBurst);
+    for (int i = 0; i < kBurst; ++i) {
+        ch->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
+                                     QVariantList{ QVariant(i) }, 9000,
+                                     [&d, i](QVariant, const logos::CallError& e) {
+                                         d.record(i, e);
+                                     });
+    }
+    pumpUntilTotal(d, kBurst, 60000);
+    ASSERT_EQ(d.total.load(), kBurst) << "the burst did not all complete";
+
+    // Every callback has landed; now let the waiters that delivered them finish
+    // and retire each other. No call is issued in this window — that is the
+    // whole point — so anything still registered is retained, not in flight.
+    for (int i = 0; i < 40; ++i) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(10);
+    }
+
+    const size_t idle = waiterCount(plain);
+    std::cout << "  " << kBurst << " completed calls then IDLE -> m_waiters="
+              << idle << std::endl;
+
+    EXPECT_EQ(d.worst(), 1);
+    EXPECT_EQ(d.missing(), 0);
+    EXPECT_EQ(d.errors.load(), 0);
+    EXPECT_LE(idle, 8u)
+        << "a burst that went idle left " << idle << " of " << kBurst
+        << " waiters parked: they are only being reaped on the spawn path";
+
+    // And the handle still works afterwards — draining from inside the waiters
+    // must not have disturbed the object they are draining.
+    Deliveries after(1);
+    ch->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
+                                 QVariantList{ QVariant(7) }, 5000,
+                                 [&after](QVariant, const logos::CallError& e) {
+                                     after.record(0, e);
+                                 });
+    pumpUntilTotal(after, 1, 10000);
+    EXPECT_EQ(after.total.load(), 1);
+    EXPECT_EQ(after.errors.load(), 0);
+    EXPECT_LE(waiterCount(plain), 8u);
 
     obj->release();
     pump(50);
