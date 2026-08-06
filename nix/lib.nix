@@ -25,7 +25,25 @@ pkgs.stdenv.mkDerivation {
 
     mkdir -p build-protocol
     cd build-protocol
-    cmake ../cpp -GNinja -DCMAKE_INSTALL_PREFIX=$out $cmakeFlags
+
+    # This derivation sets dontUseCmakeConfigure and invokes cmake by hand, so
+    # nixpkgs' cmakeConfigurePhase never runs -- and with it the step that
+    # gives cmake a CMAKE_PREFIX_PATH covering the buildInputs. That goes
+    # unnoticed natively but breaks the cross build: nixpkgs puts every Qt
+    # module in its own store path, Qt6Config resolves components through
+    # CMAKE_PREFIX_PATH, and with it empty `find_package(Qt6 COMPONENTS
+    # RemoteObjects)` looks only under qtbase's own prefix and fails with
+    # "Expected Config file at <qtbase>/lib/cmake/Qt6RemoteObjects ... does
+    # NOT exist".
+    #
+    # nixpkgs does populate QT_ADDITIONAL_PACKAGES_PREFIX_PATH with each Qt
+    # module's prefix (this Qt's Qt6Config does not read that variable), so
+    # reuse it. Colon-separated in the environment, semicolon-separated as a
+    # CMake list.
+    qtPrefixes="$(printf '%s' "''${CMAKE_PREFIX_PATH-}:''${QT_ADDITIONAL_PACKAGES_PREFIX_PATH-}" \
+        | tr ':' ';' | sed 's/^;*//; s/;*$//; s/;;*/;/g')"
+    cmake ../cpp -GNinja -DCMAKE_INSTALL_PREFIX=$out \
+        ''${qtPrefixes:+-DCMAKE_PREFIX_PATH="$qtPrefixes"} $cmakeFlags
     ninja
     cd ..
 

@@ -11,10 +11,23 @@ set(CMAKE_AUTOMOC ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core RemoteObjects)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core RemoteObjects)
 
-# Plain-C++ transport dependencies (no Qt). The `system` component is
-# required for boost::system::error_code (Boost.Asio); without it
-# Boost::system isn't an exported imported target on Boost 1.87+.
-find_package(Boost REQUIRED COMPONENTS system)
+# Plain-C++ transport dependencies (no Qt).
+#
+# Boost.System is header-only, but Boost 1.87 only EXPORTS the Boost::system
+# imported target when the component is requested -- hence the explicit
+# COMPONENTS below. Boost 1.89 then removed the compiled boost_system library
+# outright, so there is no boost_systemConfig.cmake at all and requesting it as
+# REQUIRED hard-fails ("Could not find a package configuration file provided by
+# boost_system"). Ask for it optionally and fall back to Boost::headers, which
+# carries the same header-only error_code either way.
+find_package(Boost REQUIRED)
+find_package(Boost QUIET OPTIONAL_COMPONENTS system)
+if(TARGET Boost::system)
+    set(LOGOS_BOOST_SYSTEM Boost::system)
+else()
+    set(LOGOS_BOOST_SYSTEM Boost::headers)
+endif()
+message(STATUS "Boost.System target: ${LOGOS_BOOST_SYSTEM} (Boost ${Boost_VERSION})")
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
@@ -105,7 +118,7 @@ target_link_libraries(logos_protocol PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
     Boost::headers
-    Boost::system
+    ${LOGOS_BOOST_SYSTEM}
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
@@ -150,7 +163,7 @@ target_link_libraries(logos_protocol_shared PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
     Boost::headers
-    Boost::system
+    ${LOGOS_BOOST_SYSTEM}
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
