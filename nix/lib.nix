@@ -16,6 +16,9 @@ pkgs.stdenv.mkDerivation {
   propagatedBuildInputs = common.propagatedBuildInputs;
 
   dontUseCmakeConfigure = true;
+  # Required whenever the Qt wrapper hooks are absent (Windows) -- qtbase's
+  # setup hook errors out in qtPreHook otherwise.
+  dontWrapQtApps = true;
 
   buildPhase = ''
     runHook preBuild

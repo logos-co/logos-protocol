@@ -7,6 +7,7 @@
 #include <limits>
 #include <vector>
 
+#ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -15,8 +16,65 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 namespace logos {
+
+#ifdef _WIN32
+
+// On Windows the local transport is backed by NAMED PIPES: QLocalServer maps a
+// server name to \\.\pipe\<name>. Every assumption this file is built on is a
+// unix-domain-socket assumption, and none of them survives the move:
+//
+//   * a pipe has no filesystem inode, so there is nothing to lstat, chown or
+//     chmod — access is governed by a security descriptor supplied at
+//     CreateNamedPipe time, not by mode bits;
+//   * a pipe instance ceases to exist when its last handle closes, so a
+//     hard-killed process cannot leave a stale endpoint behind. There is no
+//     equivalent of the /tmp/logos_<name>_<instance> litter the reaper exists
+//     to clean up.
+//
+// So isSocketDead/reapStaleSockets are not merely unimplemented here, they are
+// vacuous: the condition they detect cannot arise.
+
+bool applySocketPerms(const std::string& absPath, std::string* errOut)
+{
+    const char* grpEnv = std::getenv("LOGOS_SOCKET_GROUP");
+    const char* modeEnv = std::getenv("LOGOS_SOCKET_MODE");
+    const bool wantGroup = grpEnv && *grpEnv;
+    const bool wantMode = modeEnv && *modeEnv;
+
+    // Policy unset is the overwhelmingly common case and is a genuine no-op.
+    if (!wantGroup && !wantMode) return true;
+
+    // Policy SET, though, is a request we cannot honour. Returning true here
+    // would silently widen access relative to what the operator asked for --
+    // the one direction this file is careful never to go (see the chgrp-then-
+    // chmod ordering in the POSIX branch). Granting a Windows pipe to a group
+    // means building a DACL and resolving the group to a SID; until that
+    // exists, refuse loudly rather than pretend.
+    if (errOut) {
+        *errOut = "LOGOS_SOCKET_GROUP/LOGOS_SOCKET_MODE are not supported on "
+                  "Windows: the local transport uses named pipes, which carry a "
+                  "security descriptor rather than owner/group/mode. Unset them, "
+                  "or run the node per-user (%LOCALAPPDATA%). Path: " + absPath;
+    }
+    return false;
+}
+
+bool isSocketDead(const std::string& /*absPath*/)
+{
+    // Fail closed, matching the documented contract: never report an endpoint
+    // dead unless certain. A named pipe that still exists still has an owner.
+    return false;
+}
+
+std::size_t reapStaleSockets(const std::string& /*dir*/, const std::string& /*prefix*/)
+{
+    return 0;  // named pipes leave nothing behind to reap
+}
+
+#else
 
 namespace {
 
@@ -167,5 +225,7 @@ std::size_t reapStaleSockets(const std::string& dir, const std::string& prefix)
     ::closedir(d);
     return removed;
 }
+
+#endif  // _WIN32
 
 }  // namespace logos
