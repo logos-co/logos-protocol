@@ -30,7 +30,7 @@
 //   1b. AND IT DRAINS WITHOUT ANOTHER CALL. Reaping on the spawn path alone
 //      leaves the tail of a burst parked until the next call, which for a
 //      module that bursts and then goes quiet may never come: 2000 completed
-//      calls kept 1428 waiters and 24MiB once the handle went idle, and one
+//      calls kept ~1400 waiters and 24MiB once the handle went idle, and one
 //      further call dropped that to 1. Waiters therefore reap each other on
 //      their way out, and this pins the IDLE bound with no further spawn.
 //
@@ -458,7 +458,10 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
 // then the handle goes quiet. If reaping only ever happened on the spawn path,
 // everything that finished after the LAST spawn would stay parked for the life
 // of the handle — measured at 1428 waiters and +24MiB after 2000 completed
-// calls, collapsing to 1 the moment one further call was issued.
+// calls, collapsing to 1 the moment one further call was issued. That figure is
+// race-dependent, not a constant: a re-measure of the same build gave 1421 (and
+// 599 rather than 610 for the 800-call burst below). Same magnitude, different
+// number every time — which is the point of asserting a bound and not a value.
 //
 // So the bound is read here with NO further call: the burst has to have drained
 // itself. What remains is what published after the last reap — at minimum the

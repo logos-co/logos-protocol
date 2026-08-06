@@ -68,6 +68,15 @@ add_executable(protocol_tests
     # reap-vs-publish race not deadlocking, and teardown still joining what is
     # left.
     test_plain_waiter_reaping.cpp
+    # The ordering rule the other two rest on: publishFinishedWaiter() is a
+    # waiter's LAST access to the object, which is the only reason
+    # stopAndJoinWaiters() can return while a reaper is still mid-join on a
+    # waiter it has already taken out of m_waiters. No supported caller can
+    # provoke the use-after-free an extra access below the publish would create,
+    # so this observes the accesses directly: the object is placed across a page
+    # boundary at m_waiterMu and its non-registry page is guarded while a waiter
+    # runs.
+    test_plain_waiter_publish_is_last.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

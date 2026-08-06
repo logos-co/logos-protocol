@@ -526,9 +526,12 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
             //     registry, so teardown does not even wait for them; here
             //     pthread_join detects the cycle and throws out of
             //     reapFinishedWaiters, whose half-drained vector then destroys
-            //     a still-joinable thread — std::terminate. Measured: with the
-            //     two lines below swapped, ReapingRacesPublishingWithoutDead-
-            //     locking aborts the process, 5 runs out of 5.
+            //     a still-joinable thread — std::terminate. Re-measured over a
+            //     longer run than the 5/5 an earlier commit message claimed:
+            //     with the two lines below swapped, ReapingRacesPublishingWith-
+            //     outDeadlocking aborts the process 12 runs in 15. It is a
+            //     race, so it is a probabilistic detector and a single green
+            //     run of it proves nothing.
             //   * Until it publishes, this waiter is still in m_waiters, so a
             //     concurrent teardown joins it and the object cannot be
             //     destroyed under the reap. After publishing, a reaper can take
@@ -538,8 +541,12 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
             //     the touch of m_waiterMu would land on freed memory. That one
             //     needs a caller still issuing calls while another thread
             //     releases, which this class already treats as caller-side UB,
-            //     so it is an argument and not a demonstration; the cycle above
-            //     is the demonstration.
+            //     so no test can provoke it without being red on correct code.
+            //     test_plain_waiter_publish_is_last.cpp therefore stops trying
+            //     to provoke it and OBSERVES the accesses instead: it guards the
+            //     object's non-registry state with mprotect while a waiter runs,
+            //     and baits the registry with an entry planted while the waiter
+            //     is parked mid-join. Both halves are deterministic.
             //
             // Reaping here at all is what makes the retention bound hold for a
             // module that bursts and then goes quiet: the spawn-path reaper
