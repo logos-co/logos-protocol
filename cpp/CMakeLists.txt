@@ -114,6 +114,18 @@ add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
 # Link Qt + plain-C++ transport deps. Boost.Asio is header-only
 # *except* for `boost::system::error_code` (and friends), which lives
 # in libboost_system — see the matching note in logos-cpp-sdk.
+# Boost.Asio's IOCP backend calls the Winsock EXTENSION functions AcceptEx and
+# GetAcceptExSockaddrs, which live in mswsock rather than ws2_32. Without this
+# the plain TCP transport compiles cleanly and then fails at link with
+# "undefined reference to `AcceptEx'" out of
+# win_iocp_socket_service_base::start_accept_op. ws2_32 supplies core Winsock
+# and is listed explicitly rather than relied upon arriving via Qt::Network.
+if(WIN32)
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
+else()
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
+endif()
+
 target_link_libraries(logos_protocol PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
@@ -122,6 +134,7 @@ target_link_libraries(logos_protocol PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
 
 target_include_directories(logos_protocol PUBLIC
@@ -167,7 +180,12 @@ target_link_libraries(logos_protocol_shared PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
+
+# Only the SHARED build marks the lp_* C ABI dllexport; the static archive
+# leaves LP_API empty so consumers linking it need no import library.
+target_compile_definitions(logos_protocol_shared PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
 
 target_include_directories(logos_protocol_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
