@@ -13,6 +13,7 @@
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
+#include "logos_shared_api.h"
 #include "logos_subscription_state.h"
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
@@ -27,8 +28,15 @@ class TokenManager;
  * 
  * This class serves as a facade over LogosAPIConsumer, providing a clean interface
  * for applications that need to call remote methods and handle events.
+ *
+ * LOGOS_SHARED_API for the same reason as TokenManager, plus one of its own:
+ * this is the object that reaches the shared TokenManager on the call path, and
+ * archives are pulled a whole OBJECT FILE at a time. If the consumer imports
+ * TokenManager but not LogosAPIClient, ld pulls logos_api_client.cpp.obj out of
+ * liblogos_protocol.a for the client, that object drags token_manager.cpp.obj
+ * back in with it, and the duplicate static reappears. See logos_shared_api.h.
  */
-class LogosAPIClient : public QObject
+class LOGOS_SHARED_API LogosAPIClient : public QObject
 {
     Q_OBJECT
 

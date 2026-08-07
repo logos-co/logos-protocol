@@ -5,6 +5,8 @@
 #include <QVariant>
 #include <stdexcept>
 
+#include "logos_shared_api.h"
+
 class LogosResultException : public std::runtime_error
 {
 public:
@@ -131,8 +133,14 @@ struct LogosResult
     }
 };
 
-// Provide (de)serialisation for being use as Remote Object
-QDataStream &operator<<(QDataStream &out, const LogosResult &result);
-QDataStream &operator>>(QDataStream &in, LogosResult &result);
+// Provide (de)serialisation for being use as Remote Object.
+//
+// LOGOS_SHARED_API not because these hold state, but because they are the only
+// out-of-line symbols in logos_types.cpp.obj: leaving them un-imported lets ld
+// pull that object into a Windows consumer, and archive pull-in is transitive.
+// The single-provider rule is per object file, not per class — see
+// logos_shared_api.h.
+LOGOS_SHARED_API QDataStream &operator<<(QDataStream &out, const LogosResult &result);
+LOGOS_SHARED_API QDataStream &operator>>(QDataStream &in, LogosResult &result);
 
 #endif

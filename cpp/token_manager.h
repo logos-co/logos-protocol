@@ -9,6 +9,8 @@
 #include <QCryptographicHash>
 #include <string>
 
+#include "logos_shared_api.h"
+
 /**
  * @brief Render a capability/auth token safe to write to logs.
  *
@@ -38,8 +40,14 @@ inline QString redactToken(const QString& token)
  * 
  * This class manages a collection of tokens identified by keys, providing thread-safe
  * access to store, retrieve, and manage tokens throughout the application lifecycle.
+ *
+ * LOGOS_SHARED_API: the singleton below is a function-local static, so it is one
+ * per copy of the code. On PE that means one per IMAGE unless the consumer
+ * imports it from liblogos_core.dll — which is exactly the token-invisibility
+ * bug described in logos_shared_api.h. Off Windows, and inside the provider,
+ * this expands to nothing.
  */
-class TokenManager : public QObject
+class LOGOS_SHARED_API TokenManager : public QObject
 {
     Q_OBJECT
 

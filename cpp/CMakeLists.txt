@@ -35,6 +35,7 @@ set(PROTOCOL_SOURCES
     logos_protocol.h
     logos_module_impl.h
     logos_call_error.h
+    logos_shared_api.h
     logos_protocol.cpp
     logos_types.cpp
     logos_types.h
@@ -241,6 +242,10 @@ install(FILES
     logos_codec.h
     logos_call_error.h
     logos_rpc_status.h
+    # Windows single-provider marker. token_manager.h / logos_api_client.h /
+    # logos_types.h include it, and so does logos-qt-sdk's logos_api.h, so it
+    # has to ship even though nothing in this library's own sources needs it.
+    logos_shared_api.h
     logos_types.h
     logos_api_client.h
     logos_api_consumer.h
