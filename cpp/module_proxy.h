@@ -7,11 +7,33 @@
 #include <QHash>
 #include <QString>
 #include <QJsonArray>
+#include <QPointer>
 
 #include <functional>
 #include <utility>
 
 class LogosProviderObject;
+
+namespace logos {
+// The name a module's handshake surface is published under.
+//
+// A module's initializer is synchronous and routinely calls out — including
+// capability_module's requestModule, which capability answers by pushing a
+// token back to that same module. The module's BUSINESS object is published
+// only after the initializer returns (so a caller keeps waiting at acquire
+// until the module is genuinely ready, which is the long-standing contract).
+// That left the push unsatisfiable: capability waited for a source that could
+// not appear until the initializer returned, and the initializer could not
+// return until capability answered.
+//
+// The handshake object is published BEFORE the initializer runs and carries
+// token delivery only. capability can therefore always reach a module, while
+// callers of real methods still block at acquire exactly as they always have.
+inline QString handshakeObjectName(const QString& moduleName)
+{
+    return moduleName + QStringLiteral("__handshake");
+}
+} // namespace logos
 
 /**
  * @brief ModuleProxy wraps a LogosProviderObject and exposes it as a QObject
@@ -77,6 +99,30 @@ private:
     LogosProviderObject* m_provider;
     QHash<QString, QString> m_tokens;
     TokenValidator m_validator;
+};
+
+/**
+ * @brief The token-delivery-only surface described by logos::handshakeObjectName.
+ *
+ * Deliberately tiny: it exposes informModuleToken and nothing else, so
+ * publishing it early cannot expose business methods on a module that has not
+ * finished initializing. It forwards to the ModuleProxy that owns it, so a
+ * token delivered here lands in exactly the same store the business object
+ * consults later.
+ */
+class ModuleHandshakeProxy : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit ModuleHandshakeProxy(ModuleProxy* proxy, QObject* parent = nullptr);
+
+    Q_INVOKABLE bool informModuleToken(const QString& authToken,
+                                       const QString& moduleName,
+                                       const QString& token);
+
+private:
+    QPointer<ModuleProxy> m_proxy;
 };
 
 #endif // MODULE_PROXY_H

@@ -144,7 +144,12 @@ public:
 
 public slots:
     bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
-    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
+    // Delivers a token to `originModule`, preferring its handshake surface (see
+    // logos::handshakeObjectName) so a target that is still running its
+    // initializer is still reachable; falls back to the business object for
+    // modules built before that surface existed. timeoutMs bounds the fallback
+    // acquire and the call; the default preserves the historical 20s.
+    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
     std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule);
 
 private:

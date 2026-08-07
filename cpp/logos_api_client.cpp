@@ -419,9 +419,9 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
                              QString::fromStdString(token));
 }
 
-bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token)
+bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs)
 {
-    return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token);
+    return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token, timeoutMs);
 }
 
 TokenManager* LogosAPIClient::getTokenManager() const

@@ -251,3 +251,25 @@ QJsonArray ModuleProxy::getPluginEvents()
 }
 
 #include "moc_module_proxy.cpp"
+
+// ── ModuleHandshakeProxy ─────────────────────────────────────────────────────
+
+ModuleHandshakeProxy::ModuleHandshakeProxy(ModuleProxy* proxy, QObject* parent)
+    : QObject(parent)
+    , m_proxy(proxy)
+{
+}
+
+bool ModuleHandshakeProxy::informModuleToken(const QString& authToken,
+                                             const QString& moduleName,
+                                             const QString& token)
+{
+    if (!m_proxy) {
+        qWarning() << "ModuleHandshakeProxy: no module proxy to deliver the token for"
+                   << moduleName;
+        return false;
+    }
+    // Same authorization and same store as the business object — this is only a
+    // different door onto it, reachable earlier.
+    return m_proxy->informModuleToken(authToken, moduleName, token);
+}
