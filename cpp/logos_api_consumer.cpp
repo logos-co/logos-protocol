@@ -310,9 +310,25 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
     if (LogosObject* early = acquireCachedObject(handshake, kHandshakeProbeTimeoutMs)) {
         qDebug() << "[LogosObject] LogosAPIConsumer: delivering token for" << moduleName
                  << "via the handshake surface of" << originModule;
-        const bool result = early->informModuleToken(authToken, moduleName, token, timeoutMs);
-        qDebug() << "LogosAPIConsumer: informModuleToken completed with result:" << result;
-        return result;
+        if (early->informModuleToken(authToken, moduleName, token, timeoutMs)) {
+            qDebug() << "LogosAPIConsumer: informModuleToken completed with result: true";
+            return true;
+        }
+        // A refusal HERE is not authoritative, so do not report it as the answer.
+        // The handshake surface goes live before the target's initializer runs,
+        // and a target whose token store is only seeded by that initializer will
+        // refuse a push that arrives first. Falling through to the business
+        // object — which exists only once the initializer has returned, by which
+        // point the store is populated — is what the caller got before this
+        // surface existed. Returning false here instead would hand the caller an
+        // empty grant that it has no way to distinguish from a real denial.
+        //
+        // This cannot reintroduce the startup wedge: the wait below is bounded by
+        // the caller's own budget (capability_module passes 3000 ms), not by the
+        // 20 s default that made the original deadlock fatal.
+        qWarning() << "LogosAPIConsumer: handshake surface of" << originModule
+                   << "refused the token for" << moduleName
+                   << "- it is probably still initializing; retrying on the business object";
     }
 
     // Fall back to the business object: modules built before the handshake

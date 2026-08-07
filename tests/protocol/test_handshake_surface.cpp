@@ -130,6 +130,50 @@ TEST_F(HandshakeSurfaceTest, TokenDeliveredEarlyAuthorizesLaterBusinessCalls)
     EXPECT_EQ(provider.dispatches, 1);
 }
 
+// REGRESSION GUARD for the ordering bug this surface originally shipped with.
+//
+// The case above seeds "core" before pushing, which is NOT the state that holds
+// at publish time: the trust anchor is written by the module's initializer (the
+// generated cdylib glue forwards the host's authToken via
+// logos_module_accept_token), and the initializer runs AFTER publishHandshake.
+// So for the whole window the surface exists to cover, the store is empty and
+// every push is refused — the surface is reachable and useless.
+//
+// Measured on Linux before the publisher seeded the anchor: "rejecting
+// informModuleToken" in 29 of 34 runs, and 0 of 34 on the pre-surface baseline.
+//
+// This case pins the gate's behaviour on an EMPTY store so that a publisher which
+// stops seeding cannot silently regress to it again. The seeding itself lives in
+// logos-qt-sdk (LogosAPIProvider::seedHandshakeTrustAnchor) and is covered there.
+TEST_F(HandshakeSurfaceTest, PushIsRefusedWhileTheTrustAnchorIsUnseeded)
+{
+    CountingProvider provider;
+    ModuleProxy proxy(&provider);
+    ModuleHandshakeProxy handshake(&proxy);
+
+    // Model the pre-initializer state exactly: neither trust key exists yet.
+    ScopedToken restoreCore(QStringLiteral("core"));
+    ScopedToken restoreCap(QStringLiteral("capability_module"));
+    TokenManager::instance().removeToken(QStringLiteral("core"));
+    TokenManager::instance().removeToken(QStringLiteral("capability_module"));
+
+    EXPECT_FALSE(handshake.informModuleToken(QStringLiteral("coretok"),
+                                             QStringLiteral("peer"),
+                                             QStringLiteral("peertok")))
+        << "an unseeded store must refuse: this is the state a publisher leaves "
+           "if it does not seed the trust anchor before publishing the surface";
+    EXPECT_EQ(provider.tokenPushes, 0) << "a refused push must not reach the provider";
+
+    // ...and once the anchor is present, the very same push is honoured. This is
+    // the difference the publisher's seeding makes, stated as an assertion.
+    TokenManager::instance().saveToken(QStringLiteral("core"), QStringLiteral("coretok"));
+    ScopedToken restorePeer(QStringLiteral("peer"));
+    EXPECT_TRUE(handshake.informModuleToken(QStringLiteral("coretok"),
+                                            QStringLiteral("peer"),
+                                            QStringLiteral("peertok")));
+    EXPECT_EQ(provider.tokenPushes, 1);
+}
+
 // The surface is published early, so it must expose token delivery and nothing
 // else: no business dispatch, no introspection of the module's methods.
 TEST_F(HandshakeSurfaceTest, HandshakeSurfaceExposesOnlyTokenDelivery)
