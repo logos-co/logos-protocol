@@ -41,6 +41,16 @@ private:
     bool connectToRegistry();
 
     QRemoteObjectNode* m_node;
+    // Does the registry endpoint currently have a listener?
+    //
+    // Separate from m_connected because connectToNode() cannot answer it: it
+    // returns false only for an unregistered URL SCHEME and never touches the
+    // peer, so m_connected records "we attempted a connection", nothing more.
+    // For `local:` URLs this probes the socket / named pipe directly; for any
+    // other scheme it returns true, leaving those transports' behaviour
+    // unchanged.
+    bool endpointHasListener() const;
+
     QString m_registryUrl;
     bool m_connected;
 };

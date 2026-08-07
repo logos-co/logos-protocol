@@ -11,6 +11,7 @@
 #include <QEventLoop>
 #include <QDebug>
 #include <QUrl>
+#include <QLocalSocket>
 #include <QMetaObject>
 #include <QTime>
 #include <QJsonArray>
@@ -571,9 +572,44 @@ bool RemoteTransportConnection::connectToHost()
     return connectToRegistry();
 }
 
+bool RemoteTransportConnection::endpointHasListener() const
+{
+    const QUrl url(m_registryUrl);
+    // Only `local:` can be probed cheaply and without side effects worth
+    // worrying about. Anything else keeps the previous semantics.
+    if (url.scheme() != QLatin1String("local"))
+        return true;
+
+    const QString serverName = url.path().isEmpty() ? url.host() : url.path();
+    if (serverName.isEmpty())
+        return true;
+
+    // A client connect is exactly what QtRO itself does, so a transient one is
+    // benign against a live registry, and against a dead endpoint it fails
+    // immediately -- ERROR_FILE_NOT_FOUND on Windows, ENOENT/ECONNREFUSED on
+    // Unix. That is the whole point: cost is microseconds when the answer is
+    // "no", which is the case that currently costs 20 seconds.
+    QLocalSocket probe;
+    probe.connectToServer(serverName, QIODevice::ReadOnly);
+    const bool alive = probe.waitForConnected(250);
+    probe.abort();
+    return alive;
+}
+
 bool RemoteTransportConnection::isConnected() const
 {
-    return m_connected;
+    // m_connected alone is NOT an answer. QRemoteObjectNode::connectToNode()
+    // returns false only when the URL scheme is unregistered -- it never
+    // contacts the peer -- and our registry URLs are COMPUTED rather than
+    // discovered (logos_instance.h: local:logos_<module>_<instanceId>), so they
+    // are identical whether or not the module exists. Returning the raw latch
+    // made every `if (!client->isConnected()) return;` guard in the codebase
+    // dead code, and callers then paid a 20 s waitForSource per call against
+    // modules that were never loaded -- measured at ~417 s of blocked GUI
+    // thread in Basecamp on macOS, 361 s on Linux, before its window appeared.
+    if (!m_connected)
+        return false;
+    return endpointHasListener();
 }
 
 bool RemoteTransportConnection::reconnect()
@@ -609,13 +645,17 @@ bool RemoteTransportConnection::connectToRegistry()
 
     if (success) {
         m_connected = true;
-        qDebug() << "RemoteTransportConnection: Successfully connected to registry:" << m_registryUrl;
+        // Deliberately NOT "Successfully connected". connectToNode() only
+        // accepted the URL scheme; it never contacted a peer, and this line
+        // previously asserted a connection that frequently did not exist. That
+        // false claim sent three separate investigations to the wrong place --
+        // it cost considerably more than the bug it hid.
+        qDebug() << "RemoteTransportConnection: Registry connect attempt started (no peer contact yet):"
+                 << m_registryUrl;
     } else {
         m_connected = false;
-        qWarning() << "RemoteTransportConnection: Failed to connect to registry:" << m_registryUrl;
+        qWarning() << "RemoteTransportConnection: Registry URL scheme rejected:" << m_registryUrl;
     }
-    qDebug() << "RemoteTransportConnection: Connected to registry at"
-             << QTime::currentTime().toString("hh:mm:ss.zzz");
 
     return m_connected;
 }
@@ -625,6 +665,15 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     if (!m_connected) {
         qWarning() << "RemoteTransportConnection: Not connected. Cannot request object:" << objectName;
         return nullptr;
+    }
+
+    // Warn BEFORE a doomed wait rather than after it. Without this the log went
+    // silent for the full timeout and then reported failure, which reads as a
+    // hang with no cause attached.
+    if (!endpointHasListener()) {
+        qWarning() << "RemoteTransportConnection: no listener at" << m_registryUrl
+                   << "-- request for" << objectName << "will block up to" << timeoutMs
+                   << "ms and then fail. Is the module loaded?";
     }
 
     qDebug() << "RemoteTransportConnection: Requesting object:" << objectName
