@@ -16,6 +16,43 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # the test catches the bug that actually existed rather than a hand-written
 # imitation of it.
 
+# ── detector inversions: OFF, and off in every build that ships ──────────────
+#
+# An assertion that has never been seen to fail is not evidence. Two of the
+# guarantees in this suite are single points of mechanism — the exactly-once CAS
+# in AsyncCall::deliver(), and the deadline living on its own thread rather than
+# the shared io thread — so the suite has to be runnable ONCE with each of them
+# removed, and go red.
+#
+# This is a build option rather than the environment-variable probes an earlier
+# draft carried. Those shipped in the production translation unit, read getenv()
+# once per delivery in the hot path, and one of them compiled a raw-`this`
+# use-after-free path into the binary that a released build would happily
+# execute if the variable were set. A compile-time seam costs nothing at runtime
+# and cannot be turned on by accident: it is not referenced by nix/tests.nix or
+# by any packaging, so a shipped build cannot have it.
+#
+#   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
+#   ./build-broken/protocol/protocol_tests --gtest_filter='IoFoldTest.*'
+#
+# Three tests must go RED there, and test_iofold.cpp names them at the top with
+# the numbers they were seen to fail with. A green run of those in this build
+# means the corresponding real assertion is not exercising what it claims to,
+# which is a bug in the test, not a licence to trust it.
+option(LOGOS_PROTOCOL_DETECTOR_INVERSIONS
+       "Compile the plain transport with its exactly-once gate and its \
+independent deadline clock REMOVED, so the tests that assert them can be shown \
+to fail. Never enable outside a throwaway detector build." OFF)
+
+if(LOGOS_PROTOCOL_DETECTOR_INVERSIONS)
+    message(WARNING "LOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON: this build is "
+                    "DELIBERATELY BROKEN and is only useful for validating the "
+                    "test suite's detectors.")
+    target_compile_definitions(logos_protocol PUBLIC
+        LOGOS_PLAIN_DETECTOR_BREAK_ONCE=1
+        LOGOS_PLAIN_DETECTOR_BREAK_DEADLINE_ISOLATION=1)
+endif()
+
 add_executable(protocol_tests
     test_main.cpp
     # New protocol-level tests
@@ -73,33 +110,35 @@ add_executable(protocol_tests
     # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
     # which needs no blocking provider and therefore no second event loop.
     test_call_error_qt_remote.cpp
-    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Joining the
-    # per-call waiters closed a use-after-free but left release() blocking for
-    # the remainder of the call's timeout (up to the 20s default), because
-    # joinWaiters() could only join, never ask a waiter to stop. Pins all three
-    # halves of the fix: teardown costs one wait slice, the callback still fires
-    # EXACTLY ONCE on every outcome including cancellation (a waiter that just
-    # returns turns a stall into a hang), and the join that keeps `this` alive
-    # under the waiter is still there.
+    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Written when
+    # in-flight calls were threads: joining them closed a use-after-free but left
+    # release() blocking for the remainder of the call's timeout, so they were
+    # asked to stop first and teardown cost one 25ms wait slice. Public API only,
+    # so the io_context fold did not touch it — but its BOUNDS are now loose
+    # rather than tight: there is no wait slice any more (0ms, measured) and no
+    # join, because nothing captures `this`. What it still pins exactly is the
+    # part that matters most: the callback fires EXACTLY ONCE on every outcome
+    # including cancellation, since a dropped one turns a stall into a hang.
     test_plain_object_teardown.cpp
     # The other half of the same mechanism: what a COMPLETED call leaves behind.
-    # A waiter cannot join itself, so while the registry was a plain vector the
-    # only thing that ever emptied it was teardown, and every finished call
-    # parked an unjoined thread (~one page of resident memory) for the life of
-    # the handle — unbounded under the cached-handle shape LogosAPIConsumer
-    # actually uses. Pins the registry not growing with call count, the
-    # reap-vs-publish race not deadlocking, and teardown still joining what is
-    # left.
+    # Written for the waiter registry (a map of threads plus a publish list) and
+    # retargeted by the io_context fold at the registry that replaced it,
+    # CallState::inflight. The claims are unchanged and are why it survived the
+    # rework: retention must not grow with call count, a burst that goes idle
+    # must drain with no further call, and teardown must still deliver exactly
+    # once.
     test_plain_waiter_reaping.cpp
-    # The ordering rule the other two rest on: publishFinishedWaiter() is a
-    # waiter's LAST access to the object, which is the only reason
-    # stopAndJoinWaiters() can return while a reaper is still mid-join on a
-    # waiter it has already taken out of m_waiters. No supported caller can
-    # provoke the use-after-free an extra access below the publish would create,
-    # so this observes the accesses directly: the object is placed across a page
-    # boundary at m_waiterMu and its non-registry page is guarded while a waiter
-    # runs.
-    test_plain_waiter_publish_is_last.cpp
+    # test_plain_waiter_publish_is_last.cpp — DELETED BY THE io_context FOLD.
+    # It pinned one rule: publishFinishedWaiter() is a waiter thread's LAST
+    # access to the object, which was the only reason stopAndJoinWaiters() could
+    # return while a reaper was still mid-join on a waiter it had already taken
+    # out of m_waiters. There are no waiter threads, no reaper and no publish
+    # list any more, so there is no ordering left to pin — the property it
+    # protected ("no handler touches the object after teardown") is structural
+    # now: handlers hold a weak_ptr to CallState and never dereference the
+    # handle. test_iofold.cpp OBSERVES that instead of pinning the protocol that
+    # used to be needed for it.
+    test_iofold.cpp
     # The OTHER thing release() leaves behind: the deferred-completion event
     # subscription. Its handler captured raw `this` and lives in the
     # RpcConnection, which is shared across every handle and outlives all of

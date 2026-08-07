@@ -1,3 +1,16 @@
+// RETARGETED BY THE io_context FOLD — read this before the history below.
+//
+// The mechanism this file was written against is gone: there are no waiter
+// threads, no publish list and no reaping, because an async call is no longer a
+// thread. What it MEASURES is unchanged, which is why the file survived rather
+// than being deleted with the code it was written for — retention must not grow
+// with call count, a burst that goes idle must drain with no further call, and
+// teardown must still deliver exactly once. It now reads CallState::inflight
+// (see the accessor further down) instead of m_waiters, and the numbers it
+// prints are in-flight calls rather than threads. The file name, and everything
+// below this banner, is the history of the defect it was built for.
+//
+// ─────────────────────────────────────────────────────────────────────────────
 // A long-lived PlainLogosObject must not accumulate the waiters of calls that
 // have already finished.
 //
@@ -101,32 +114,39 @@ using namespace logos::plain;
 
 namespace {
 
-// ── reading m_waiters without touching the production header ────────────────
+// ── reading the in-flight registry without touching the production header ───
+//
+// RETARGETED BY THE io_context FOLD. This file was written against
+// m_waiters/m_finishedWaiters — a map of std::thread plus a publish list, which
+// existed only because a thread cannot join itself. There are no threads any
+// more: an async call is a shared_ptr<AsyncCall> in CallState::inflight, put
+// there when the call is issued and erased by the one delivery it gets.
+//
+// The CLAIMS are unchanged and are the reason this file survives the rework
+// rather than being deleted with the mechanism it was written for: retention
+// must not scale with call count, a burst that goes idle must drain with no
+// further call, and teardown must still deliver exactly once. What changes is
+// that they now hold for a much duller reason — an entry's lifetime IS the
+// call's — so the deadlock test below is pinning something that can no longer
+// happen (nothing joins anything) and is kept as a cheap tripwire.
 template <typename Tag, typename Tag::type Member>
 struct Rob {
     friend typename Tag::type get(Tag) { return Member; }
 };
 
-struct WaitersTag {
-    using type = std::map<std::uint64_t, std::thread> PlainLogosObject::*;
-    friend type get(WaitersTag);
+struct StateTag {
+    using type = std::shared_ptr<PlainLogosObject::CallState> PlainLogosObject::*;
+    friend type get(StateTag);
 };
-template struct Rob<WaitersTag, &PlainLogosObject::m_waiters>;
+template struct Rob<StateTag, &PlainLogosObject::m_state>;
 
-struct WaiterMuTag {
-    using type = std::mutex PlainLogosObject::*;
-    friend type get(WaiterMuTag);
-};
-template struct Rob<WaiterMuTag, &PlainLogosObject::m_waiterMu>;
-
-// Taken under the object's OWN mutex — the one the registration path holds —
-// so this is a consistent read, not a torn one.
-size_t waiterCount(PlainLogosObject* obj)
+// Taken under the state's OWN mutex — the one the registration path holds — so
+// this is a consistent read, not a torn one.
+size_t inflightCount(PlainLogosObject* obj)
 {
-    auto& mu = obj->*get(WaiterMuTag{});
-    auto& m  = obj->*get(WaitersTag{});
-    std::lock_guard<std::mutex> g(mu);
-    return m.size();
+    auto& st = obj->*get(StateTag{});
+    std::lock_guard<std::mutex> g(st->mu);
+    return st->inflight.size();
 }
 
 // Answers `ping` immediately — every call in the retention tests COMPLETES,
@@ -475,11 +495,11 @@ TEST_F(PlainWaiterReapingTest, SequentialCompletedCallsDoNotAccumulateWaiters)
                                      });
         pumpUntilTotal(d, i + 1, 10000);
         ASSERT_EQ(d.total.load(), i + 1) << "call " << i << " never delivered";
-        peak = std::max(peak, waiterCount(plain));
+        peak = std::max(peak, inflightCount(plain));
     }
 
-    const size_t finalCount = waiterCount(plain);
-    std::cout << "  " << kCalls << " sequential completed calls -> m_waiters peak="
+    const size_t finalCount = inflightCount(plain);
+    std::cout << "  " << kCalls << " sequential completed calls -> in-flight peak="
               << peak << " final=" << finalCount << std::endl;
 
     EXPECT_EQ(d.errors.load(), 0) << "a completed call reported an error";
@@ -531,15 +551,15 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
                                              d.record(i, e);
                                          });
         }
-        peak = std::max(peak, waiterCount(plain));
+        peak = std::max(peak, inflightCount(plain));
         pumpUntilTotal(d, issued - kInflight + 1, 10000);
     }
     pumpUntilTotal(d, kCalls, 20000);
     pump(200);   // a duplicate delivery would land here
 
-    const size_t finalCount = waiterCount(plain);
+    const size_t finalCount = inflightCount(plain);
     std::cout << "  " << kCalls << " calls at " << kInflight
-              << " in flight -> m_waiters peak=" << peak
+              << " in flight -> in-flight registry peak=" << peak
               << " final=" << finalCount << std::endl;
 
     EXPECT_EQ(d.total.load(), kCalls);
@@ -571,9 +591,12 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
 // number" into kBurst exactly — see WHY THE PROVIDER IS GATED.
 //
 // So the bound is read here with NO further call: the burst has to have drained
-// itself. What remains is whatever published after the FINAL reap — at minimum
-// the last waiter to finish, which by construction has nobody behind it to
-// collect it.
+// itself. RETARGETED BY THE FOLD, and this is where the two mechanisms differ
+// most: there is no last reap and no last exit batch, because an entry's
+// lifetime IS its call's. What remains after a burst that all completed is
+// therefore ZERO, not "one or two", and the interesting quantity moves to the
+// OTHER end of the test — the peak, which the gate below makes a measured 800
+// concurrent async calls carrying no threads at all.
 //
 // WHY THE PROVIDER IS GATED, which is the whole design of this test. "Issue 800
 // calls in a loop and hope they overlap" is not an experiment, it is a race
@@ -606,39 +629,36 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
 // counter, not inferred. The burst is then concurrent by construction on every
 // platform: 800/800 in flight, measured, on both, at every load level tried.
 //
-// AND THE DRAIN IS PACED, which is the other half and is NOT the same thing. The
-// first version of this released all 800 at once, and on Linux that replaced one
-// scheduling artefact with another: 800 threads become runnable on 6 cores, and
-// because a waiter reaps and only THEN publishes, a reaper that collects a large
-// batch sits in its join loop while everyone behind it publishes — so the last
-// exit batch is enormous. Correct code, 800 released together, 20 runs:
+// THE PACED DRAIN BELOW IS INHERITED AND, ON THIS BRANCH, NOT LOAD-BEARING. It
+// is carried over from the base because releasing all 800 at once mattered
+// THERE: waiters reap and only then publish, so a reaper that collected a large
+// batch sat in its join loop while everyone behind it published, and correct
+// code left 2-389 on a 6-core Linux box against the defect's 800 — a 2x
+// separation, useless as a detector. Here there is nothing to reap and nothing
+// to serialize, and the residue is 0 at any pace: measured with kRelease set to
+// kBurst — one release, all 800 answered together — it is 0 on all 30 runs per
+// platform, the same as at 16. It stays because the structure is worth keeping
+// identical to the base's while both branches are live, and because a paced
+// drain checks the entries leaving progressively rather than all at the end.
 //
-//   macOS   1 every run          Linux   2-389 (median ~190)
+// MEASURED, this gated burst, CallState::inflight when it goes idle. Numbers, n
+// and margins are at the assertion below; the shape is:
 //
-// That is not a defect, it is what the exit guard can and cannot do against a
-// thundering herd, and it is recorded in plain_logos_object.h next to the
-// mechanism. It is useless as a DETECTOR, because the defect's value (800) is
-// only ~2x it. So the gate is opened kRelease at a time, each step awaited: the
-// waiters then retire each other the way a real drain does, and the residue is
-// the last step's exit batch instead of the burst's. Measured across release
-// steps, correct code on Linux, idle: step 1 → 1, step 8 → 1-3, step 16 → 1-2,
-// step 32 → 1-3, step 64 → 1-55, step 200 → 1-142, step 800 → 2-389. The knee is
-// well above the step chosen below, and a smaller step buys nothing but runtime
-// (step 8 costs 3x step 32 on a 64x-oversubscribed box).
+//                     this code    a delivery that does not erase its entry
+//   macOS             0            800   (exactly, every run)
+//   Linux, any load   0            800   (exactly, every run)
 //
-// MEASURED, this gated burst, m_waiters when it goes idle. Numbers, n and
-// margins are at the assertion below; the shape is:
+// The defect arm here is NOT the base's — the exit-guard reap it removed does
+// not exist any more — but the shape is the same one and it is the closest
+// mechanism-appropriate inversion: drop `st->inflight.erase(id)` from
+// AsyncCall::deliver(), so a completed call keeps its registration. That gives
+// kBurst exactly, on both platforms, and 801 after the follow-up call at the end
+// of this test. The separation is not statistical on either side.
 //
-//                     this code    reaping only on the spawn path
-//   macOS             1-2          800   (exactly, every run)
-//   Linux, any load   1-7          800   (exactly, every run)
-//
-// The defect's 800 is not "high", it is the whole burst: with no exit-guard reap
-// and no further spawn, nothing on any platform ever removes an entry, so the
-// count is kBurst exactly and the separation is not statistical. 800 live waiter
-// threads at once is also the peak this now reaches where the ungated version
-// reached ~150 on Linux, and that is affordable: the stacks are lazily faulted,
-// so peak RSS for the whole run is 29MiB on Linux and 32MiB on macOS.
+// AND THE PEAK IS THE CLAIM NOW. 800 async calls outstanding at once is what
+// this branch exists to make cheap: on the base, that reading is 800 live
+// std::threads; here it is 800 shared_ptr<AsyncCall> on the shared io_context
+// and no thread per pending RPC at all.
 TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
 {
     LiveHost host;
@@ -655,21 +675,20 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
 
     // ~1s in practice. Every wait in this test is already bounded — the gate
     // self-releases, the pumps have budgets, the calls have timeouts — so this
-    // is the backstop for a wedge INSIDE the code under test (a reaper deadlocked
-    // against a publisher), which none of those would catch.
+    // is the backstop for a wedge INSIDE the code under test, which none of
+    // those would catch. Cheap, and kept across the fold for that reason.
     Watchdog watchdog("BurstThatGoesIdleDrainsWithoutAnotherCall", 120000);
 
     // Issued in one go, with no pumping in between, against a CLOSED gate: no
     // reply can be produced until every one of them is outstanding.
     constexpr int kBurst = 800;
     // Gated calls released per step of the drain, each step awaited before the
-    // next. See the header comment: this is what keeps the residue the last
-    // step's exit batch rather than the burst's.
+    // next. Inherited from the base and not load-bearing here — see the header
+    // comment; the residue is 0 at any step, including one.
     constexpr int kRelease = 16;
-    // The residue cannot exceed what the last release step can leave behind, so
-    // the bound is stated against THAT and not against kBurst — 4x the step,
-    // sized at the assertion below.
-    constexpr size_t kDrained = 4 * kRelease;
+    // A small CONSTANT, because on this branch the quantity it bounds is a
+    // registry that a completed call has already left. Sized at the assertion.
+    constexpr size_t kDrained = 8;
     Deliveries d(kBurst);
     // Declared AFTER `d`, so it runs BEFORE it. The tail of this test used to be
     // a bare `obj->release(); pump(50);` on the happy path, which a FATAL
@@ -679,8 +698,8 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     // run them against a destroyed Deliveries. That is the one way this test
     // could answer a failure with a crash instead of a verdict, and the
     // assertions below (a gate that never opened, a burst that did not all
-    // complete) are exactly the ones that would trigger it. release() cancels
-    // and JOINS every waiter, and the pump behind it runs what they posted —
+    // complete) are exactly the ones that would trigger it. release() resolves
+    // every outstanding call, and the pump behind it runs what they posted —
     // both while `d` is still alive.
     struct ReleaseOnExit {
         LogosObject* obj;
@@ -702,13 +721,14 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     //     it does not depend on the client, on who reaps what, or on the Qt
     //     event loop having been pumped (it has not been — a delivery count
     //     would read 0 here whether or not replies existed).
-    //   * all 800 waiters are registered. A call that completed during the loop
-    //     would have been reaped by one of the spawns behind it, so this number
-    //     falling short is the ungated behaviour coming back.
+    //   * all 800 calls are registered in CallState::inflight. A call that
+    //     completed during the loop would have left it, so this number falling
+    //     short is the ungated behaviour coming back. It is also the fold's own
+    //     headline, measured: 800 concurrent async calls, zero threads.
     const int    answeredAtIssueEnd = host.answered();
-    const size_t inflight           = waiterCount(plain);
+    const size_t inflight           = inflightCount(plain);
     std::cout << "  burst issued: provider replies=" << answeredAtIssueEnd
-              << " waiters registered=" << inflight << "/" << kBurst << std::endl;
+              << " calls in flight=" << inflight << "/" << kBurst << std::endl;
     ASSERT_EQ(answeredAtIssueEnd, 0)
         << "the gate leaked: replies were produced while the burst was still "
            "being issued, so what this test measures below is not a burst drain";
@@ -717,9 +737,9 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
            "the burst finished issuing";
 
     // Drain it, kRelease at a time and NEVER issuing another call — which is the
-    // claim. Every entry that leaves m_waiters from here leaves by the exit
-    // guard: the spawn-path reaper has already run 800 times against an empty
-    // publish list and will not run again.
+    // claim. Every entry that leaves CallState::inflight from here leaves
+    // because its own call was delivered; nothing else in the object touches
+    // that map while the handle is alive.
     for (int done = 0; done < kBurst; done += kRelease) {
         const int upto = std::min(done + kRelease, kBurst);
         host.allow(upto);
@@ -751,40 +771,36 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
         QThread::msleep(10);
     }
 
-    const size_t idle = waiterCount(plain);
-    std::cout << "  " << kBurst << " completed calls then IDLE -> m_waiters="
+    const size_t idle = inflightCount(plain);
+    std::cout << "  " << kBurst << " completed calls then IDLE -> in-flight="
               << idle << std::endl;
 
     EXPECT_EQ(d.worst(), 1);
     EXPECT_EQ(d.missing(), 0);
     EXPECT_EQ(d.errors.load(), 0);
-    // kDrained is 64 and it is a CONSTANT again, which the ungated version could
-    // not afford. It is 4 * kRelease rather than a fraction of kBurst because
-    // that is what the quantity is: the residue is what published after the last
-    // reap, the last reap is inside the last release step, and so the residue is
-    // bounded by a step and not by the burst. It does not grow with kBurst and it
-    // does not grow with load.
+    // kDrained is 8 and it is a CONSTANT, which the ungated version of this test
+    // could not afford (its residue was a draw from the scheduler; see the
+    // header). Here the measured value is not "small", it is ZERO — a delivered
+    // call has already left the registry — so 8 is not headroom over a
+    // distribution, it is slack for a shape this branch does not currently have:
+    // an entry whose erase is deferred to a later turn of the loop.
     //
-    // MEASURED, correct code, 380 runs, worst value per cell:
+    // MEASURED, this code, 380 runs, worst value per cell:
     //
-    //   macOS  idle 1 (n=100)   4x 1 (n=40)   16x 2 (n=40)
-    //   Linux  idle 7 (n=40)    4x 5 (n=60)   16x 6 (n=60)   64x 5 (n=40)
+    //   macOS  idle 0 (n=100)   4x 0 (n=40)   16x 0 (n=40)
+    //   Linux  idle 0 (n=40)    4x 0 (n=60)   16x 0 (n=60)   64x 0 (n=40)
     //
-    // The same seven cells with the exit-guard reap removed, 380 more runs, give
-    // 800 — kBurst, not "several hundred" — in every single one, on both
-    // platforms, at every load level: with no reap on the exit path and no
-    // further spawn there is no code left that can remove an entry. All 380 of
-    // those runs FAILED this assertion and all 380 correct-code runs passed it.
+    // The same seven cells with `st->inflight.erase(id)` removed from
+    // AsyncCall::deliver(), 380 more runs, give 800 in every single one, on both
+    // platforms, at every load level. All 380 of those runs FAILED this
+    // assertion and all 380 unmodified runs passed it.
     //
-    // MARGINS: 9.1x above the worst correct-code value ever seen (7, Linux
-    // idle), 12.5x below the defect's 800. There is no overlap anywhere to
-    // report — the two arms are 114x apart at their closest and the defect's
-    // side is not a distribution at all. The load levels do not move the
-    // correct-code side either, which is the point of pacing the drain: the
-    // worst value on Linux came from the UNLOADED cell.
+    // MARGINS: the correct-code side never leaves the floor, so the headroom is
+    // 8 over 0, and 100x below the defect's 800. There is no overlap to report
+    // and neither side is a distribution.
     EXPECT_LE(idle, kDrained)
         << "a burst that went idle left " << idle << " of " << kBurst
-        << " waiters parked: they are only being reaped on the spawn path";
+        << " calls registered: completed calls are not leaving the registry";
 
     // And the handle still works afterwards — draining from inside the waiters
     // must not have disturbed the object they are draining.
@@ -797,12 +813,10 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     pumpUntilTotal(after, 1, 10000);
     EXPECT_EQ(after.total.load(), 1);
     EXPECT_EQ(after.errors.load(), 0);
-    // Same claim, same bound — but this one also had a spawn to help it, so it
-    // lands at 1-2 in practice. It is held to the same expression on purpose: a
-    // residue that the follow-up call did NOT collect is the same retention bug,
-    // and hard-coding a tighter number here would put the magic constant back in
-    // a quieter place.
-    EXPECT_LE(waiterCount(plain), kDrained);
+    // Same claim, same bound, read once more after a further call has been and
+    // gone: 0 in practice, and 801 with the erase removed — the retention grows
+    // by exactly the one call, which is the shape of the bug this pins.
+    EXPECT_LE(inflightCount(plain), kDrained);
 
     // release() + pump: see ReleaseOnExit above. It runs on every exit path from
     // here, not just this one.
@@ -868,13 +882,13 @@ TEST_F(PlainWaiterReapingTest, ReapingRacesPublishingWithoutDeadlocking)
 
     const qint64 elapsed = total.elapsed();
     std::cout << "  " << kCalls << " calls across " << kRounds
-              << " bursts in " << elapsed << "ms, m_waiters="
-              << waiterCount(plain) << std::endl;
+              << " bursts in " << elapsed << "ms, in-flight="
+              << inflightCount(plain) << std::endl;
 
     EXPECT_EQ(d.total.load(), kCalls) << "callbacks went missing under the race";
     EXPECT_EQ(d.worst(), 1) << "a callback fired more than once under the race";
     EXPECT_EQ(d.missing(), 0);
-    EXPECT_LE(waiterCount(plain), size_t(4 * kPerRound))
+    EXPECT_LE(inflightCount(plain), size_t(4 * kPerRound))
         << "the registry grew across the bursts";
 
     obj->release();
@@ -912,7 +926,7 @@ TEST_F(PlainWaiterReapingTest, TeardownAfterReapingStillJoinsAndDeliversOnce)
         pumpUntilTotal(warm, i + 1, 10000);
     }
     ASSERT_EQ(warm.total.load(), kWarm);
-    ASSERT_LE(waiterCount(plain), 8u) << "the warmup calls were not reaped";
+    ASSERT_LE(inflightCount(plain), 8u) << "the warmup calls were not reaped";
 
     // Now release with a call that REALLY is outstanding: `block` parks in the
     // provider until the host is torn down, so the waiter is unambiguously
