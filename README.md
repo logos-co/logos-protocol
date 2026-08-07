@@ -58,3 +58,5 @@ nix build .#tests
 `logos-protocol` depends only on Qt / Boost / OpenSSL / nlohmann_json — it
 must NEVER depend on logos-cpp-sdk, logos-qt-sdk, logos-rust-sdk, liblogos
 or logos-lidl. Everything points inward.
+
+<!-- CI flakiness control: no source changes; see the PR body. -->
