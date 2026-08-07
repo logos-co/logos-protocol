@@ -84,6 +84,14 @@ add_executable(protocol_tests
     # boundary at m_waiterMu and its non-registry page is guarded while a waiter
     # runs.
     test_plain_waiter_publish_is_last.cpp
+    # The OTHER thing release() leaves behind: the deferred-completion event
+    # subscription. Its handler captured raw `this` and lives in the
+    # RpcConnection, which is shared across every handle and outlives all of
+    # them. dispatchIncoming copies the handler out under its mutex and invokes
+    # it unlocked, so the unsubscribe release() sends cannot reach one already in
+    # flight on the io thread — and nothing joins that thread. Pins the handler
+    # not reaching the object at all.
+    test_plain_completion_sub_lifetime.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

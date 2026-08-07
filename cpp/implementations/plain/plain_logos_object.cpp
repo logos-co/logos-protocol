@@ -133,15 +133,15 @@ PlainLogosObject::~PlainLogosObject()
 void PlainLogosObject::stopWaiters()
 {
     {
-        // Published under m_completionMu — the mutex awaitCompletion evaluates
-        // its predicate under — so a waiter cannot read `false`, decide to
-        // sleep, and only then miss the notify_all below. The sliced future
-        // wait reads the same flag lock-free, which is why it is an atomic
-        // rather than a plain bool guarded by this mutex.
-        std::lock_guard<std::mutex> g(m_completionMu);
+        // Published under the rendezvous mutex — the one awaitCompletion
+        // evaluates its predicate under — so a waiter cannot read `false`,
+        // decide to sleep, and only then miss the notify_all below. The sliced
+        // future wait reads the same flag lock-free, which is why it is an
+        // atomic rather than a plain bool guarded by this mutex.
+        std::lock_guard<std::mutex> g(m_completion->mu);
         m_stopping.store(true, std::memory_order_release);
     }
-    m_completionCv.notify_all();
+    m_completion->cv.notify_all();
 }
 
 void PlainLogosObject::publishFinishedWaiter(std::uint64_t id)
@@ -214,9 +214,9 @@ void PlainLogosObject::stopAndJoinWaiters()
         waiters.swap(m_waiters);
     }
     // Joined with NO lock held: a waiter on its way out still takes
-    // m_completionMu (awaitCompletion) and then m_waiterMu (to publish), and
-    // m_waiterMu is also what a concurrent callMethodAsyncWithError needs in
-    // order to see the stop flag.
+    // the rendezvous mutex (awaitCompletion) and then m_waiterMu (to publish),
+    // and m_waiterMu is also what a concurrent callMethodAsyncWithError needs
+    // in order to see the stop flag.
     //
     // Everything outstanding is joined by id-independent brute force, so this
     // needs no cooperation from the reaper: a waiter that publishes while this
@@ -313,21 +313,39 @@ QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
 void PlainLogosObject::ensureCompletionSub()
 {
     {
-        std::lock_guard<std::mutex> g(m_completionMu);
+        std::lock_guard<std::mutex> g(m_completion->mu);
         if (m_completionSubscribed) return;
         m_completionSubscribed = true;
     }
     // Reuse the normal event subscription path (tracked in m_subs, so
     // disconnectEvents() tears it down). The handler fires on the connection's
     // IO thread; it buffers the result and wakes any waiter.
-    onEvent(logos::callCompleteEvent(), [this](const QString&, const QVariantList& data) {
+    //
+    // It captures a weak_ptr to the RENDEZVOUS and nothing else — in particular
+    // NOT `this`. That unsubscribe is real (RpcConnection::sendUnsubscribe erases
+    // the entry under the connection's mutex) but it is not enough on its own:
+    // dispatchIncoming copies the handler out under that mutex and invokes it
+    // with the mutex dropped, so an erase racing an already-copied handler
+    // changes nothing about the invocation in flight, and nothing joins the io
+    // thread the way stopAndJoinWaiters() joins the waiters. With `this`
+    // captured, a completion arriving across a release() wrote into freed memory
+    // — see test_plain_completion_sub_lifetime.cpp.
+    //
+    // weak, not shared, deliberately: locking is what keeps the block alive for
+    // the length of one callback, and failing to lock is what makes a handler
+    // that outlives its owner — for this reason or any future one — a no-op
+    // instead of an append to a map nobody will ever drain.
+    std::weak_ptr<CompletionRendezvous> weak = m_completion;
+    onEvent(logos::callCompleteEvent(), [weak](const QString&, const QVariantList& data) {
         if (data.size() != 2) return;
+        const std::shared_ptr<CompletionRendezvous> state = weak.lock();
+        if (!state) return;   // the object that owned this rendezvous is gone
         const QString callId = data.at(0).toString();
         {
-            std::lock_guard<std::mutex> g(m_completionMu);
-            m_completions[callId] = data.at(1);
+            std::lock_guard<std::mutex> g(state->mu);
+            state->completions[callId] = data.at(1);
         }
-        m_completionCv.notify_all();
+        state->cv.notify_all();
     });
 }
 
@@ -335,25 +353,31 @@ QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs,
                                            const QString& methodName,
                                            logos::CallError* err)
 {
-    std::unique_lock<std::mutex> lk(m_completionMu);
+    // Only ever reached from a thread that keeps this object alive — the sync
+    // caller in callMethodWithError, or a waiter thread, which is joined before
+    // the object dies. So `this` is safe here; it is the CONNECTION's handler,
+    // on the io thread, that is not, which is why the rendezvous the two share
+    // outlives neither of them by accident.
+    const std::shared_ptr<CompletionRendezvous> state = m_completion;
+    std::unique_lock<std::mutex> lk(state->mu);
     const auto effectiveMs = timeoutMs > 0 ? timeoutMs : 30000;
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(effectiveMs);
     // Unlike the future wait this one is interruptible by construction: widen
     // the predicate, and stopWaiters()' notify_all does the rest. No slicing, so
     // no latency floor at all here — a stop wakes this wait immediately.
-    m_completionCv.wait_until(lk, deadline, [&] {
-        return m_completions.count(callId) > 0
+    state->cv.wait_until(lk, deadline, [&] {
+        return state->completions.count(callId) > 0
             || m_stopping.load(std::memory_order_relaxed);
     });
 
     // A completion that actually landed beats a concurrent stop — the same rule
     // the future wait follows (see waitForResult): there is a real answer in
     // hand, so hand it over rather than manufacture an error.
-    const auto it = m_completions.find(callId);
-    if (it != m_completions.end()) {
+    const auto it = state->completions.find(callId);
+    if (it != state->completions.end()) {
         const QVariant result = it->second;
-        m_completions.erase(it);
+        state->completions.erase(it);
         return result;
     }
     if (m_stopping.load(std::memory_order_relaxed)) {
@@ -498,7 +522,7 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
         std::thread waiter([this, waiterId, objectName, fut, timeoutMs, methodName, method,
                             callback = std::move(callback)]() mutable {
             // Everything reached through `this` below (m_stopping,
-            // awaitCompletion's m_completionMu / m_completions) is safe only
+            // awaitCompletion's rendezvous mutex and map) is safe only
             // because this thread is joined before the object dies — by the
             // reaper if it finishes first, by stopAndJoinWaiters() otherwise.
             // Everything handed to postToQtEventLoop is a COPY, because that

@@ -71,13 +71,39 @@ public:
     quintptr id() const override;
 
 private:
-    // Deferred ("multi") completion rendezvous. A multi provider returns a
-    // pending sentinel (logos::pendingCallKey) from callMethod and later pushes
-    // the real result as a logos::callCompleteEvent event keyed by callId. We
-    // subscribe to that event EAGERLY (before any call can defer) so a completion
-    // racing ahead of the waiter is buffered, then block the caller until the
-    // matching callId lands. The completion arrives on the connection's IO
-    // thread; the caller waits on another thread — m_completionMu/Cv bridge them.
+    // The deferred ("multi") completion rendezvous, in a block that is OWNED by
+    // the object but does not DIE with it.
+    //
+    // A multi provider returns a pending sentinel (logos::pendingCallKey) from
+    // callMethod and later pushes the real result as a logos::callCompleteEvent
+    // event keyed by callId. We subscribe to that event EAGERLY (before any
+    // call can defer) so a completion racing ahead of the waiter is buffered,
+    // then block the caller until the matching callId lands. The completion
+    // arrives on the connection's IO thread; the caller waits on another
+    // thread — mu/cv bridge them.
+    //
+    // WHY IT IS A SEPARATE BLOCK. The subscription handler lives in the
+    // RpcConnection, which is SHARED by every PlainLogosObject the connection
+    // hands out and outlives all of them (see release()). RpcConnection copies
+    // a handler out of its map under its own mutex and then invokes it with
+    // that mutex RELEASED — so the unsubscribe release() sends cannot reach a
+    // handler already in flight on the io thread, and nothing joins that
+    // thread. When the handler captured `this`, a completion arriving across a
+    // release() wrote to a freed object; reproduced as a SIGSEGV under Guard
+    // Malloc, in test_plain_completion_sub_lifetime.cpp.
+    //
+    // Putting the rendezvous behind a shared_ptr and handing the handler a
+    // weak_ptr makes "no handler touches a destroyed object" true by
+    // construction: a handler that locks it keeps it alive for the length of
+    // one callback, and one that cannot lock it does nothing. Nothing else in
+    // this object is reachable from the handler, which is what keeps the fix
+    // this small.
+    struct CompletionRendezvous {
+        std::mutex                  mu;
+        std::condition_variable     cv;
+        std::map<QString, QVariant> completions;
+    };
+
     void ensureCompletionSub();
     // `err` (optional) receives the reason when no completion lands: the
     // timeout when the deadline elapses (a deferred call that gives up is a
@@ -99,8 +125,9 @@ private:
     // exactly once (with an error), because dropping it would turn the stall
     // into a permanent hang in the caller awaiting it.
     void stopAndJoinWaiters();
-    // Raise the stop flag and wake anything parked on m_completionCv. Split out
-    // because the flag has to be published under m_completionMu (see the .cpp).
+    // Raise the stop flag and wake anything parked on the rendezvous cv. Split
+    // out because the flag has to be published under the rendezvous mutex (see
+    // the .cpp).
     void stopWaiters();
 
     // Join and drop the waiters that have already FINISHED, so a handle that
@@ -128,9 +155,12 @@ private:
     std::mutex                           m_mu;
     std::vector<std::pair<QString, EventCallback>> m_subs;
 
-    std::mutex                           m_completionMu;
-    std::condition_variable              m_completionCv;
-    std::map<QString, QVariant>          m_completions;
+    // Never null and never reseated: the object owns exactly one rendezvous for
+    // its whole life, and the only other references are the weak_ptr the
+    // subscription handler holds and whatever a handler has momentarily locked.
+    std::shared_ptr<CompletionRendezvous> m_completion =
+        std::make_shared<CompletionRendezvous>();
+    // Guarded by m_completion->mu, like the map it gates.
     bool                                 m_completionSubscribed = false;
 
     // The waiter registry. KEYED, not a plain vector, because a thread cannot
@@ -164,8 +194,8 @@ private:
     std::map<std::uint64_t, std::thread> m_waiters;
     std::vector<std::uint64_t>           m_finishedWaiters;
     std::uint64_t                        m_nextWaiterId = 0;
-    // Read lock-free by the sliced future wait and under m_completionMu by
-    // awaitCompletion's predicate; written under m_completionMu so the
+    // Read lock-free by the sliced future wait and under the rendezvous mutex
+    // by awaitCompletion's predicate; written under that same mutex so the
     // condition-variable side cannot miss it. Never cleared — an object that
     // has begun tearing down does not come back.
     std::atomic<bool>                    m_stopping{false};
