@@ -352,12 +352,12 @@ void PlainTransportHost::fanOutEvent(const std::string& name, EventMessage msg)
     std::vector<EventSink> sinks;
     {
         std::lock_guard<std::mutex> g(m_mu);
-        auto it = m_published.find(name);
-        if (it == m_published.end()) return;
+        auto it = m_sinks.find(name);
+        if (it == m_sinks.end()) return;
         // Named subscribers + wildcard ("") subscribers get the event.
         for (auto which : {msg.eventName, std::string{}}) {
-            auto evtIt = it->second.sinksByEvent.find(which);
-            if (evtIt == it->second.sinksByEvent.end()) continue;
+            auto evtIt = it->second.find(which);
+            if (evtIt == it->second.end()) continue;
             for (auto& [key, sink] : evtIt->second) sinks.push_back(sink);
         }
     }
@@ -450,29 +450,30 @@ void PlainTransportHost::onSubscribe(const SubscribeMessage& req, EventSink sink
                                      const void* connectionId)
 {
     std::lock_guard<std::mutex> g(m_mu);
-    auto it = m_published.find(req.object);
-    if (it == m_published.end()) return;
-    // Sinks are keyed by the originating connection so that
-    // onUnsubscribe / onConnectionClosed can remove only sinks
-    // belonging to that connection — sub/unsub frames don't carry a
-    // subscriber id on the wire.
-    it->second.sinksByEvent[req.eventName][connectionId] = std::move(sink);
+    // Recorded whether or not `req.object` is published YET. A consumer
+    // subscribes exactly when it most likely is not — the host is listening but
+    // the module has not published — and refusing here loses the subscription
+    // silently: the consumer's requestObject() already succeeded, so nothing
+    // upstream knows to retry. The sink simply waits for the object to appear,
+    // which is the same contract onEventWhenAvailable() offers a layer up.
+    m_sinks[req.object][req.eventName][connectionId] = std::move(sink);
 }
 
 void PlainTransportHost::onUnsubscribe(const UnsubscribeMessage& req,
                                        const void* connectionId)
 {
     std::lock_guard<std::mutex> g(m_mu);
-    auto it = m_published.find(req.object);
-    if (it == m_published.end()) return;
-    auto evtIt = it->second.sinksByEvent.find(req.eventName);
-    if (evtIt == it->second.sinksByEvent.end()) return;
+    auto it = m_sinks.find(req.object);
+    if (it == m_sinks.end()) return;
+    auto evtIt = it->second.find(req.eventName);
+    if (evtIt == it->second.end()) return;
     // Only drop the requesting connection's sink — other clients
     // subscribed to the same (object, event) keep theirs. Previously
     // this erased the entire eventName entry, taking every other
     // subscriber down with it.
     evtIt->second.erase(connectionId);
-    if (evtIt->second.empty()) it->second.sinksByEvent.erase(evtIt);
+    if (evtIt->second.empty()) it->second.erase(evtIt);
+    if (it->second.empty()) m_sinks.erase(it);
 }
 
 void PlainTransportHost::onConnectionClosed(const void* connectionId)
@@ -482,12 +483,14 @@ void PlainTransportHost::onConnectionClosed(const void* connectionId)
     // entries belonging to the closed connection. Without this, a
     // crashing/disconnecting client (which never sends Unsubscribe)
     // leaves dead sinks in the table forever.
-    for (auto& [_name, pub] : m_published) {
-        for (auto evtIt = pub.sinksByEvent.begin(); evtIt != pub.sinksByEvent.end(); ) {
+    for (auto objIt = m_sinks.begin(); objIt != m_sinks.end(); ) {
+        for (auto evtIt = objIt->second.begin(); evtIt != objIt->second.end(); ) {
             evtIt->second.erase(connectionId);
-            if (evtIt->second.empty()) evtIt = pub.sinksByEvent.erase(evtIt);
+            if (evtIt->second.empty()) evtIt = objIt->second.erase(evtIt);
             else ++evtIt;
         }
+        if (objIt->second.empty()) objIt = m_sinks.erase(objIt);
+        else ++objIt;
     }
 }
 

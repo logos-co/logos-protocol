@@ -113,6 +113,13 @@ struct lp_client {
 
 struct lp_subscription {
     std::shared_ptr<CbGuard> guard;
+    // Enough to un-register from the consumer's pending registry on
+    // lp_unsubscribe. The client guard is what makes that safe: a subscription
+    // can outlive lp_client_destroy, and dereferencing `owner` then would be a
+    // use-after-free.
+    LogosAPIClient* owner = nullptr;
+    std::shared_ptr<CbGuard> ownerGuard;
+    quint64 id = 0;
 };
 
 struct lp_provider {
@@ -397,10 +404,12 @@ lp_subscription* lp_subscribe(lp_client* client,
     // when it arms, and says so loudly if it ever becomes impossible.
     auto* sub = new lp_subscription();
     sub->guard = std::make_shared<CbGuard>();
+    sub->owner = client->client;
+    sub->ownerGuard = client->guard;
 
     std::shared_ptr<CbGuard> subGuard = sub->guard;
     std::shared_ptr<CbGuard> clientGuard = client->guard;
-    client->client->onEventWhenAvailable(
+    sub->id = client->client->onEventWhenAvailable(
         client->target, QString::fromUtf8(event_name),
         [subGuard, clientGuard, cb, user_data](const QString& name,
                                                const QVariantList& data) {
@@ -428,7 +437,27 @@ void lp_unsubscribe(lp_subscription* sub)
         std::lock_guard<std::recursive_mutex> lock(sub->guard->mutex);
         sub->guard->alive = false;
     }
+    // Stop the consumer tracking it too. Without this an unsubscribed-while-
+    // pending subscription stays in the registry forever: it holds the retry
+    // timer up, keeps emitting the 3 s / 60 s "still not reachable" warnings
+    // about a subscription nobody wants, and shows up in the
+    // pendingEventSubscriptions() diagnostics this whole change relies on for
+    // its own credibility.
+    if (sub->id && sub->owner && sub->ownerGuard) {
+        std::lock_guard<std::recursive_mutex> ownerLock(sub->ownerGuard->mutex);
+        if (sub->ownerGuard->alive)
+            sub->owner->cancelEventSubscription(sub->id);
+    }
     delete sub;
+}
+
+char* lp_pending_subscriptions(lp_client* client)
+{
+    if (!client || !client->client) return nullptr;
+    nlohmann::json out = nlohmann::json::array();
+    for (const QString& entry : client->client->pendingEventSubscriptions())
+        out.push_back(entry.toStdString());
+    return lpStrdup(out.dump());
 }
 
 /* ------------------------------------------------------------ introspect */

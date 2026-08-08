@@ -17,6 +17,13 @@ add_executable(protocol_tests
     # the pure virtual and asserts nothing about payloads.
     test_event_payload_fidelity.cpp
     test_lp_client.cpp
+    # The event-delivery regression matrix: transport x provider kind x consumer
+    # path x timing. Event delivery has broken silently three times, each in a
+    # cell nothing covered — a one-shot subscription, a deferred one that never
+    # armed outside Remote mode, and a plain host dropping a Subscribe for a
+    # not-yet-published object. Every case here has a control that is green
+    # independently of those fixes.
+    test_event_delivery_matrix.cpp
     # The canonical LIDL <-> JSON codec (cpp/logos_codec.h): one implementation
     # of an encoding that used to exist six times with divergent semantics.
     # Pins the contract — accepted shapes, rejected shapes, and bytes staying

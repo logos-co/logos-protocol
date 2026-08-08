@@ -13,6 +13,7 @@
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
+#include "logos_subscription_state.h"
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
 
@@ -256,22 +257,41 @@ public:
      *
      * Adds no member state to this class — see the ABI note below; it forwards
      * to the consumer that already exists.
+     *
+     * @return A non-zero id for cancelEventSubscription() /
+     *         eventSubscriptionState(), or 0 if the arguments were refused.
      */
-    void onEventWhenAvailable(const QString& objectName, const QString& eventName,
-                              std::function<void(const QString&, const QVariantList&)> callback,
-                              std::function<void(bool)> onArmed = {});
+    quint64 onEventWhenAvailable(const QString& objectName, const QString& eventName,
+                                 std::function<void(const QString&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {});
 
-    void onEventWhenAvailable(const std::string& objectName, const std::string& eventName,
-                              std::function<void(const std::string&, const QVariantList&)> callback,
-                              std::function<void(bool)> onArmed = {})
+    quint64 onEventWhenAvailable(const std::string& objectName, const std::string& eventName,
+                                 std::function<void(const std::string&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {})
     {
-        onEventWhenAvailable(QString::fromStdString(objectName),
-                             QString::fromStdString(eventName),
-                             [cb = std::move(callback)](const QString& name, const QVariantList& args) {
-                                 cb(name.toStdString(), args);
-                             },
-                             std::move(onArmed));
+        return onEventWhenAvailable(QString::fromStdString(objectName),
+                                    QString::fromStdString(eventName),
+                                    [cb = std::move(callback)](const QString& name, const QVariantList& args) {
+                                        cb(name.toStdString(), args);
+                                    },
+                                    std::move(onArmed));
     }
+
+    /**
+     * @brief Stop tracking the subscription with this id.
+     *
+     * See LogosAPIConsumer::cancelEventSubscription — in particular that it
+     * stops the BOOKKEEPING (the retry timer, the watchdog, the reconnect
+     * re-arm set) and does not detach the callback from the shared handle.
+     */
+    bool cancelEventSubscription(quint64 subscriptionId);
+
+    /**
+     * @brief Whether a subscription id is still pending, armed, or forgotten.
+     *        For callers that keep their own de-duplication record and need to
+     *        check it rather than trust it.
+     */
+    LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
 
     /**
      * @brief Diagnostics: "<object>::<event>" for every deferred subscription

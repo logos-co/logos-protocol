@@ -42,26 +42,66 @@ public:
         m_handles.clear();
     }
 
-    void add(const QString& objectName, const QString& eventName,
-             LogosObject::EventCallback cb, std::function<void(bool)> onArmed)
+    quint64 add(const QString& objectName, const QString& eventName,
+                LogosObject::EventCallback cb, std::function<void(bool)> onArmed)
     {
         Entry e;
+        e.id         = m_nextId++;
         e.objectName = objectName;
         e.eventName  = eventName;
         e.callback   = std::move(cb);
         e.onArmed    = std::move(onArmed);
         e.since.start();
+        const quint64 id = e.id;
         m_entries.push_back(std::move(e));
 
         // If a handle for this object is already live, arm right now.
         if (LogosObject* obj = liveHandle(objectName)) {
             armAgainst(objectName, obj);
-            return;
+            return id;
         }
+        if (beginAcquire(objectName))
+            return id;                                 // armed synchronously
+
         qDebug().nospace() << "LogosAPIConsumer: '" << objectName << "::" << eventName
                            << "' deferred pending the module becoming reachable";
-        startAcquire(objectName);
         ensureTimer();
+        return id;
+    }
+
+    // Stop tracking a subscription. A PENDING one leaves the registry entirely
+    // (it stops holding the timer up and stops the watchdog warning about a
+    // subscription nobody wants any more); an ARMED one is dropped from the
+    // re-arm set so a later reconnect does not resurrect it.
+    //
+    // Deliberately does NOT detach the callback from the handle: LogosObject
+    // exposes no per-callback removal, only clearEventSubscriptions(), which
+    // would take out every OTHER subscriber on the same shared handle. Callers
+    // that must stop delivery (lp_unsubscribe) gate their own callback; this
+    // just stops the bookkeeping from outliving them.
+    bool cancel(quint64 id)
+    {
+        for (int i = 0; i < m_entries.size(); ++i) {
+            if (m_entries[i].id != id) continue;
+            m_entries.remove(i);
+            stopTimerIfIdle();
+            return true;
+        }
+        for (int i = 0; i < m_armed.size(); ++i) {
+            if (m_armed[i].id != id) continue;
+            m_armed.remove(i);
+            return true;
+        }
+        return false;
+    }
+
+    LogosSubscriptionState state(quint64 id) const
+    {
+        for (const Entry& e : m_entries)
+            if (e.id == id) return LogosSubscriptionState::Pending;
+        for (const Entry& e : m_armed)
+            if (e.id == id) return LogosSubscriptionState::Armed;
+        return LogosSubscriptionState::Unknown;
     }
 
     QStringList pending() const
@@ -98,11 +138,19 @@ public:
             m_entries.push_back(std::move(e));
         }
         for (const QString& name : objects)
-            startAcquire(name);
+            beginAcquire(name);
+
+        // MUST be last, and must happen even when beginAcquire() armed some of
+        // them: takeMatching() stopped the timer when these subscriptions first
+        // armed, and tick() is the sole driver of BOTH the retry and the only
+        // log voice. Leaving it stopped is a subscription that is dead AND
+        // silent -- a quieter version of the bug this class exists to remove.
+        ensureTimer();
     }
 
 private:
     struct Entry {
+        quint64 id = 0;
         QString objectName;
         QString eventName;
         LogosObject::EventCallback callback;
@@ -111,38 +159,70 @@ private:
         int warnLevel = 0;   // 0 = quiet, 1 = warned at 3s, 2 = warned at 60s
     };
 
+    // What the transport said when we asked it to acquire an object.
+    enum class AcquireKind {
+        Deferred,     // took ownership; the callback WILL fire. Never poll it.
+        Declined,     // can defer, but not right now. Retry the deferred path.
+        Unsupported,  // no deferred acquire at all. requestObject() is the only way.
+    };
+
     LogosObject* liveHandle(const QString& objectName) const
     {
         LogosObject* obj = m_handles.value(objectName, nullptr);
         return (obj && obj->isValid()) ? obj : nullptr;
     }
 
-    // Ask the transport for a handle. Prefers the deferred path; falls back to
-    // a bounded-backoff poll for transports that cannot defer.
-    void startAcquire(const QString& objectName)
+    // Ask the transport to acquire `objectName`, without ever blocking.
+    // Reports which of the three answers it gave; the caller decides how to
+    // follow up. Does NOT poll and does NOT arm.
+    AcquireKind startAcquire(const QString& objectName)
     {
-        if (m_acquiring.contains(objectName)) return;   // one acquire per object
+        auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport);
+        if (!async) return AcquireKind::Unsupported;
 
-        if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport)) {
-            QPointer<LogosAPIConsumer> guard(m_owner);
-            const QString name = objectName;
-            if (async->requestObjectWhenAvailable(name, [this, guard, name](LogosObject* obj) {
-                    if (!guard) return;               // consumer died first
-                    m_acquiring.remove(name);
-                    if (obj) armAgainst(name, obj);
-                    else     abandon(name);
-                })) {
-                m_acquiring.insert(objectName);
-                return;
-            }
-        }
-        // No deferred acquire on this transport (qt_local / mock / plain). Their
-        // requestObject() is a registry hash lookup or an in-memory socket
-        // check — non-blocking and cheap enough to poll; tick() will do it.
-        // Deliberately NOT used for qt_remote, whose requestObject() enters
-        // QRemoteObjectReplica::waitForSource()'s nested event loop even with a
-        // 0 timeout (QTBUG-94570 comment aside, timeout>=0 still calls
-        // loop.exec()) — a GUI-thread hazard smuggled in through the retry.
+        if (m_acquiring.contains(objectName))
+            return AcquireKind::Deferred;               // one acquire per object
+
+        QPointer<LogosAPIConsumer> guard(m_owner);
+        const QString name = objectName;
+        if (!async->requestObjectWhenAvailable(name, [this, guard, name](LogosObject* obj) {
+                if (!guard) return;                     // consumer died first
+                m_acquiring.remove(name);
+                if (obj) armAgainst(name, obj);
+                else     abandon(name);
+            }))
+            return AcquireKind::Declined;
+
+        m_acquiring.insert(objectName);
+        return AcquireKind::Deferred;
+    }
+
+    // startAcquire() plus the ONE synchronous attempt that transports without a
+    // deferred acquire need. Returns true if the object was acquired and the
+    // pending subscriptions for it are now armed.
+    //
+    // The synchronous attempt is not an optimisation, it is a correctness fix:
+    // on qt_local/mock/plain the deferred path does not exist, so without it a
+    // subscription to a module that is ALREADY loaded and in-process would not
+    // arm until the first 250 ms tick, and every event emitted in that window
+    // would be dropped. lp_subscribe used to attach synchronously and deliver
+    // them; losing that would move the silent event loss rather than remove it.
+    //
+    // It is confined to AcquireKind::Unsupported on purpose. Those transports'
+    // requestObject() is a registry hash lookup (qt_local), an in-memory
+    // construction (plain) or an unconditional success (mock). qt_remote's
+    // enters QRemoteObjectReplica::waitForSource()'s nested event loop even at
+    // timeout 0, so calling it from here — or from tick() — would smuggle a GUI
+    // thread block in through the retry. Routing on the transport's OWN answer
+    // makes that structural instead of a comment someone has to remember.
+    bool beginAcquire(const QString& objectName)
+    {
+        if (startAcquire(objectName) != AcquireKind::Unsupported)
+            return false;
+        LogosObject* obj = m_transport->requestObject(objectName, 0);
+        if (!obj) return false;
+        armAgainst(objectName, obj);
+        return true;
     }
 
     // One timer per consumer, running only while something is pending.
@@ -177,21 +257,48 @@ private:
             if (!m_acquiring.contains(e.objectName)) wanted.insert(e.objectName);
 
         for (const QString& name : wanted) {
-            LogosObject* obj = m_transport->requestObject(name, 0);
-            if (obj) armAgainst(name, obj);
+            // beginAcquire() re-asks the transport and only ever reaches
+            // requestObject() on a transport that has no deferred acquire. A
+            // transport that CAN defer but declined this round (qt_remote when
+            // acquireDynamic() came back null) is simply retried on the
+            // deferred path — polling it here is the nested-event-loop hazard.
+            beginAcquire(name);
         }
 
         reportStillPending();
+        rescheduleOrStop();
+    }
 
+    // 250 ms → 5 s cap. Unbounded in TIME on purpose: a module can be installed
+    // and loaded mid-session, so any give-up would silently break the package
+    // manager's core flow. What is bounded is the NOISE — two log lines per
+    // (object, event), ever — and the timer itself, which stops once there is
+    // nothing left for a tick to do.
+    void rescheduleOrStop()
+    {
+        if (!m_timer) return;
         if (m_entries.isEmpty()) { m_timer->stop(); return; }
-        // 250 ms → 5 s cap. Unbounded in TIME on purpose: a module can be
-        // installed and loaded mid-session, so any give-up would silently break
-        // the package manager's core flow. What is bounded is the noise — two
-        // log lines per (object, event), ever.
-        if (m_intervalMs < 5000) {
-            m_intervalMs = qMin(5000, m_intervalMs * 2);
-            m_timer->start(m_intervalMs);
+
+        // Nothing to do means: every pending object already has an acquire in
+        // flight (the transport will arm it with no help from us) and every
+        // pending entry has said everything it is ever going to say. That is
+        // the steady state on qt_remote, where a tick does no work at all.
+        // add() and reconnected() restart the timer if that changes.
+        for (const Entry& e : m_entries) {
+            if (!m_acquiring.contains(e.objectName) || e.warnLevel < 2) {
+                if (m_intervalMs < 5000) {
+                    m_intervalMs = qMin(5000, m_intervalMs * 2);
+                    m_timer->start(m_intervalMs);
+                }
+                return;
+            }
         }
+        m_timer->stop();
+    }
+
+    void stopTimerIfIdle()
+    {
+        if (m_timer && m_entries.isEmpty()) m_timer->stop();
     }
 
     // Bounded diagnostics. A subscription that is deferred for a few
@@ -225,6 +332,15 @@ private:
     {
         LogosObject* handle = m_handles.value(objectName, nullptr);
         if (handle && handle != obj && !handle->isValid()) {
+            // Releasing this handle destroys its event helper, and every
+            // subscription already armed for this object is attached to THAT
+            // helper. Without the revive they stay in m_armed, never fire
+            // again, and pendingSubscriptions() reports nothing wrong — a
+            // subscription that is dead while looking healthy, which is the
+            // exact failure this class exists to remove. Move them back to the
+            // pending set so takeMatching() below re-arms them on the new
+            // handle, THEN release.
+            reviveArmed(objectName);
             handle->release();
             handle = nullptr;
         }
@@ -255,6 +371,22 @@ private:
             if (e.onArmed) e.onArmed(true);
             m_armed.push_back(std::move(e));           // keep, so reconnect can re-arm
         }
+    }
+
+    // Move every ARMED subscription for an object back into the pending set,
+    // keeping its warnLevel so a re-arm produces no new noise.
+    void reviveArmed(const QString& objectName)
+    {
+        QVector<Entry> keep;
+        for (Entry& e : m_armed) {
+            if (e.objectName == objectName) {
+                e.since.start();
+                m_entries.push_back(std::move(e));
+            } else {
+                keep.push_back(std::move(e));
+            }
+        }
+        m_armed = std::move(keep);
     }
 
     QVector<Entry> takeMatching(const QString& objectName)
@@ -297,6 +429,7 @@ private:
     QHash<QString, LogosObject*> m_handles;
     QTimer* m_timer = nullptr;
     int m_intervalMs = 250;
+    quint64 m_nextId = 1;
 };
 
 LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
@@ -355,20 +488,32 @@ LogosAPIConsumer::~LogosAPIConsumer()
     clearObjectCache();
 }
 
-void LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
-                                            const QString& eventName,
-                                            std::function<void(const QString&, const QVariantList&)> callback,
-                                            std::function<void(bool)> onArmed)
+quint64 LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
+                                               const QString& eventName,
+                                               std::function<void(const QString&, const QVariantList&)> callback,
+                                               std::function<void(bool)> onArmed)
 {
     if (objectName.isEmpty() || eventName.isEmpty() || !callback) {
         qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object/event name "
                       "or null callback -- refusing" << objectName << eventName;
         if (onArmed) onArmed(false);
-        return;
+        return 0;
     }
     if (!m_pendingSubs)
         m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
-    m_pendingSubs->add(objectName, eventName, std::move(callback), std::move(onArmed));
+    return m_pendingSubs->add(objectName, eventName, std::move(callback), std::move(onArmed));
+}
+
+bool LogosAPIConsumer::cancelEventSubscription(quint64 subscriptionId)
+{
+    if (!subscriptionId || !m_pendingSubs) return false;
+    return m_pendingSubs->cancel(subscriptionId);
+}
+
+LogosSubscriptionState LogosAPIConsumer::eventSubscriptionState(quint64 subscriptionId) const
+{
+    if (!subscriptionId || !m_pendingSubs) return LogosSubscriptionState::Unknown;
+    return m_pendingSubs->state(subscriptionId);
 }
 
 QStringList LogosAPIConsumer::pendingSubscriptions() const

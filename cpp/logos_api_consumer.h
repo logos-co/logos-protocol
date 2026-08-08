@@ -15,6 +15,7 @@
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
+#include "logos_subscription_state.h"
 #include "logos_transport_config.h"
 
 class LogosTransportConnection;
@@ -178,16 +179,57 @@ public:
      *
      * NOT deduplicated: two identical calls produce two live subscriptions and
      * therefore two callbacks per event. Callers that must not double-deliver
-     * (e.g. QML re-running Component.onCompleted) dedupe on their own side.
+     * (e.g. QML re-running Component.onCompleted) dedupe on their own side, and
+     * should verify with eventSubscriptionState() rather than assuming their
+     * own record is still accurate.
+     *
+     * WHAT THIS DOES NOT PROMISE. Arming is not retroactive and the transports
+     * do not buffer, so there is a window — roughly the 50-150 ms between a
+     * module's socket appearing and the replica reaching Valid — in which an
+     * event the module emits is not delivered to anyone. A module that fires a
+     * one-shot "ready"/"started" event synchronously inside its own init() can
+     * still be missed. This is inherent to the transport, not introduced here
+     * (the blocking requestObject() this replaced had exactly the same window),
+     * but "subscriptions survive a late module" is not "no event can be
+     * missed": a module whose startup event matters must also expose a pull
+     * method the subscriber can call after arming.
      *
      * @param onArmed Optional; called with true the moment the subscription
      *                goes live, or false if it is abandoned. Never called for
      *                "not yet".
+     * @return A non-zero id for cancelEventSubscription() /
+     *         eventSubscriptionState(), or 0 if the arguments were refused.
      */
-    void onEventWhenAvailable(const QString& objectName,
-                              const QString& eventName,
-                              std::function<void(const QString&, const QVariantList&)> callback,
-                              std::function<void(bool)> onArmed = {});
+    quint64 onEventWhenAvailable(const QString& objectName,
+                                 const QString& eventName,
+                                 std::function<void(const QString&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {});
+
+    /**
+     * @brief Stop tracking the subscription with this id.
+     *
+     * A subscription that is still PENDING leaves the registry entirely, so it
+     * stops holding the retry timer up and stops the watchdog warning about a
+     * subscription nobody wants. One that has already ARMED is dropped from the
+     * re-arm set so a later reconnect does not resurrect it.
+     *
+     * Does NOT detach the callback from the shared handle — LogosObject offers
+     * no per-callback removal, only clearEventSubscriptions(), which would take
+     * out every other subscriber on that handle. A caller that must stop
+     * delivery gates its own callback (lp_unsubscribe does).
+     *
+     * @return true if the id was known.
+     */
+    bool cancelEventSubscription(quint64 subscriptionId);
+
+    /**
+     * @brief Whether a subscription id is still pending, armed, or forgotten.
+     *
+     * Lets a caller that keeps its own de-duplication record check it against
+     * the registry instead of trusting it — an assumed-live record that is
+     * actually gone turns a re-subscribe into a silent no-op.
+     */
+    LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
 
     /**
      * @brief Diagnostics: "<object>::<event>" for every subscription registered

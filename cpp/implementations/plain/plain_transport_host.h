@@ -63,10 +63,20 @@ public:
 private:
     struct Published {
         QObject* object = nullptr;
-        // Tracked event subscribers per event name (including "" wildcard).
-        std::map<std::string, std::map<const void*, EventSink>> sinksByEvent;
         QMetaObject::Connection eventConn;
     };
+
+    // Event subscribers: object name -> event name ("" = wildcard) -> connection.
+    //
+    // DELIBERATELY not a member of Published, and keyed independently of it.
+    // A consumer subscribes at the one moment the object is most likely to be
+    // missing — its host process is listening but has not published yet — and a
+    // subscription recorded only against a Published entry is dropped on the
+    // floor there, with the consumer's transport reporting success. It must
+    // also survive an unpublish/republish, which Published cannot: publishObject
+    // overwrites its entry wholesale. Both are the same defect the deferred
+    // subscription registry above this exists to remove, one layer down.
+    using SinkTable = std::map<std::string, std::map<const void*, EventSink>>;
 
     LogosTransportConfig                    m_cfg;
     std::shared_ptr<RpcServerTcp>           m_tcp;
@@ -75,6 +85,7 @@ private:
 
     mutable std::mutex                      m_mu;
     std::map<std::string, Published>        m_published;
+    std::map<std::string, SinkTable>        m_sinks;
     bool                                    m_started = false;
 };
 

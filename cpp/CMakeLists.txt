@@ -29,6 +29,7 @@ set(PROTOCOL_SOURCES
     logos_api_client.h
     logos_api_consumer.cpp
     logos_api_consumer.h
+    logos_subscription_state.h
     module_proxy.cpp
     module_proxy.h
     token_manager.cpp
@@ -212,6 +213,9 @@ install(FILES
     logos_types.h
     logos_api_client.h
     logos_api_consumer.h
+    # Named by logos_api_client.h and logos_api_consumer.h alike; the client only
+    # forward-declares the consumer, so the enum cannot live in the consumer header.
+    logos_subscription_state.h
     module_proxy.h
     token_manager.h
     logos_mode.h
