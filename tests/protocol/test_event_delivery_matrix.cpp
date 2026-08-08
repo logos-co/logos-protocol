@@ -745,6 +745,17 @@ TEST(EventDeliveryMock, SubscriptionArmsImmediatelyAndDoesNotLinger)
 // called from the GUI thread during startup. The way this fix decays is
 // somebody "just retrying requestObject()" from the timer, which on qt_remote
 // means a 250 ms socket probe plus waitForSource()'s nested event loop.
+//
+// WHAT THE acquireCount ASSERTION DOES AND DOES NOT PROVE. It catches a retry
+// that polls qt_remote's blocking requestObject() in the ordinary case, which
+// is the likely regression. It cannot catch the narrow one: the poll is only
+// reachable at all when the transport DECLINES a deferred acquire while still
+// reporting connected, which happens only if acquireDynamic() returns null —
+// not forcible from outside the transport. That case is held shut by
+// construction instead: beginAcquire() calls requestObject() only when the
+// transport reports it has no deferred acquire, and RemoteTransportConnection
+// implements that interface, so it can never give that answer. The invariant
+// lives in the control flow, not in this test.
 TEST(EventDeliveryNonBlocking, SubscribingToAnAbsentModuleReturnsImmediately)
 {
     ensureApp();
