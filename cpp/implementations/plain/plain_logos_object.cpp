@@ -312,11 +312,35 @@ QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
 
 void PlainLogosObject::ensureCompletionSub()
 {
-    {
-        std::lock_guard<std::mutex> g(m_completion->mu);
-        if (m_completionSubscribed) return;
-        m_completionSubscribed = true;
-    }
+    // Fast path. Every call after the first pays one acquire load and nothing
+    // else — and inherits, through it, the ordering the first caller
+    // established (see the header).
+    if (m_completionSubscribed.load(std::memory_order_acquire)) return;
+
+#ifdef LOGOS_PLAIN_DETECTOR_BREAK_SUB_ORDER
+    // THE INVERSION: the pre-fix shape restored exactly — publish "subscribed"
+    // and let every other caller straight through, subscribed or not. Defined
+    // ONLY by an explicit `-DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON` configure of
+    // the tests tree; test_plain_completion_sub_order.cpp must go RED there, or
+    // its assertions are decoration.
+    if (m_completionSubscribed.exchange(true, std::memory_order_acq_rel)) return;
+    subscribeToCompletions();
+#else
+    // Serializing is the whole fix. A second caller that arrives while the
+    // first is still inside subscribeToCompletions() BLOCKS here instead of
+    // racing ahead with a Call the provider can answer before the Subscribe
+    // frame has been enqueued.
+    std::call_once(m_completionSubOnce, [this] {
+        subscribeToCompletions();
+        // Published last, so the fast path above cannot let a caller through on
+        // a subscription that is not yet on the strand.
+        m_completionSubscribed.store(true, std::memory_order_release);
+    });
+#endif
+}
+
+void PlainLogosObject::subscribeToCompletions()
+{
     // Reuse the normal event subscription path (tracked in m_subs, so
     // disconnectEvents() tears it down). The handler fires on the connection's
     // IO thread; it buffers the result and wakes any waiter.

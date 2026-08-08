@@ -1,5 +1,31 @@
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
+# ── validating the detectors ────────────────────────────────────────────────
+#
+# A race assertion that has never been seen to fail is not evidence. This option
+# compiles the plain transport with the mechanism the tests exist to prove
+# REMOVED, so the suite can be shown to go red on the code the fix replaced:
+#
+#   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
+#   ./build-broken/protocol/protocol_tests \
+#       --gtest_filter='PlainCompletionSubOrderTest.*'
+#
+# Both tests in test_plain_completion_sub_order.cpp must FAIL there. A green run
+# means those assertions are not exercising what they claim to, which is a bug
+# in the test and not a licence to trust it.
+option(LOGOS_PROTOCOL_DETECTOR_INVERSIONS
+       "Compile the plain transport with the mechanisms its race tests assert \
+REMOVED, so those tests can be shown to fail. Never enable outside a throwaway \
+detector build." OFF)
+
+if(LOGOS_PROTOCOL_DETECTOR_INVERSIONS)
+    message(WARNING "LOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON: this build is "
+                    "DELIBERATELY BROKEN and is only useful for validating the "
+                    "test suite's detectors.")
+    target_compile_definitions(logos_protocol PUBLIC
+        LOGOS_PLAIN_DETECTOR_BREAK_SUB_ORDER=1)
+endif()
+
 add_executable(protocol_tests
     test_main.cpp
     # New protocol-level tests
@@ -92,6 +118,13 @@ add_executable(protocol_tests
     # flight on the io thread — and nothing joins that thread. Pins the handler
     # not reaching the object at all.
     test_plain_completion_sub_lifetime.cpp
+    # The ORDERING half of the same subscription. ensureCompletionSub() raised
+    # its flag under the rendezvous mutex and released the mutex before
+    # subscribing, so a concurrent first caller could put a Call on the wire
+    # ahead of the Subscribe frame; a "multi" provider then completed into a
+    # subscription the host had not registered and the completion was dropped.
+    # Costs a caller its whole timeout and leaves nothing behind — see the file.
+    test_plain_completion_sub_order.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

@@ -104,7 +104,29 @@ private:
         std::map<QString, QVariant> completions;
     };
 
+    // Bring the completion subscription up, ONCE, and — the part that is not
+    // the same thing — make every other caller wait until it is actually up.
+    //
+    // The window this closes is a LOST COMPLETION, not a crash. The flag used to
+    // be raised under the rendezvous mutex and the mutex DROPPED before the
+    // subscribe, so a second caller could read "subscribed", build its Call and
+    // put it on the wire while the Subscribe frame had not been enqueued yet. A
+    // "multi" provider that answers such a call quickly emits its completion
+    // into a subscription the host has not registered — PlainTransportHost::
+    // fanOutEvent finds no sink for that connection and DROPS it — and the
+    // caller then waits out its full timeout for a result that was computed and
+    // thrown away. Measured on pristine master: 42 of 400 two-thread first-call
+    // rounds inverted on the wire, every one of them a dropped completion and a
+    // timed-out caller; 10 of 600 calls through the real host stack.
+    //
+    // Ordering, once the two are serialized, is a property of asio and not of
+    // luck: handlers posted to a strand run in the order they were posted when
+    // the posts are ordered by a happens-before edge, and the release/acquire
+    // pair below (or call_once's own edge) is that edge.
     void ensureCompletionSub();
+    // The subscribe itself, run by exactly one caller. Split out only so the
+    // detector inversion in ensureCompletionSub can reach it.
+    void subscribeToCompletions();
     // `err` (optional) receives the reason when no completion lands: the
     // timeout when the deadline elapses (a deferred call that gives up is a
     // timeout like any other, and used to be reported as a null result), or a
@@ -160,8 +182,14 @@ private:
     // subscription handler holds and whatever a handler has momentarily locked.
     std::shared_ptr<CompletionRendezvous> m_completion =
         std::make_shared<CompletionRendezvous>();
-    // Guarded by m_completion->mu, like the map it gates.
-    bool                                 m_completionSubscribed = false;
+    // "The Subscribe frame is on the strand." Stored with RELEASE after
+    // subscribeToCompletions() returns and read with ACQUIRE on the fast path,
+    // so a caller that skips the once_flag still inherits the edge that orders
+    // its own Call behind that Subscribe.
+    std::atomic<bool>                    m_completionSubscribed{false};
+    // What makes a concurrent first caller WAIT rather than sail past a flag
+    // that has been raised but not yet honoured. The whole fix is this member.
+    std::once_flag                       m_completionSubOnce;
 
     // The waiter registry. KEYED, not a plain vector, because a thread cannot
     // join itself: a waiter can therefore never retire its own entry, and a
