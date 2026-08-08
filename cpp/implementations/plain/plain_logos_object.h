@@ -210,11 +210,18 @@ private:
     //
     // That remainder is the size of the last exit batch, NOT a small constant,
     // and nothing collects it while the handle stays idle: sampled out to 25.6s
-    // it does not move. 1-2 after a 2000-call burst on macOS, but up to 402 of
-    // an 800-call burst on Linux under CPU oversubscription, where a waiter's
-    // reap can sit in its join loop while the batch behind it publishes. It does
-    // not scale with the call count, which is the claim; "1-2" was a
-    // one-platform reading of it.
+    // it does not move. What sets it is how SERIALIZED the exits are, because a
+    // waiter reaps and only then publishes: exits that interleave one after
+    // another leave 1, while a batch that becomes runnable together leaves most
+    // of itself, since the reaper that collects a large batch sits in its join
+    // loop (no lock held) while everyone behind it publishes and finds nobody to
+    // collect them. Measured on the drain of an 800-call burst that was fully
+    // outstanding before any reply — the worst case for this, and the shape
+    // test_plain_waiter_reaping.cpp builds deliberately — with all 800 answered
+    // at once: 1 every run on 10-core macOS, but 2-389 on a 6-core Linux box. It
+    // does not scale with the CALL COUNT, which is the claim; "1-2" was a
+    // one-platform reading of it, and a burst answered at any pace at all (16 at
+    // a time is enough, measured) leaves 1-6 on both.
     //
     // The real fix is still the TODO in callMethodAsyncWithError — fold the
     // wait into the shared Asio io_context and have no thread per pending RPC

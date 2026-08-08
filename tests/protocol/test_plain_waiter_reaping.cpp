@@ -82,6 +82,7 @@
 #include <QVariant>
 #include <QVariantList>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -129,29 +130,66 @@ size_t waiterCount(PlainLogosObject* obj)
 }
 
 // Answers `ping` immediately — every call in the retention tests COMPLETES,
-// which is the case that leaks — and parks on `block` until the test lets go,
-// for the one place that needs a call genuinely still in flight.
+// which is the case that leaks — and parks on `gate` / `block` until the test
+// lets go. The two parked flavours differ in WHAT releases them: `block` waits
+// for a single all-or-nothing release, for the one place that needs a call
+// genuinely still in flight, while `gate` waits for its TURN, which is what lets
+// the burst below hold every reply until the whole burst is outstanding and then
+// hand them back at a rate the test controls.
 class EchoProvider : public LogosProviderObject {
 public:
     QVariant callMethod(const QString& method, const QVariantList& args) override
     {
-        if (method == QLatin1String("ping")) return args.value(0, QVariant(1));
+        if (method == QLatin1String("ping")) {
+            m_answered.fetch_add(1);
+            return args.value(0, QVariant(1));
+        }
+        if (method == QLatin1String("gate")) {
+            if (!awaitTurn()) m_gateExpired.store(true);
+            m_answered.fetch_add(1);
+            return args.value(0, QVariant(1));
+        }
         if (method == QLatin1String("block")) {
-            std::unique_lock<std::mutex> lk(m_mu);
-            m_cv.wait(lk, [this] { return m_released; });
+            await();
+            m_answered.fetch_add(1);
             return QVariant(42);
         }
         return QVariant();
     }
 
+    // Release everything, parked and future, `gate` and `block` alike.
     void letGo()
     {
         {
             std::lock_guard<std::mutex> g(m_mu);
             m_released = true;
+            m_allowed  = kAll;
         }
         m_cv.notify_all();
     }
+
+    // Let the first `n` gated calls through — the burst's pacing knob. Dispatch
+    // is single-threaded, so arrival order is call order and this is exactly
+    // "answer calls 0..n-1".
+    void allow(int n)
+    {
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            if (n > m_allowed) m_allowed = n;
+        }
+        m_cv.notify_all();
+    }
+
+    // Replies PRODUCED so far, counted immediately before each one is handed
+    // back to the host. This is the direct measure of "has anything answered
+    // yet", direct in the sense that it does not go through the client at all —
+    // so unlike a delivery count it cannot be fooled by a callback that has been
+    // posted to the Qt event loop but not yet pumped, and unlike a registry size
+    // it does not depend on who reaps what.
+    int  answered() const { return m_answered.load(); }
+    // True if a parked call gave up waiting instead of being released. A test
+    // that forgets to open the gate must FAIL on this, not hang; see await().
+    bool gateExpired() const { return m_gateExpired.load(); }
 
     QJsonArray getMethods() override { return QJsonArray{}; }
     bool informModuleToken(const QString&, const QString&) override { return true; }
@@ -161,9 +199,58 @@ public:
     QString providerVersion() const override { return QStringLiteral("1.0.0"); }
 
 private:
+    // Park until the test lets go / until this call's turn comes. Returns false
+    // if it gave up first.
+    //
+    // BOUNDED, and SELF-RELEASING on the way out, because both halves are what
+    // keep a mistake here from becoming a hung binary. Provider dispatch is
+    // single-threaded (PlainTransportHost posts each call to the proxy's thread
+    // with a QueuedConnection), so a call parked here holds up every call behind
+    // it: an unbounded wait would wedge the whole host if the test never opened
+    // the gate, and a bounded wait that did NOT open it on the way out would
+    // wedge it just as thoroughly, one budget at a time, 800 times over. Opening
+    // it here means one budget is the WHOLE cost — after which every held call
+    // answers, every callback fires, and the run ends in a named assertion
+    // failure (gateExpired) instead of a timeout somewhere in CI. Measured: with
+    // the release deleted, this test FAILS in 20.2s naming the gate, where the
+    // unbounded version would have hung.
+    bool await()
+    {
+        std::unique_lock<std::mutex> lk(m_mu);
+        if (m_cv.wait_for(lk, kGateBudget, [this] { return m_released; }))
+            return true;
+        forceOpen();
+        return false;
+    }
+
+    bool awaitTurn()
+    {
+        std::unique_lock<std::mutex> lk(m_mu);
+        const int mine = m_arrived++;
+        if (m_cv.wait_for(lk, kGateBudget, [this, mine] { return mine < m_allowed; }))
+            return true;
+        forceOpen();
+        return false;
+    }
+
+    void forceOpen()   // called with m_mu held
+    {
+        m_released = true;
+        m_allowed  = kAll;
+    }
+
+    // ~40x the slowest complete run of the burst below measured at any load, so
+    // it can only be reached by a gate that is never opened at all.
+    static constexpr std::chrono::seconds kGateBudget{20};
+    static constexpr int                  kAll = 1 << 30;
+
     std::mutex              m_mu;
     std::condition_variable m_cv;
     bool                    m_released = false;
+    int                     m_arrived  = 0;   // gated calls seen, under m_mu
+    int                     m_allowed  = 0;   // gated calls permitted, under m_mu
+    std::atomic<int>        m_answered{0};
+    std::atomic<bool>       m_gateExpired{false};
 };
 
 QCoreApplication* ensureApp()
@@ -213,6 +300,14 @@ public:
 
     bool ok() const { return m_started && m_published && m_port != 0; }
     uint16_t port() const { return m_port; }
+
+    // Let every call parked in the provider's gate — and every one that arrives
+    // after this — answer.
+    void openGate() { m_provider.letGo(); }
+    // Let the first `n` gated calls answer, and no more.
+    void allow(int n) { m_provider.allow(n); }
+    int  answered() const { return m_provider.answered(); }
+    bool gateExpired() const { return m_provider.gateExpired(); }
 
 private:
     EchoProvider m_provider;
@@ -469,56 +564,81 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
 // then the handle goes quiet. If reaping only ever happened on the spawn path,
 // everything that finished after the LAST spawn would stay parked for the life
 // of the handle — measured at 1428 waiters and +24MiB after 2000 completed
-// calls, collapsing to 1 the moment one further call was issued. That figure is
-// race-dependent, not a constant: a re-measure of the same build gave 1421 (and
-// 599 rather than 610 for the 800-call burst below). Same magnitude, different
-// number every time — which is the point of asserting a bound and not a value.
+// calls, collapsing to 1 the moment one further call was issued. Those figures
+// came off a burst that was merely issued in a loop, so they are race-dependent
+// and not constants: a re-measure of the same build gave 1421. The burst below
+// is gated instead, and that is what turns the defect's side from "some large
+// number" into kBurst exactly — see WHY THE PROVIDER IS GATED.
 //
 // So the bound is read here with NO further call: the burst has to have drained
-// itself. What remains is whatever published after the FINAL reap, and that is
-// scheduling-dependent by construction rather than a small constant: a waiter
-// reaps only OTHERS, so the last one to finish has nobody behind it to collect
-// it, and a waiter still inside the join loop of its own reap has not published
-// yet while everyone it did not collect already has. The size of that remainder
-// is the size of the last exit batch, which is the scheduler's business.
+// itself. What remains is whatever published after the FINAL reap — at minimum
+// the last waiter to finish, which by construction has nobody behind it to
+// collect it.
 //
-// AND NOTHING TAKES IT AFTERWARDS. Sampled from 100ms to 25.6s after the burst
-// went quiet, the count does not move: 5→5 and 17→17 idle, 2→2 under 4x CPU
-// oversubscription, 33→33 and 82→82 under 32x. It is a residue, not a drain in
-// progress — so widening the window below would buy nothing at any load, and the
-// only thing that makes this survive a loaded runner is a bound that scales with
-// the burst.
+// WHY THE PROVIDER IS GATED, which is the whole design of this test. "Issue 800
+// calls in a loop and hope they overlap" is not an experiment, it is a race
+// between two rates: how fast the caller can spawn a std::thread, and how fast a
+// loopback RPC can come back. On macOS the first is much cheaper than the second
+// and the burst really is concurrent. On Linux they are comparable, so most of
+// the burst COMPLETES WHILE IT IS STILL BEING ISSUED and gets collected by the
+// SPAWN-path reaper — the very reaper this test is supposed to be doing without.
+// Measured on the ungated version, calls still outstanding when the last one of
+// the burst went out (n=25 per platform):
 //
-// MEASURED, 20 runs per cell, this 800-call burst, m_waiters when it goes idle:
+//                   in flight at the end of the issue loop, of 800
+//   macOS           544-612      (68-77% of the burst)
+//   Linux           0-237        (0-30%, median 85)
 //
-//                     this code             reaping only on the spawn path
-//   macOS idle        1 every run           572-723
-//   Linux idle        1-80   (median 9)     4-168   (median 80)
-//   Linux 2x CPU      1-145  (median 14)    16-527  (median 275)
-//   Linux 4x CPU      1-104  (median 28)    10-504  (median 271)
+// On Linux, then, the thing being measured was ~85 concurrent calls with a spawn
+// reaper running throughout — one run in 25 had the ENTIRE burst answered before
+// the last call was issued — and not an 800-call burst going quiet. The residue
+// it left was a draw from the scheduler rather than a property of the code, both
+// arms drew from overlapping distributions, and NO bound could separate them:
+// correct code reached 152 unloaded and 713 under load, the defect fell as low
+// as 5. The bound before this commit (400) scored 25/25 on macOS and 0/40 on an
+// idle Linux box; the bound before THAT (8) failed correct code 96 times in 160.
+// Neither number was the problem.
 //
-// The 8 this used to assert was read off the macOS column, where the burst is
-// genuinely concurrent because spawning a std::thread is cheap next to a
-// loopback ping. On Linux it is the other way round — most of the burst has
-// already been collected by the SPAWN-path reaper before the last call is even
-// issued — so the same 8 sits under the median of a correct build: 35 of 60
-// unloaded Linux runs of correct code exceed it. CI scored 7 against it, then
-// 21, then 10.
+// The gate removes the race instead of arbitrating it. Every call in the burst
+// invokes `gate`, which parks in the provider; provider dispatch is
+// single-threaded, so the first one to arrive holds up all 800 and NOT ONE REPLY
+// EXISTS until the test opens the gate — asserted below off the provider's own
+// counter, not inferred. The burst is then concurrent by construction on every
+// platform: 800/800 in flight, measured, on both, at every load level tried.
 //
-// SO BE CLEAR ABOUT WHAT THIS ASSERTION IS AND IS NOT. On Linux the two columns
-// overlap, because the experiment stops being a concurrent burst there, and 8
-// was not buying detection so much as a coin toss on both arms at once. With the
-// bound below, the defect is RED 10/10 on macOS and 4/10 under 16x CPU
-// oversubscription on Linux, but 0/15 on an unloaded Linux box (25-208 of 800).
-// That is a real loss of Linux coverage HERE and it is the price of not failing
-// correct code — and it costs the SUITE nothing, because the portable,
-// deterministic detector for a missing exit-guard reap is
-// PublishedWaiterDoesNotTouchTheRegistryAgain in the sibling file: RED 5/5 on
-// macOS and 8/8 on Linux with the reap removed, green with it in place. This
-// test is the coarse retention check. Its bound is only honest stated against
-// the burst it is draining; if it has to become the detector again, the fix is
-// to pace the provider so the burst is concurrent on every platform, not to
-// tighten the number.
+// AND THE DRAIN IS PACED, which is the other half and is NOT the same thing. The
+// first version of this released all 800 at once, and on Linux that replaced one
+// scheduling artefact with another: 800 threads become runnable on 6 cores, and
+// because a waiter reaps and only THEN publishes, a reaper that collects a large
+// batch sits in its join loop while everyone behind it publishes — so the last
+// exit batch is enormous. Correct code, 800 released together, 20 runs:
+//
+//   macOS   1 every run          Linux   2-389 (median ~190)
+//
+// That is not a defect, it is what the exit guard can and cannot do against a
+// thundering herd, and it is recorded in plain_logos_object.h next to the
+// mechanism. It is useless as a DETECTOR, because the defect's value (800) is
+// only ~2x it. So the gate is opened kRelease at a time, each step awaited: the
+// waiters then retire each other the way a real drain does, and the residue is
+// the last step's exit batch instead of the burst's. Measured across release
+// steps, correct code on Linux, idle: step 1 → 1, step 8 → 1-3, step 16 → 1-2,
+// step 32 → 1-3, step 64 → 1-55, step 200 → 1-142, step 800 → 2-389. The knee is
+// well above the step chosen below, and a smaller step buys nothing but runtime
+// (step 8 costs 3x step 32 on a 64x-oversubscribed box).
+//
+// MEASURED, this gated burst, m_waiters when it goes idle. Numbers, n and
+// margins are at the assertion below; the shape is:
+//
+//                     this code    reaping only on the spawn path
+//   macOS             1-2          800   (exactly, every run)
+//   Linux, any load   1-7          800   (exactly, every run)
+//
+// The defect's 800 is not "high", it is the whole burst: with no exit-guard reap
+// and no further spawn, nothing on any platform ever removes an entry, so the
+// count is kBurst exactly and the separation is not statistical. 800 live waiter
+// threads at once is also the peak this now reaches where the ungated version
+// reached ~150 on Linux, and that is affordable: the stacks are lazily faulted,
+// so peak RSS for the whole run is 29MiB on Linux and 32MiB on macOS.
 TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
 {
     LiveHost host;
@@ -533,23 +653,94 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     auto* plain = dynamic_cast<PlainLogosObject*>(obj);
     ASSERT_NE(plain, nullptr);
 
-    // Issued in one go, with no pumping in between, so they are as concurrent as
-    // the platform will make them and the tail of the burst is large.
+    // ~1s in practice. Every wait in this test is already bounded — the gate
+    // self-releases, the pumps have budgets, the calls have timeouts — so this
+    // is the backstop for a wedge INSIDE the code under test (a reaper deadlocked
+    // against a publisher), which none of those would catch.
+    Watchdog watchdog("BurstThatGoesIdleDrainsWithoutAnotherCall", 120000);
+
+    // Issued in one go, with no pumping in between, against a CLOSED gate: no
+    // reply can be produced until every one of them is outstanding.
     constexpr int kBurst = 800;
-    // DRAINED, as a fraction of the burst rather than a count: the bulk of it
-    // must have retired itself with no further call. There is no small constant
-    // available — see the table above — so the only honest bound is one that
-    // scales with kBurst. Sized at the assertion below.
-    constexpr size_t kDrained = kBurst / 2;
+    // Gated calls released per step of the drain, each step awaited before the
+    // next. See the header comment: this is what keeps the residue the last
+    // step's exit batch rather than the burst's.
+    constexpr int kRelease = 16;
+    // The residue cannot exceed what the last release step can leave behind, so
+    // the bound is stated against THAT and not against kBurst — 4x the step,
+    // sized at the assertion below.
+    constexpr size_t kDrained = 4 * kRelease;
     Deliveries d(kBurst);
+    // Declared AFTER `d`, so it runs BEFORE it. The tail of this test used to be
+    // a bare `obj->release(); pump(50);` on the happy path, which a FATAL
+    // assertion skips — and skipping it is not merely untidy here. Every
+    // outstanding callback holds a reference to `d`, and LiveHost's destructor
+    // pumps the event loop, so bailing out with deliveries still in flight would
+    // run them against a destroyed Deliveries. That is the one way this test
+    // could answer a failure with a crash instead of a verdict, and the
+    // assertions below (a gate that never opened, a burst that did not all
+    // complete) are exactly the ones that would trigger it. release() cancels
+    // and JOINS every waiter, and the pump behind it runs what they posted —
+    // both while `d` is still alive.
+    struct ReleaseOnExit {
+        LogosObject* obj;
+        ~ReleaseOnExit() { obj->release(); pump(50); }
+    } releaseOnExit{obj};
     for (int i = 0; i < kBurst; ++i) {
-        ch->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
-                                     QVariantList{ QVariant(i) }, 9000,
+        ch->callMethodAsyncWithError(kToken, QStringLiteral("gate"),
+                                     QVariantList{ QVariant(i) }, 45000,
                                      [&d, i](QVariant, const logos::CallError& e) {
                                          d.record(i, e);
                                      });
     }
+
+    // THE EXPERIMENT'S OWN PRECONDITION, measured rather than assumed — because
+    // an unmeasured one is exactly how this test spent three revisions asserting
+    // a bound on a burst that was not a burst. Two independent readings:
+    //
+    //   * the provider has produced NOTHING. Read from the provider itself, so
+    //     it does not depend on the client, on who reaps what, or on the Qt
+    //     event loop having been pumped (it has not been — a delivery count
+    //     would read 0 here whether or not replies existed).
+    //   * all 800 waiters are registered. A call that completed during the loop
+    //     would have been reaped by one of the spawns behind it, so this number
+    //     falling short is the ungated behaviour coming back.
+    const int    answeredAtIssueEnd = host.answered();
+    const size_t inflight           = waiterCount(plain);
+    std::cout << "  burst issued: provider replies=" << answeredAtIssueEnd
+              << " waiters registered=" << inflight << "/" << kBurst << std::endl;
+    ASSERT_EQ(answeredAtIssueEnd, 0)
+        << "the gate leaked: replies were produced while the burst was still "
+           "being issued, so what this test measures below is not a burst drain";
+    EXPECT_EQ(inflight, size_t(kBurst))
+        << "only " << inflight << " of " << kBurst << " calls were in flight when "
+           "the burst finished issuing";
+
+    // Drain it, kRelease at a time and NEVER issuing another call — which is the
+    // claim. Every entry that leaves m_waiters from here leaves by the exit
+    // guard: the spawn-path reaper has already run 800 times against an empty
+    // publish list and will not run again.
+    for (int done = 0; done < kBurst; done += kRelease) {
+        const int upto = std::min(done + kRelease, kBurst);
+        host.allow(upto);
+        pumpUntilTotal(d, upto, 30000);
+        // A step that does not complete is a failure, and carrying on would turn
+        // one stuck call into fifty budgets back to back. Break; the assertion
+        // below reports it.
+        if (d.total.load() < upto) break;
+    }
+    // Anything the loop left behind (it broke early, or the provider saw calls
+    // the client never counted) answers now, so nothing is parked in the host
+    // while the assertions run.
+    host.openGate();
+
     pumpUntilTotal(d, kBurst, 60000);
+    // A gate that was never opened, a call that errored, a callback that went
+    // missing: all of them arrive here as a FAILED assertion on a bounded run,
+    // never as a hang. See EchoProvider::await() for why that is true of the
+    // gate in particular.
+    ASSERT_FALSE(host.gateExpired())
+        << "a gated call gave up waiting: the gate was never opened";
     ASSERT_EQ(d.total.load(), kBurst) << "the burst did not all complete";
 
     // Every callback has landed; now let the waiters that delivered them finish
@@ -567,29 +758,30 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     EXPECT_EQ(d.worst(), 1);
     EXPECT_EQ(d.missing(), 0);
     EXPECT_EQ(d.errors.load(), 0);
-    // kDrained is 400 of 800, and it is half rather than something tighter
-    // because the residue has no ceiling for a tighter fraction to sit under.
-    // Worst value per load level, 620 runs of this burst on a 6-core Linux box:
+    // kDrained is 64 and it is a CONSTANT again, which the ungated version could
+    // not afford. It is 4 * kRelease rather than a fraction of kBurst because
+    // that is what the quantity is: the residue is what published after the last
+    // reap, the last reap is inside the last release step, and so the residue is
+    // bounded by a step and not by the burst. It does not grow with kBurst and it
+    // does not grow with load.
     //
-    //   idle 152 (n=60)  2x 145 (n=20)  4x 172 (n=80)  8x 175 (n=160)
-    //   16x 278 (n=120)  32x 402 (n=60)  64x 317 (n=40)
+    // MEASURED, correct code, 380 runs, worst value per cell:
     //
-    // Flat out to 8x, climbing after that. A quarter of the burst (200) would
-    // have been the old mistake in a new unit — it clears the worst by 1.14x,
-    // the same ratio as the 7-against-8 the last green run scored. Half clears
-    // everything up to 16x by 1.44x, clears the worst CI has ever produced (21)
-    // by 19x, still says the MAJORITY of the burst retired itself, and still
-    // fails 10/10 on macOS with the exit-guard reap removed (550-614).
+    //   macOS  idle 1 (n=100)   4x 1 (n=40)   16x 2 (n=40)
+    //   Linux  idle 7 (n=40)    4x 5 (n=60)   16x 6 (n=60)   64x 5 (n=40)
     //
-    // Where that stops: ONE run in 620, at 32x CPU oversubscription, scored 402.
-    // That is the honest edge of this envelope and it is recorded here rather
-    // than rounded away — a runner thrashing that hard is not measuring burst
-    // drainage any more. If it is ever seen on real CI, the answer is not a
-    // bigger fraction (half is already as loose as this can be while the defect
-    // still fails it); it is that the 800-thread burst has outlived its use.
+    // The same seven cells with the exit-guard reap removed, 380 more runs, give
+    // 800 — kBurst, not "several hundred" — in every single one, on both
+    // platforms, at every load level: with no reap on the exit path and no
+    // further spawn there is no code left that can remove an entry. All 380 of
+    // those runs FAILED this assertion and all 380 correct-code runs passed it.
     //
-    // Do not read a Linux pass here as the defect being absent: see the table
-    // above, and the deterministic detector named with it.
+    // MARGINS: 9.1x above the worst correct-code value ever seen (7, Linux
+    // idle), 12.5x below the defect's 800. There is no overlap anywhere to
+    // report — the two arms are 114x apart at their closest and the defect's
+    // side is not a distribution at all. The load levels do not move the
+    // correct-code side either, which is the point of pacing the drain: the
+    // worst value on Linux came from the UNLOADED cell.
     EXPECT_LE(idle, kDrained)
         << "a burst that went idle left " << idle << " of " << kBurst
         << " waiters parked: they are only being reaped on the spawn path";
@@ -606,14 +798,14 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     EXPECT_EQ(after.total.load(), 1);
     EXPECT_EQ(after.errors.load(), 0);
     // Same claim, same bound — but this one also had a spawn to help it, so it
-    // lands at 1-2 in practice and never came near kDrained in any run above.
-    // It is held to the same expression on purpose: a residue that the follow-up
-    // call did NOT collect is the same retention bug, and hard-coding a tighter
-    // number here would put the magic constant back in a quieter place.
+    // lands at 1-2 in practice. It is held to the same expression on purpose: a
+    // residue that the follow-up call did NOT collect is the same retention bug,
+    // and hard-coding a tighter number here would put the magic constant back in
+    // a quieter place.
     EXPECT_LE(waiterCount(plain), kDrained);
 
-    obj->release();
-    pump(50);
+    // release() + pump: see ReleaseOnExit above. It runs on every exit path from
+    // here, not just this one.
 }
 
 // ── 2. the deadlock the fix could introduce ─────────────────────────────────
