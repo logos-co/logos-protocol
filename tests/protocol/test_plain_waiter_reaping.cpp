@@ -475,10 +475,50 @@ TEST_F(PlainWaiterReapingTest, ConcurrentCompletedCallsStayBoundedByInFlight)
 // number every time — which is the point of asserting a bound and not a value.
 //
 // So the bound is read here with NO further call: the burst has to have drained
-// itself. What remains is what published after the last reap — at minimum the
-// last waiter to finish, which has nobody behind it to collect it (1 in almost
-// every run, 2 when a waiter's publish slips past the final reap). The bound
-// below is generous against that and still ~100x under the pre-fix number.
+// itself. What remains is whatever published after the FINAL reap, and that is
+// scheduling-dependent by construction rather than a small constant: a waiter
+// reaps only OTHERS, so the last one to finish has nobody behind it to collect
+// it, and a waiter still inside the join loop of its own reap has not published
+// yet while everyone it did not collect already has. The size of that remainder
+// is the size of the last exit batch, which is the scheduler's business.
+//
+// AND NOTHING TAKES IT AFTERWARDS. Sampled from 100ms to 25.6s after the burst
+// went quiet, the count does not move: 5→5 and 17→17 idle, 2→2 under 4x CPU
+// oversubscription, 33→33 and 82→82 under 32x. It is a residue, not a drain in
+// progress — so widening the window below would buy nothing at any load, and the
+// only thing that makes this survive a loaded runner is a bound that scales with
+// the burst.
+//
+// MEASURED, 20 runs per cell, this 800-call burst, m_waiters when it goes idle:
+//
+//                     this code             reaping only on the spawn path
+//   macOS idle        1 every run           572-723
+//   Linux idle        1-80   (median 9)     4-168   (median 80)
+//   Linux 2x CPU      1-145  (median 14)    16-527  (median 275)
+//   Linux 4x CPU      1-104  (median 28)    10-504  (median 271)
+//
+// The 8 this used to assert was read off the macOS column, where the burst is
+// genuinely concurrent because spawning a std::thread is cheap next to a
+// loopback ping. On Linux it is the other way round — most of the burst has
+// already been collected by the SPAWN-path reaper before the last call is even
+// issued — so the same 8 sits under the median of a correct build: 35 of 60
+// unloaded Linux runs of correct code exceed it. CI scored 7 against it, then
+// 21, then 10.
+//
+// SO BE CLEAR ABOUT WHAT THIS ASSERTION IS AND IS NOT. On Linux the two columns
+// overlap, because the experiment stops being a concurrent burst there, and 8
+// was not buying detection so much as a coin toss on both arms at once. With the
+// bound below, the defect is RED 10/10 on macOS and 4/10 under 16x CPU
+// oversubscription on Linux, but 0/15 on an unloaded Linux box (25-208 of 800).
+// That is a real loss of Linux coverage HERE and it is the price of not failing
+// correct code — and it costs the SUITE nothing, because the portable,
+// deterministic detector for a missing exit-guard reap is
+// PublishedWaiterDoesNotTouchTheRegistryAgain in the sibling file: RED 5/5 on
+// macOS and 8/8 on Linux with the reap removed, green with it in place. This
+// test is the coarse retention check. Its bound is only honest stated against
+// the burst it is draining; if it has to become the detector again, the fix is
+// to pace the provider so the burst is concurrent on every platform, not to
+// tighten the number.
 TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
 {
     LiveHost host;
@@ -493,9 +533,14 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     auto* plain = dynamic_cast<PlainLogosObject*>(obj);
     ASSERT_NE(plain, nullptr);
 
-    // Issued in one go, with no pumping in between, so they really are
-    // concurrent and the tail of the burst is large.
+    // Issued in one go, with no pumping in between, so they are as concurrent as
+    // the platform will make them and the tail of the burst is large.
     constexpr int kBurst = 800;
+    // DRAINED, as a fraction of the burst rather than a count: the bulk of it
+    // must have retired itself with no further call. There is no small constant
+    // available — see the table above — so the only honest bound is one that
+    // scales with kBurst. Sized at the assertion below.
+    constexpr size_t kDrained = kBurst / 2;
     Deliveries d(kBurst);
     for (int i = 0; i < kBurst; ++i) {
         ch->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
@@ -522,7 +567,30 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     EXPECT_EQ(d.worst(), 1);
     EXPECT_EQ(d.missing(), 0);
     EXPECT_EQ(d.errors.load(), 0);
-    EXPECT_LE(idle, 8u)
+    // kDrained is 400 of 800, and it is half rather than something tighter
+    // because the residue has no ceiling for a tighter fraction to sit under.
+    // Worst value per load level, 620 runs of this burst on a 6-core Linux box:
+    //
+    //   idle 152 (n=60)  2x 145 (n=20)  4x 172 (n=80)  8x 175 (n=160)
+    //   16x 278 (n=120)  32x 402 (n=60)  64x 317 (n=40)
+    //
+    // Flat out to 8x, climbing after that. A quarter of the burst (200) would
+    // have been the old mistake in a new unit — it clears the worst by 1.14x,
+    // the same ratio as the 7-against-8 the last green run scored. Half clears
+    // everything up to 16x by 1.44x, clears the worst CI has ever produced (21)
+    // by 19x, still says the MAJORITY of the burst retired itself, and still
+    // fails 10/10 on macOS with the exit-guard reap removed (550-614).
+    //
+    // Where that stops: ONE run in 620, at 32x CPU oversubscription, scored 402.
+    // That is the honest edge of this envelope and it is recorded here rather
+    // than rounded away — a runner thrashing that hard is not measuring burst
+    // drainage any more. If it is ever seen on real CI, the answer is not a
+    // bigger fraction (half is already as loose as this can be while the defect
+    // still fails it); it is that the 800-thread burst has outlived its use.
+    //
+    // Do not read a Linux pass here as the defect being absent: see the table
+    // above, and the deterministic detector named with it.
+    EXPECT_LE(idle, kDrained)
         << "a burst that went idle left " << idle << " of " << kBurst
         << " waiters parked: they are only being reaped on the spawn path";
 
@@ -537,7 +605,12 @@ TEST_F(PlainWaiterReapingTest, BurstThatGoesIdleDrainsWithoutAnotherCall)
     pumpUntilTotal(after, 1, 10000);
     EXPECT_EQ(after.total.load(), 1);
     EXPECT_EQ(after.errors.load(), 0);
-    EXPECT_LE(waiterCount(plain), 8u);
+    // Same claim, same bound — but this one also had a spawn to help it, so it
+    // lands at 1-2 in practice and never came near kDrained in any run above.
+    // It is held to the same expression on purpose: a residue that the follow-up
+    // call did NOT collect is the same retention bug, and hard-coding a tighter
+    // number here would put the magic constant back in a quieter place.
+    EXPECT_LE(waiterCount(plain), kDrained);
 
     obj->release();
     pump(50);

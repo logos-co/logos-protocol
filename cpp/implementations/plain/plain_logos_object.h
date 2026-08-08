@@ -147,8 +147,15 @@ private:
     // as it completes, because each waiter reaps the ones that finished before
     // it. What survives an idle handle is only what published after the last
     // reap — at minimum the last waiter to finish, which by construction has
-    // nobody behind it to collect it (measured: 1-2 after a 2000-call burst).
-    // The next call, or teardown, takes those.
+    // nobody behind it to collect it. The next call, or teardown, takes those.
+    //
+    // That remainder is the size of the last exit batch, NOT a small constant,
+    // and nothing collects it while the handle stays idle: sampled out to 25.6s
+    // it does not move. 1-2 after a 2000-call burst on macOS, but up to 402 of
+    // an 800-call burst on Linux under CPU oversubscription, where a waiter's
+    // reap can sit in its join loop while the batch behind it publishes. It does
+    // not scale with the call count, which is the claim; "1-2" was a
+    // one-platform reading of it.
     //
     // The real fix is still the TODO in callMethodAsyncWithError — fold the
     // wait into the shared Asio io_context and have no thread per pending RPC
