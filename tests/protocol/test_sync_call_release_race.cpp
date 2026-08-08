@@ -260,7 +260,14 @@ const char* kToken = "live-token";
         std::_Exit(9);
     }
     LogosObject* obj = conn->requestObject(QStringLiteral("racer_module"), 5000);
-    auto* ch = channelFor(obj);
+    auto* ch = obj ? channelFor(obj) : nullptr;
+    if (!ch) {
+        // Distinguished from the failure this test is looking for: a broken
+        // harness must not read as "the diagnostic never happened".
+        std::fprintf(stderr, "harness failed to acquire the object\n");
+        std::fflush(stderr);
+        std::_Exit(9);
+    }
 
     std::atomic<bool> callReturned{false};
     std::thread caller([ch, &callReturned] {
@@ -450,9 +457,15 @@ TEST_F(SyncCallReleaseRaceTest, ConcurrentCallersThatHaveReturnedAreNotAccused)
         });
     }
     // The Qt loop has to keep turning: ModuleProxy dispatches on its own thread
-    // but the host's reply path posts through this one.
-    while (ok.load() < kThreads * kPerThread)
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+    // but the host's reply path posts through this one. BOUNDED, because an
+    // unbounded wait in a test does not fail — it hangs the CI job until the
+    // job timeout, and a hang reports nothing about what broke.
+    {
+        QElapsedTimer t;
+        t.start();
+        while (ok.load() < kThreads * kPerThread && t.elapsed() < 60000)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+    }
     for (auto& th : threads) th.join();
 
     std::cout << "  " << kThreads << " threads x " << kPerThread
