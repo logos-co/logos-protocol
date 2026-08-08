@@ -16,6 +16,7 @@
 #include <boost/asio/write.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -125,9 +126,41 @@ public:
     // difference and how.
     virtual void cancelPending(uint64_t id) = 0;
 
-    virtual void sendSubscribe(SubscribeMessage msg,
-                               std::function<void(EventMessage)> callback) = 0;
-    virtual void sendUnsubscribe(UnsubscribeMessage msg) = 0;
+    // Identifies ONE registration, not one (object, event) pair. Local to this
+    // process and never on the wire — see sendSubscribe.
+    using SubscriptionId = std::uint64_t;
+
+    // Register `callback` for (msg.object, msg.eventName) and put the Subscribe
+    // frame on the wire. Returns the token that withdraws THIS registration.
+    //
+    // MANY REGISTRATIONS PER (object, event) ARE THE POINT. One RpcConnection is
+    // shared by every handle a PlainTransportConnection hands out, and
+    // requestObject() mints a fresh handle per acquire, so two handles
+    // subscribing to the same event on the same module is ordinary — including
+    // the deferred-completion channel every handle subscribes to on its first
+    // call. This map used to be keyed by (object, event) and ASSIGNED, so the
+    // second one silently took the first one's channel away: a lost
+    // subscription, never a stale one, whose only symptom was a call that used
+    // to answer in single-digit milliseconds waiting out its whole timeout.
+    //
+    // THE WIRE DOES NOT MOVE, and that is a deliberate choice rather than an
+    // omission. Subscribe/Unsubscribe carry (object, event) and nothing else, in
+    // both directions, exactly as before — so a new consumer against an old host
+    // and an old consumer against a new host both behave exactly as they do
+    // today. What changed is WHERE the demultiplexing happens: the host keeps
+    // ONE sink per (object, event, connection) — which is the right model,
+    // because every sink for one connection is the same "write this frame back
+    // down that socket" — and the CONSUMER, which is the only end that knows how
+    // many of its own handles want the event, fans the single delivery out. The
+    // corollary is the contract sendUnsubscribe implements: an Unsubscribe frame
+    // means "this connection wants no more of that event AT ALL", so it may only
+    // go out when the last local registration for the pair is gone.
+    virtual SubscriptionId sendSubscribe(SubscribeMessage msg,
+                                         std::function<void(EventMessage)> callback) = 0;
+    // Withdraw one registration. Writes the Unsubscribe frame only when it was
+    // the LAST registration for its (object, event) — see sendSubscribe. Safe
+    // for an id that has already been withdrawn, or that never existed.
+    virtual void sendUnsubscribe(SubscriptionId id) = 0;
     virtual void sendEvent(EventMessage msg) = 0;
     virtual void sendToken(TokenMessage msg) = 0;
 
@@ -172,9 +205,9 @@ public:
         m_pendingMethods.erase(id);
     }
 
-    void sendSubscribe(SubscribeMessage msg,
-                       std::function<void(EventMessage)> callback) override;
-    void sendUnsubscribe(UnsubscribeMessage msg) override;
+    SubscriptionId sendSubscribe(SubscribeMessage msg,
+                                 std::function<void(EventMessage)> callback) override;
+    void sendUnsubscribe(SubscriptionId id) override;
     void sendEvent(EventMessage msg) override;
     void sendToken(TokenMessage msg) override;
 
@@ -219,7 +252,17 @@ private:
     std::map<uint64_t, std::shared_ptr<std::promise<MethodsResultMessage>>> m_pendingMethods;
 
     using EventKey = std::pair<std::string, std::string>; // object, event
-    std::map<EventKey, std::function<void(EventMessage)>> m_eventCallbacks;
+    struct EventSubscription {
+        SubscriptionId                    id;
+        std::function<void(EventMessage)> callback;
+    };
+    // A LIST per key, in registration order, because several handles on this one
+    // connection legitimately want the same event (see sendSubscribe).
+    std::map<EventKey, std::vector<EventSubscription>> m_eventSubs;
+    // Reverse index, so withdrawing a registration is a lookup rather than a walk
+    // of every key. Kept exactly in step with m_eventSubs under m_mu.
+    std::map<SubscriptionId, EventKey>                m_subKeys;
+    std::atomic<SubscriptionId>                       m_nextSubId{1};
 
     ErrorHandler                                 m_error;
     std::atomic<uint64_t>                        m_nextId{1};
@@ -339,17 +382,26 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
             if (p) p->set_value(std::forward<decltype(m)>(m));
 
         } else if constexpr (std::is_same_v<T, EventMessage>) {
-            std::function<void(EventMessage)> cb;
-            std::function<void(EventMessage)> wildcardCb;
+            // ONE frame, EVERY local subscriber. The host sends a connection a
+            // single copy of an event (one sink per object/event/connection), so
+            // this is the only place that knows how many handles asked for it.
+            // Copied out under m_mu and invoked with the mutex RELEASED — the
+            // same shape the single-callback version had, and for the same
+            // reason: a subscriber may call back into this connection.
+            std::vector<std::function<void(EventMessage)>> cbs;
             {
                 std::lock_guard<std::mutex> g(m_mu);
-                auto it = m_eventCallbacks.find({m.object, m.eventName});
-                if (it != m_eventCallbacks.end()) cb = it->second;
-                auto wit = m_eventCallbacks.find({m.object, std::string{}});
-                if (wit != m_eventCallbacks.end()) wildcardCb = wit->second;
+                auto collect = [&](const EventKey& key) {
+                    auto it = m_eventSubs.find(key);
+                    if (it == m_eventSubs.end()) return;
+                    for (const auto& sub : it->second) cbs.push_back(sub.callback);
+                };
+                collect({m.object, m.eventName});
+                // The wildcard key IS the named key for an event whose name is
+                // empty; visiting it twice would deliver that event twice.
+                if (!m.eventName.empty()) collect({m.object, std::string{}});
             }
-            if (cb)         cb(m);
-            if (wildcardCb) wildcardCb(m);
+            for (auto& cb : cbs) cb(m);
 
         } else if constexpr (std::is_same_v<T, CallMessage>) {
             if (!m_handler) return;
@@ -587,23 +639,59 @@ RpcConnection<Stream>::sendMethods(MethodsMessage msg)
 // mutex round trip on the subscribe path in exchange for nothing observable, so
 // the pending maps get the fix and this does not.
 template <typename Stream>
-void RpcConnection<Stream>::sendSubscribe(SubscribeMessage msg,
-                                          std::function<void(EventMessage)> cb)
+RpcConnectionBase::SubscriptionId
+RpcConnection<Stream>::sendSubscribe(SubscribeMessage msg,
+                                     std::function<void(EventMessage)> cb)
 {
-    {
-        std::lock_guard<std::mutex> g(m_mu);
-        m_eventCallbacks[{msg.object, msg.eventName}] = std::move(cb);
-    }
+    const SubscriptionId sid = m_nextSubId.fetch_add(1, std::memory_order_relaxed);
+    // The frame is written WITH m_mu HELD, which is new and is not tidiness.
+    // writeFrame only encodes and posts onto the strand (no user code, no m_mu),
+    // so the lock orders the POSTS by the order the registry decisions were made.
+    // Without that, an unsubscribe that had just decided "I am the last one" could
+    // have its Unsubscribe frame overtaken by a concurrent handle's Subscribe, and
+    // the host would end up honouring the unsubscribe LAST — dropping the sink of
+    // a handle that is still registered locally, which is exactly the silent
+    // "subscribed but no events" state this change exists to remove.
+    std::lock_guard<std::mutex> g(m_mu);
+    const EventKey key{msg.object, msg.eventName};
+    m_eventSubs[key].push_back(EventSubscription{sid, std::move(cb)});
+    m_subKeys.emplace(sid, key);
+    // Re-sent for every registration, not just the first: it is idempotent at the
+    // host (onSubscribe assigns one sink per object/event/connection) and it makes
+    // a second handle re-assert a subscription the host may have dropped — an
+    // object that was not published yet when the first Subscribe arrived is
+    // silently ignored there.
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
+    return sid;
 }
 
 template <typename Stream>
-void RpcConnection<Stream>::sendUnsubscribe(UnsubscribeMessage msg)
+void RpcConnection<Stream>::sendUnsubscribe(SubscriptionId id)
 {
-    {
-        std::lock_guard<std::mutex> g(m_mu);
-        m_eventCallbacks.erase({msg.object, msg.eventName});
+    std::lock_guard<std::mutex> g(m_mu);   // held across writeFrame — see sendSubscribe
+    auto kit = m_subKeys.find(id);
+    if (kit == m_subKeys.end()) return;    // already withdrawn, or never existed
+    const EventKey key = kit->second;
+    m_subKeys.erase(kit);
+
+    auto vit = m_eventSubs.find(key);
+    if (vit != m_eventSubs.end()) {
+        auto& subs = vit->second;
+        subs.erase(std::remove_if(subs.begin(), subs.end(),
+                                  [id](const EventSubscription& s) { return s.id == id; }),
+                   subs.end());
+        // STILL WANTED LOCALLY: say nothing. The Unsubscribe frame is
+        // connection-wide — the host has one sink for this connection and would
+        // drop it — so telling the host now would silence every sibling handle
+        // that is still subscribed. That is the whole of the host-side half of
+        // this fix, and it needs no wire change to work.
+        if (!subs.empty()) return;
+        m_eventSubs.erase(vit);
     }
+
+    UnsubscribeMessage msg;
+    msg.object    = key.first;
+    msg.eventName = key.second;
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
 }
 
@@ -728,7 +816,8 @@ void RpcConnection<Stream>::fail(const std::string& reason)
         calls.swap(m_pendingCalls);
         methods.swap(m_pendingMethods);
         errCb.swap(m_error);
-        m_eventCallbacks.clear();
+        m_eventSubs.clear();
+        m_subKeys.clear();
     }
     for (auto& [id, h] : calls) {
         ResultMessage r; r.id = id; r.ok = false;

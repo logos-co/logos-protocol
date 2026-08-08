@@ -38,6 +38,21 @@ namespace {
 // async path and the sync path give up at the same moment.
 constexpr int kDeferredFallbackMs = 30000;
 
+// Hard ceiling on CallState::completions — completions that arrived before
+// anything was waiting on them (see the header).
+//
+// The gate that keeps this map honest is `busy`: nothing is parked unless this
+// handle has a call outstanding, and the map is emptied the instant none is. The
+// cap covers the one shape the gate cannot bound on its own — a handle that is
+// NEVER idle while other handles on the same connection complete deferred calls
+// in the thousands. It has to be generous, because the window it exists for is
+// the microseconds between a completion and the Result it overtook: reaching 512
+// unclaimed entries inside that window means the parked one this handle actually
+// wanted is long gone anyway, and the cost of being wrong is a call that falls
+// back to its timeout rather than a hang. Oldest goes first, so the entries most
+// likely to still be claimable are the ones that survive.
+constexpr std::size_t kParkedCompletionCap = 512;
+
 // The honest code for "the object was released while your call was in flight".
 //
 // logos_call_error.h's vocabulary is part of the wire contract, so this reuses
@@ -147,6 +162,29 @@ boost::asio::io_context& deadlineContext()
 {
     return DeadlineService::shared().context();
 }
+
+// Counts one synchronous call as outstanding for as long as the caller is inside
+// callMethodWithError — see CallState::syncOutstanding. RAII because that function
+// returns from six places and an unbalanced count would either wedge the parked
+// completions on forever or let them be thrown away under a live waiter.
+struct SyncCallScope {
+    std::shared_ptr<PlainLogosObject::CallState> st;
+
+    explicit SyncCallScope(std::shared_ptr<PlainLogosObject::CallState> s)
+        : st(std::move(s))
+    {
+        std::lock_guard<std::mutex> g(st->mu);
+        ++st->syncOutstanding;
+    }
+    ~SyncCallScope()
+    {
+        std::lock_guard<std::mutex> g(st->mu);
+        --st->syncOutstanding;
+        st->dropUnclaimedIfIdle();
+    }
+    SyncCallScope(const SyncCallScope&) = delete;
+    SyncCallScope& operator=(const SyncCallScope&) = delete;
+};
 
 // -----------------------------------------------------------------------------
 // DeliveryService — the thread user callbacks land on in a process that has NO
@@ -375,6 +413,48 @@ void postDelivery(PlainLogosObject::AsyncResultErrorCallback callback,
 
 } // anonymous namespace
 
+// ── CallState: the parked-completion staging area ────────────────────────────
+//
+// All three run with CallState::mu already held by the caller.
+
+void PlainLogosObject::CallState::parkCompletion(const QString& callId,
+                                                 const QVariant& value)
+{
+    // NOT OURS, and provably so: this handle has no call outstanding, so no
+    // sentinel it could ever see will name this callId. Before every handle had
+    // its own event channel this branch could not exist — one handle received
+    // every completion on the object and parked the ones it could not place for
+    // the life of the connection.
+    if (!busy()) return;
+
+    const auto it = completions.find(callId);
+    if (it != completions.end()) { it->second = value; return; }
+    completions.emplace(callId, value);
+    completionOrder.push_back(callId);
+    while (completionOrder.size() > kParkedCompletionCap) {
+        completions.erase(completionOrder.front());
+        completionOrder.pop_front();
+    }
+}
+
+bool PlainLogosObject::CallState::takeCompletion(const QString& callId, QVariant* out)
+{
+    const auto it = completions.find(callId);
+    if (it == completions.end()) return false;
+    if (out) *out = it->second;
+    completions.erase(it);
+    const auto oit = std::find(completionOrder.begin(), completionOrder.end(), callId);
+    if (oit != completionOrder.end()) completionOrder.erase(oit);
+    return true;
+}
+
+void PlainLogosObject::CallState::dropUnclaimedIfIdle()
+{
+    if (busy()) return;
+    completions.clear();
+    completionOrder.clear();
+}
+
 // -----------------------------------------------------------------------------
 // AsyncCall — one in-flight asynchronous call. THIS IS WHAT REPLACED THE THREAD.
 //
@@ -501,6 +581,10 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
             std::lock_guard<std::mutex> g(st->mu);
             st->inflight.erase(id);
             if (!callId.isEmpty()) st->deferred.erase(callId);
+            // This may have been the last thing outstanding. Anything still
+            // parked then belongs to another handle on the shared connection and
+            // will never be claimed — see CallState::parkCompletion.
+            st->dropUnclaimedIfIdle();
         }
 
         if (!claim()) return;
@@ -782,10 +866,11 @@ void PlainLogosObject::stopAndCancelCalls()
             outstanding.push_back(entry.second);
         m_state->inflight.clear();
         m_state->deferred.clear();
-        // Buffered completions nobody can claim any more. They are dropped here
+        // Parked completions nobody can claim any more. They are dropped here
         // rather than left to the state block's own destruction so that a
         // handler still holding a share of it does not keep them alive.
         m_state->completions.clear();
+        m_state->completionOrder.clear();
     }
     m_state->cv.notify_all();
 
@@ -845,6 +930,13 @@ QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
     // Subscribe to the completion channel BEFORE sending, so a "multi" provider's
     // completion can't race ahead of the waiter (it's buffered either way).
     ensureCompletionSub();
+
+    // From here until this function returns — the deferred wait included — this
+    // handle has a call that a completion arriving out of order could belong to.
+    // That is what licenses CallState::parkCompletion to keep an unattributed
+    // completion at all, and dropping the count is what licenses it to throw the
+    // rest away. Scoped rather than hand-decremented: this function has six exits.
+    SyncCallScope scope(m_state);
 
     CallMessage msg;
     msg.id        = m_conn->nextId();
@@ -945,10 +1037,15 @@ void PlainLogosObject::subscribeToCompletions()
                 call = it->second;
                 st->deferred.erase(it);
             } else {
-                // Nobody is waiting on it yet: either a SYNCHRONOUS caller is
-                // about to park on it, or it arrived before its own sentinel
-                // was recorded. Buffer it, exactly as before.
-                st->completions[callId] = data.at(1);
+                // Nobody is waiting on it yet. Either a SYNCHRONOUS caller is
+                // about to park on it, or it arrived before its own sentinel was
+                // recorded — or it belongs to a DIFFERENT handle on this shared
+                // connection, which is now possible because every handle has its
+                // own event channel. parkCompletion() is what tells those apart
+                // as well as they can be told apart at all: it keeps the
+                // completion only while this handle has something outstanding
+                // that could still claim it.
+                st->parkCompletion(callId, data.at(1));
             }
         }
         if (call) {
@@ -987,12 +1084,9 @@ QVariant PlainLogosObject::awaitCompletion(const QString& callId, int timeoutMs,
     // AN ANSWER ALREADY IN HAND BEATS A CONCURRENT STOP: there is a real result
     // here, so hand it over rather than manufacture a failure that did not
     // happen. Callers re-acquire, retry and log on transport_error.
-    const auto it = st->completions.find(callId);
-    if (it != st->completions.end()) {
-        const QVariant result = it->second;
-        st->completions.erase(it);
+    QVariant result;
+    if (st->takeCompletion(callId, &result))
         return result;
-    }
     if (st->stopping.load(std::memory_order_relaxed)) {
         qWarning() << "PlainLogosObject: deferred call" << callId
                    << "abandoned — object released while it was in flight";
@@ -1139,14 +1233,12 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
         {
             std::lock_guard<std::mutex> g(st->mu);
             stopping = st->stopping.load(std::memory_order_relaxed);
-            // The completion can be buffered ALREADY. On one ordered connection
-            // it cannot be — the provider writes the sentinel result before the
-            // completion event, and both are decoded on the same strand in order
-            // — but checking costs one lookup and removes the assumption.
-            const auto it = st->completions.find(callId);
-            if (it != st->completions.end()) {
-                buffered = it->second;
-                st->completions.erase(it);
+            // The completion can be parked ALREADY, and — contrary to what this
+            // comment used to claim — not only in theory: a "multi" provider whose
+            // worker finishes before the host has written the sentinel puts the
+            // completion event on the wire AHEAD of its own Result, and both are
+            // then decoded in that order on the one strand.
+            if (st->takeCompletion(callId, &buffered)) {
                 haveBuffered = true;
             } else if (!stopping) {
                 call->callId = callId;      // written under st->mu, read under it
@@ -1194,20 +1286,25 @@ void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
     EntryGuard guard(this, "onEvent()");
     if (!m_conn || !m_conn->isOpen() || !callback) return;
 
-    {
-        std::lock_guard<std::mutex> g(m_mu);
-        m_subs.emplace_back(eventName, callback);
-    }
-
     SubscribeMessage msg;
     msg.object    = m_objectName;
     msg.eventName = eventName.toStdString();
 
+    // m_mu HELD ACROSS THE SUBSCRIBE, because the token only exists once the
+    // registration does: recording it afterwards without the lock would let a
+    // concurrent disconnectEvents() swap an empty list out and leave this
+    // subscription registered on a connection that outlives the handle. (The old
+    // code recorded the name first and had the mirror-image hole — it could send
+    // an Unsubscribe for a Subscribe that had not been enqueued yet.) Lock order
+    // is handle → connection; the connection never calls back into the handle
+    // while holding its own mutex, so there is no cycle.
+    std::lock_guard<std::mutex> g(m_mu);
     // Bridge RPC event → Qt-flavored callback.
-    m_conn->sendSubscribe(std::move(msg), [callback](EventMessage evt) {
+    const auto sid = m_conn->sendSubscribe(std::move(msg), [callback](EventMessage evt) {
         callback(QString::fromStdString(evt.eventName),
                  rpcListToQVariantList(evt.data));
     });
+    m_subs.push_back(sid);
 }
 
 void PlainLogosObject::disconnectEvents()
@@ -1220,18 +1317,17 @@ void PlainLogosObject::disconnectEvents()
 // must not take a reference to an object they are in the middle of destroying.
 void PlainLogosObject::disconnectEventsImpl()
 {
-    std::vector<std::pair<QString, EventCallback>> subs;
+    std::vector<RpcConnectionBase::SubscriptionId> subs;
     {
         std::lock_guard<std::mutex> g(m_mu);
         subs.swap(m_subs);
     }
     if (!m_conn) return;
-    for (const auto& [name, _] : subs) {
-        UnsubscribeMessage msg;
-        msg.object    = m_objectName;
-        msg.eventName = name.toStdString();
-        m_conn->sendUnsubscribe(std::move(msg));
-    }
+    // Withdraws OUR registrations only. Whether an Unsubscribe frame goes out is
+    // the connection's decision — it does so once the last handle interested in
+    // that (object, event) is gone, because the frame is connection-wide.
+    for (const auto sid : subs)
+        m_conn->sendUnsubscribe(sid);
 }
 
 void PlainLogosObject::emitEvent(const QString& eventName, const QVariantList& data)

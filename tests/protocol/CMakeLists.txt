@@ -35,6 +35,15 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
 #   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
 #   PlainSendAfterFailTest.*   (all four; validated on cf1b9b0)
+#   PlainEventSubSharingTest.ASecondHandleDoesNotStealTheFirstsCompletionChannel
+#   PlainEventSubSharingTest.TheSameTheftThroughTheRealHost
+#   PlainEventSubSharingTest.EveryHandleGetsEveryEmission
+#   PlainEventSubSharingTest.ANamedAndAWildcardSubscriberEachGetOneCopy
+#   PlainEventSubSharingTest.ReleasingOneHandleLeavesTheOtherSubscribed
+#   PlainEventSubSharingTest.SubscriptionsSurviveChurn
+#   PlainEventSubSharingTest.ACompletionThatOvertakesItsOwnResultIsStillDelivered
+#   PlainEventSubSharingTest.ANewConsumerAgainstAnOldHost
+#   PlainEventSubSharingTest.AnOldConsumersFrameSequenceAgainstTheNewHost
 #   SyncCallReleaseRaceTest.ReleaseWithASyncCallInFlightIsReportedAndFatal
 #   SyncCallReleaseRaceTest.AParkedSyncCallSurvivesReleaseFromAnotherThread
 #   SyncCallReleaseRaceTest.ReleaseDefersDestructionToTheLastCallInFlight
@@ -66,12 +75,21 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # and it takes the process down with SIGSEGV on the first round, with or without
 # a memory detector. The backtrace it produces is recorded in the file.
 #
+# The subscription-sharing group is nine detectors of ONE mechanism: every handle
+# holding its own registration on the shared connection. All nine were run RED on
+# the pre-fix tree — where the second handle to subscribe to an event on a
+# connection silently takes the first one's channel — and green here; the tenth
+# case in that file is a pin, and is named below.
+#
 # Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
 # the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
 # deliver() once no matter what guards it — and only racing teardown against
 # replies in flight (the first entry) and the hand-built extract-then-cancel
 # interleaving (the last) actually catch a doubled callback. Do not read a green
-# per-path test as evidence the gate is there.
+# per-path test as evidence the gate is there. Nor is
+# PlainEventSubSharingTest.TeardownRemovesEverySubscription, which passes on the
+# pre-fix tree: only the tests that assert a SECOND live subscriber still has its
+# channel detect the subscription clobber.
 #
 # AND DO NOT READ ReleaseRacingRepliesInFlightDeliversEachCallOnce AS COVERING
 # EVERY DOUBLE. It races teardown of the HANDLE against replies with the
@@ -192,6 +210,15 @@ add_executable(protocol_tests
     # subscription the host had not registered and the completion was dropped.
     # Costs a caller its whole timeout and leaves nothing behind — see the file.
     test_plain_completion_sub_order.cpp
+    # A THIRD thing release() and the shared RpcConnection get wrong together:
+    # m_eventCallbacks is keyed by (object, event) and ASSIGNED, so the second
+    # handle a connection hands out for the same module silently takes the
+    # first one's subscription — the completion channel included. Reachable with
+    # no concurrency at all. Covers the theft over the raw wire and through the
+    # shipping host, every-handle-gets-every-emission, one handle leaving without
+    # taking another's subscription with it, and randomized churn with a quiesced
+    # per-round audit.
+    test_plain_event_sub_sharing.cpp
     # cancelPending() and the two things it is NOT. dispatchIncoming copies a
     # handler out under the connection mutex and invokes it unlocked, so a
     # cancel arriving in that gap stops nothing — at-most-once INVOCATION is the

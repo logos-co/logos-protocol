@@ -40,6 +40,19 @@ public:
     // by it so a subsequent onUnsubscribe / onConnectionClosed can
     // remove only the sinks belonging to that connection — sub/unsub
     // frames don't carry a subscriber identifier on the wire.
+    //
+    // ONE SINK PER (object, event, connection), AND THAT IS THE CONTRACT, not a
+    // simplification waiting to be lifted. Every sink a handler could build for a
+    // given connection is the same thing — "write this frame back down that
+    // socket" — so a second Subscribe for a pair this connection already has is
+    // an idempotent re-assertion, and a handler is right to overwrite. It follows
+    // that a CONSUMER with several logical subscribers behind one connection owns
+    // the demultiplexing: it fans one delivery out locally (see
+    // RpcConnection::sendSubscribe) and sends Unsubscribe only when the last of
+    // them is gone, because Unsubscribe means "this connection wants no more of
+    // that event at all". A consumer that unsubscribes per-subscriber silences
+    // its own siblings, and no host-side bookkeeping can tell that apart from a
+    // genuine unsubscribe.
     virtual void onSubscribe(const SubscribeMessage& req, EventSink sink,
                              const void* connectionId) = 0;
 

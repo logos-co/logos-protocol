@@ -243,8 +243,16 @@ public:
         m_cancelled.fetch_add(1);
     }
 
-    void sendSubscribe(SubscribeMessage, std::function<void(EventMessage)>) override {}
-    void sendUnsubscribe(UnsubscribeMessage) override {}
+    // A DISTINCT id per registration, not a constant: the handle records what it
+    // gets back and hands exactly that to sendUnsubscribe, so a double that
+    // returned the same token for every subscribe would let a bug that withdraws
+    // the wrong registration pass unnoticed here.
+    SubscriptionId sendSubscribe(SubscribeMessage,
+                                 std::function<void(EventMessage)>) override
+    {
+        return m_nextSub.fetch_add(1);
+    }
+    void sendUnsubscribe(SubscriptionId) override {}
     void sendEvent(EventMessage) override {}
     void sendToken(TokenMessage) override {}
     void setErrorHandler(ErrorHandler) override {}
@@ -263,6 +271,7 @@ private:
     std::atomic<int>           m_cancelled{0};
     std::atomic<uint64_t>      m_lastCancelled{0};
     std::atomic<uint64_t>      m_nextId{1};
+    std::atomic<SubscriptionId> m_nextSub{1};
 };
 
 // PlainLogosObject that says when it is destroyed. "Exactly once, and not before

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -131,7 +132,55 @@ public:
         // still parks its own caller's thread here, because a synchronous call
         // has to block someone and that someone is the caller.
         std::condition_variable cv;
+        // Completions that arrived before anyone was waiting on them. It exists
+        // for ONE ordering: a "multi" provider whose worker finishes before the
+        // sentinel it is answering has been written, which puts the completion
+        // event on the wire AHEAD of its own Result. The synchronous caller is
+        // still blocked on the Result at that instant and cannot possibly have
+        // registered, so the completion has to be parked somewhere.
+        //
+        // WHOSE completions, though, is a question this map could not answer
+        // until every handle got its own event channel. The callId is minted by
+        // the provider, so a completion arriving early is not attributable to a
+        // handle at all — every handle subscribed to the object now sees it, and
+        // a handle that parked every one it could not place would grow this map
+        // without bound for the whole life of the connection. (Pre-fix the same
+        // leak existed with one victim instead of N: the single handle that had
+        // stolen the channel parked every OTHER handle's completions here and
+        // never claimed one of them.)
+        //
+        // So parking is gated on `busy` below and the map is EMPTIED the moment
+        // this handle has nothing outstanding — at which point, by construction,
+        // nothing it holds can ever be claimed.
         std::map<QString, QVariant> completions;
+        // Order of arrival, so the gate below can evict the oldest rather than
+        // refuse the newest when the cap is hit. Entries here may name a callId
+        // that has already been claimed; the eviction skips those.
+        std::deque<QString>         completionOrder;
+
+        // Synchronous calls this handle has issued that have not finished — from
+        // just before the Call goes out until callMethodWithError returns,
+        // INCLUDING the deferred wait in awaitCompletion. Async calls are counted
+        // by `inflight` and deferred ones by `deferred`, so the three together are
+        // "this handle could still claim a completion".
+        int syncOutstanding = 0;
+
+        // Guarded by `mu`. True while some call of this handle's could still turn
+        // out to own an unattributed completion.
+        bool busy() const
+        {
+            return syncOutstanding > 0 || !inflight.empty() || !deferred.empty();
+        }
+        // All three below run under `mu`, which the caller already holds.
+        //
+        // Park an unclaimed completion, or drop it when it cannot be ours.
+        void parkCompletion(const QString& callId, const QVariant& value);
+        // Claim a parked completion. Keeps `completions` and `completionOrder`
+        // exactly in step, which is the whole reason it is one function.
+        bool takeCompletion(const QString& callId, QVariant* out);
+        // Called whenever something stops being outstanding: at that point
+        // anything still parked is provably another handle's.
+        void dropUnclaimedIfIdle();
 
         // In-flight ASYNC calls, keyed by the call's wire id. This is the whole
         // retention story on the handle now: an entry exists exactly while its
@@ -284,7 +333,11 @@ private:
     std::string                          m_objectName;
     std::shared_ptr<RpcConnectionBase>   m_conn;
     std::mutex                           m_mu;
-    std::vector<std::pair<QString, EventCallback>> m_subs;
+    // The connection-side tokens for THIS handle's subscriptions, not the
+    // (name, callback) pairs they used to be. The connection now holds several
+    // registrations per (object, event) — one per handle that asked — so the only
+    // way to withdraw ours and no one else's is to name the registration.
+    std::vector<RpcConnectionBase::SubscriptionId> m_subs;
 
     // Never null and never reseated: the object owns exactly one state block for
     // its whole life, and the only other references are the weak_ptrs its
