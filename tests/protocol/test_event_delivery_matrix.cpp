@@ -775,6 +775,84 @@ TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
     }
 }
 
+// ── readiness, the call-path counterpart ─────────────────────────────────────
+//
+// whenObjectAvailable() answers "tell me when this module is reachable" without
+// blocking and without giving up on the first no. It is what lets a CALL issued
+// before its module exists be held and dispatched rather than failing fast, and
+// it shares this registry — so it is pinned on every transport here rather than
+// only end-to-end through the QML bridge.
+TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAlreadyUp_FiresTrue)
+{
+    Module mod = makeModule("rdyctl");
+    ASSERT_TRUE(mod.hostReady());
+    mod.bringUp();
+
+    auto client = makeClient(mod);
+    std::atomic<int> fired{0};
+    std::atomic<int> ready{0};
+    ASSERT_NE(client->whenObjectAvailable(mod.name(), [&](bool ok) {
+        if (ok) ready.fetch_add(1);
+        fired.fetch_add(1);
+    }), 0u);
+
+    ASSERT_TRUE(pumpUntil([&] { return fired.load() > 0; }, 10000))
+        << "readiness never answered for a module that was already up";
+    EXPECT_EQ(ready.load(), 1);
+}
+
+TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce)
+{
+    Module mod = makeModule("rdylate");
+    ASSERT_TRUE(mod.hostReady());
+    // NOT brought up.
+
+    auto client = makeClient(mod);
+    std::atomic<int> fired{0};
+    std::atomic<int> ready{0};
+    ASSERT_NE(client->whenObjectAvailable(mod.name(), [&](bool ok) {
+        if (ok) ready.fetch_add(1);
+        fired.fetch_add(1);
+    }), 0u);
+
+    if (defersWhenModuleAbsent(GetParam().transport)) {
+        pump(300);
+        EXPECT_EQ(fired.load(), 0) << "answered 'not reachable' for a module that is "
+                                      "merely not up YET -- that is the defect, not the answer";
+    }
+
+    mod.bringUp();
+    ASSERT_TRUE(pumpUntil([&] { return fired.load() > 0; }, 10000))
+        << "readiness never fired after the module appeared";
+    EXPECT_EQ(ready.load(), 1);
+
+    // Exactly once, and never again: a one-shot readiness answer that arrives
+    // twice would dispatch a held call twice.
+    pump(500);
+    EXPECT_EQ(fired.load(), 1);
+}
+
+// It must NOT be resurrected by a reconnect. Event subscriptions are re-armed
+// there on purpose; a readiness answer already delivered is spent, and
+// re-firing it would re-dispatch whatever call it was gating.
+TEST_P(EventDeliveryMatrix, WhenObjectAvailable_NotReArmedOnReconnect)
+{
+    Module mod = makeModule("rdyrecon");
+    ASSERT_TRUE(mod.hostReady());
+    mod.bringUp();
+
+    auto client = makeClient(mod);
+    std::atomic<int> fired{0};
+    ASSERT_NE(client->whenObjectAvailable(mod.name(),
+                                          [&](bool) { fired.fetch_add(1); }), 0u);
+    ASSERT_TRUE(pumpUntil([&] { return fired.load() > 0; }, 10000)) << "control never fired";
+    ASSERT_EQ(fired.load(), 1);
+
+    ASSERT_TRUE(client->reconnect());
+    pump(1000);
+    EXPECT_EQ(fired.load(), 1) << "a spent readiness answer was re-delivered by reconnect";
+}
+
 INSTANTIATE_TEST_SUITE_P(
     AllTransportsAndProviders, EventDeliveryMatrix,
     ::testing::Values(
