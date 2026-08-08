@@ -6,6 +6,7 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QMap>
+#include <QStringList>
 #include <functional>
 #include <string>
 #include <vector>
@@ -239,8 +240,44 @@ public:
      * @param eventName The name of the event to listen for
      * @param callback Function to call when the event is triggered
      */
-    void onEvent(LogosObject* originObject, const QString& eventName, 
+    void onEvent(LogosObject* originObject, const QString& eventName,
                 std::function<void(const QString&, const QVariantList&)> callback);
+
+    /**
+     * @brief Subscribe to an event on a module that may not be reachable YET.
+     *
+     * The safe alternative to requestObject() + onEvent() for any caller that
+     * subscribes during startup — a UI plugin's Component.onCompleted, a
+     * module's initLogos(), a backend's onContextReady(). Never blocks; arms
+     * when the module appears, including a mid-session install; warns once on
+     * deferral and logs when it arms. See LogosAPIConsumer::onEventWhenAvailable
+     * for the full contract, the cost of waiting, and the (deliberate) lack of
+     * de-duplication.
+     *
+     * Adds no member state to this class — see the ABI note below; it forwards
+     * to the consumer that already exists.
+     */
+    void onEventWhenAvailable(const QString& objectName, const QString& eventName,
+                              std::function<void(const QString&, const QVariantList&)> callback,
+                              std::function<void(bool)> onArmed = {});
+
+    void onEventWhenAvailable(const std::string& objectName, const std::string& eventName,
+                              std::function<void(const std::string&, const QVariantList&)> callback,
+                              std::function<void(bool)> onArmed = {})
+    {
+        onEventWhenAvailable(QString::fromStdString(objectName),
+                             QString::fromStdString(eventName),
+                             [cb = std::move(callback)](const QString& name, const QVariantList& args) {
+                                 cb(name.toStdString(), args);
+                             },
+                             std::move(onArmed));
+    }
+
+    /**
+     * @brief Diagnostics: "<object>::<event>" for every deferred subscription
+     *        that has not armed yet.
+     */
+    QStringList pendingEventSubscriptions() const;
 
     /**
      * @brief Emit an event on a LogosObject (for plugins that act as event sources)

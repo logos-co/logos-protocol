@@ -493,6 +493,109 @@ private:
     QString m_objectName;
 };
 
+// ── PendingAcquire ───────────────────────────────────────────────────────────
+
+namespace {
+
+// One outstanding non-blocking acquire.
+//
+// Acquiring a dynamic replica before the peer exists is legal and free:
+// QRemoteObjectNodePrivate::handleNewAcquire registers the replica in the
+// node's `replicas` map with no connection, and when the peer finally shows up
+// the ObjectList packet handler calls handleReplicaConnection for every waiting
+// replica, which drives the replica to Valid. There is no polling here — the
+// node's own 250 ms reconnect timer (onShouldReconnect) is running for this
+// endpoint regardless of whether anyone is waiting on it.
+//
+// Deletes itself after delivering exactly once. If it is destroyed before
+// delivering (transport torn down), it owns and deletes the replica.
+class PendingAcquire : public QObject {
+    Q_OBJECT
+public:
+    PendingAcquire(QRemoteObjectReplica* replica,
+                   const QString& objectName,
+                   LogosTransportAsyncAcquire::AcquireCallback cb,
+                   QObject* parent)
+        : QObject(parent)
+        , m_replica(replica)
+        , m_objectName(objectName)
+        , m_cb(std::move(cb))
+    {
+        connect(m_replica, &QRemoteObjectReplica::stateChanged,
+                this, &PendingAcquire::onStateChanged);
+        // Already live (module was up before we asked) — still deliver via the
+        // event loop, so the callback contract is "never synchronously".
+        if (m_replica->state() == QRemoteObjectReplica::Valid)
+            schedule(true);
+    }
+
+    ~PendingAcquire() override
+    {
+        // Only reached when we never handed the replica over.
+        delete m_replica;
+    }
+
+private slots:
+    void onStateChanged(QRemoteObjectReplica::State state,
+                        QRemoteObjectReplica::State /*old*/)
+    {
+        if (m_done) return;
+        if (state == QRemoteObjectReplica::Valid) {
+            schedule(true);
+        } else if (state == QRemoteObjectReplica::SignatureMismatch) {
+            // Terminal: handleReplicaConnection warns and never connects, and
+            // no further state change will arrive. Report it rather than
+            // sitting Pending forever in silence — a subscription that can
+            // never arm has to SAY so.
+            qWarning() << "RemoteTransportConnection: source signature mismatch for"
+                       << m_objectName << "-- this acquire can never succeed";
+            schedule(false);
+        }
+        // Suspect / Default are NOT terminal: the source can come back and the
+        // node will re-drive the replica to Valid.
+    }
+
+private:
+    void schedule(bool ok)
+    {
+        if (m_done) return;
+        m_done = true;
+        // NEVER deliver inline. stateChanged is emitted from inside
+        // QRemoteObjectNodePrivate::onClientRead; constructing a
+        // RemoteLogosObject (which connects to the same replica) and then
+        // running caller code there re-enters QtRO while the replica is still
+        // emitting. That is precisely the refresh_balances SIGSEGV documented
+        // on RemoteLogosObject::disconnectEvents(). Hop to the next event-loop
+        // turn; `this` as context cancels the call if we are destroyed first.
+        QTimer::singleShot(0, this, [this, ok]() { deliver(ok); });
+    }
+
+    void deliver(bool ok)
+    {
+        QRemoteObjectReplica* replica = m_replica;
+        m_replica = nullptr;                       // ownership leaves us either way
+        disconnect(replica, nullptr, this, nullptr);
+
+        LogosObject* obj = nullptr;
+        if (ok) {
+            g_acquireCount.fetch_add(1, std::memory_order_relaxed);
+            obj = new RemoteLogosObject(replica, m_objectName);
+        } else {
+            delete replica;
+        }
+        auto cb = std::move(m_cb);
+        deleteLater();
+        cb(obj);                                   // may re-enter the transport safely
+    }
+
+    QRemoteObjectReplica* m_replica;
+    QString m_objectName;
+    LogosTransportAsyncAcquire::AcquireCallback m_cb;
+    bool m_done = false;
+};
+
+} // anonymous namespace
+
 // ── RemoteTransportHost ──────────────────────────────────────────────────────
 
 RemoteTransportHost::RemoteTransportHost(const QString& registryUrl)
@@ -557,6 +660,7 @@ void RemoteTransportHost::unpublishObject(const QString& /*name*/)
 
 RemoteTransportConnection::RemoteTransportConnection(const QString& registryUrl)
     : m_node(new QRemoteObjectNode())
+    , m_pendingAcquires(new QObject())
     , m_registryUrl(registryUrl)
     , m_connected(false)
 {
@@ -564,6 +668,9 @@ RemoteTransportConnection::RemoteTransportConnection(const QString& registryUrl)
 
 RemoteTransportConnection::~RemoteTransportConnection()
 {
+    // Pending replicas belong to the node; kill them FIRST so none outlives it.
+    delete m_pendingAcquires;
+    m_pendingAcquires = nullptr;
     delete m_node;
 }
 
@@ -617,6 +724,12 @@ bool RemoteTransportConnection::reconnect()
     qDebug() << "RemoteTransportConnection: Attempting to reconnect to registry:" << m_registryUrl;
 
     if (m_connected) {
+        // In-flight acquires hold replicas belonging to the node about to die.
+        // Drop them first; their callbacks are cancelled with them, so the
+        // consumer's subscription registry re-arms against the new node
+        // (LogosAPIConsumer::reconnect -> reconnected()).
+        delete m_pendingAcquires;
+        m_pendingAcquires = new QObject();
         delete m_node;
         m_node = new QRemoteObjectNode();
         m_connected = false;
@@ -694,6 +807,28 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     qDebug() << "[LogosObject] RemoteTransportConnection: returning RemoteLogosObject for:" << objectName;
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);
+}
+
+bool RemoteTransportConnection::requestObjectWhenAvailable(const QString& objectName,
+                                                           AcquireCallback onReady)
+{
+    if (objectName.isEmpty() || !onReady) return false;
+    if (!m_node || !m_pendingAcquires) return false;
+    // m_connected is the raw "connectToNode() accepted the URL" latch, and here
+    // that is exactly the right question: we are NOT asking whether the peer is
+    // up (it deliberately need not be), only whether this node is wired to the
+    // endpoint so QtRO's reconnect loop is running for it. Calling the truthful
+    // isConnected() here would reintroduce the very bug this exists to fix.
+    if (!m_connected) return false;
+
+    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    if (!replica) {
+        qWarning() << "RemoteTransportConnection: Failed to acquire replica for:" << objectName;
+        return false;
+    }
+
+    new PendingAcquire(replica, objectName, std::move(onReady), m_pendingAcquires);
+    return true;
 }
 
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }

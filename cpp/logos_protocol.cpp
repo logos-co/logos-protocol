@@ -380,16 +380,28 @@ lp_subscription* lp_subscribe(lp_client* client,
     if (!client || !client->client || !event_name || !*event_name || !cb)
         return nullptr;
 
-    LogosObject* object = client->client->requestObject(client->target);
-    if (!object) return nullptr;
-
+    // Deliberately NOT requestObject() + onEvent().
+    //
+    // That pair asks "is the target module reachable at this instant?", and
+    // every caller that reaches here asks it at the worst possible instant: a
+    // module's init(), a UI backend's onContextReady(), a generated
+    // `dep.onSomething(...)` wrapper — all of which run while the dependency's
+    // host process has been spawned but has not called listen() yet. The old
+    // code returned nullptr there, the generated wrapper turned that into a
+    // `false` its documented example discards, and the subscription was never
+    // attempted again for the life of the process: method calls worked, events
+    // silently never arrived.
+    //
+    // onEventWhenAvailable() returns a handle that arms when the module shows
+    // up (including a mid-session install), warns once when it defers, logs
+    // when it arms, and says so loudly if it ever becomes impossible.
     auto* sub = new lp_subscription();
     sub->guard = std::make_shared<CbGuard>();
 
     std::shared_ptr<CbGuard> subGuard = sub->guard;
     std::shared_ptr<CbGuard> clientGuard = client->guard;
-    client->client->onEvent(
-        object, QString::fromUtf8(event_name),
+    client->client->onEventWhenAvailable(
+        client->target, QString::fromUtf8(event_name),
         [subGuard, clientGuard, cb, user_data](const QString& name,
                                                const QVariantList& data) {
             std::lock_guard<std::recursive_mutex> subLock(subGuard->mutex);

@@ -121,6 +121,7 @@ add_executable(protocol_tests
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
     test_remote_transport_events.cpp
+    test_deferred_subscription.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller

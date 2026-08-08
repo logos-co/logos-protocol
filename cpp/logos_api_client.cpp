@@ -370,6 +370,26 @@ void LogosAPIClient::onEvent(LogosObject* originObject, const QString& eventName
     });
 }
 
+void LogosAPIClient::onEventWhenAvailable(const QString& objectName, const QString& eventName,
+                                          std::function<void(const QString&, const QVariantList&)> callback,
+                                          std::function<void(bool)> onArmed)
+{
+    // Marshal to the owner thread for the same reason onEvent() does: the
+    // registry touches (and later arms against) a QtRO replica, which only
+    // works on the thread that created the node.
+    logos::runOnOwnerThread(this, [&]() {
+        m_consumer->onEventWhenAvailable(objectName, eventName,
+                                         std::move(callback), std::move(onArmed));
+    });
+}
+
+QStringList LogosAPIClient::pendingEventSubscriptions() const
+{
+    return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> QStringList {
+        return m_consumer->pendingSubscriptions();
+    });
+}
+
 void LogosAPIClient::onEventResponse(LogosObject* object, const QString& eventName, const QVariantList& data)
 {
     qDebug() << "[LogosObject] LogosAPIClient::onEventResponse" << eventName << "-> LogosObject::emitEvent";

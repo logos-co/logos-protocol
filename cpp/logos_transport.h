@@ -5,6 +5,8 @@
 #include <QVariant>
 #include <QVariantList>
 
+#include <functional>
+
 class QObject;
 class LogosObject;
 
@@ -95,6 +97,74 @@ public:
      */
     virtual QString endpointUrl(const QString& instanceId,
                                 const QString& moduleName);
+};
+
+/**
+ * @brief Optional extension: acquire a handle WITHOUT blocking, delivered when
+ *        (and if) the object becomes reachable.
+ *
+ * requestObject() answers "is it there RIGHT NOW", and on the qt_remote
+ * transport it answers by sitting in QRemoteObjectReplica::waitForSource() —
+ * a nested event loop, for up to `timeoutMs`. Neither answer is usable from a
+ * GUI thread during startup, when the module's host process has been spawned
+ * but has not called listen() yet. A caller that needs a *subscription* rather
+ * than an immediate call has no reason to ask the now-question at all: it can
+ * wait, as long as waiting costs nothing and is not silent.
+ *
+ * This is DELIBERATELY a sibling interface rather than another virtual on
+ * LogosTransportConnection, for exactly the reason spelled out on
+ * LogosObjectErrorChannel (logos_object.h): logos_transport.h is an installed
+ * header whose vtable is baked into every statically-linked copy of
+ * liblogos_protocol in a process, one per loaded module, each pinned to its own
+ * protocol revision. Appending a virtual would append a vtable slot, and a
+ * caller compiled against the new header calling that slot on a transport whose
+ * vtable came from an older copy is undefined behaviour. A separate interface
+ * reached with dynamic_cast leaves LogosTransportConnection's layout, size and
+ * vtable byte-for-byte unchanged — an older copy simply fails the cast.
+ *
+ * Consumers MUST therefore treat it as optional:
+ *
+ *     if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(conn)) {
+ *         if (async->requestObjectWhenAvailable(name, cb)) return;  // armed
+ *     }
+ *     // ... else retry requestObject() yourself, and say that you are.
+ *
+ * Implemented by qt_remote, where the wait is free: QRemoteObjectNode already
+ * retries a dropped/absent connection every 250 ms for the life of the process
+ * (QRemoteObjectNodePrivate::onShouldReconnect), so a pending acquire adds one
+ * replica object and no timer at all. The other transports do not implement it
+ * — their requestObject() is a registry hash lookup or an in-memory socket
+ * check, cheap enough for the caller to poll.
+ */
+class LogosTransportAsyncAcquire {
+public:
+    virtual ~LogosTransportAsyncAcquire() = default;
+
+    /**
+     * @brief Callback for a deferred acquire.
+     *
+     * Invoked with a LogosObject* the caller owns (release() when done), or
+     * with nullptr when the object can be proven to be permanently
+     * unreachable on this connection (e.g. a source signature mismatch).
+     * nullptr means GIVE UP — it is never used for "not there yet".
+     */
+    using AcquireCallback = std::function<void(LogosObject*)>;
+
+    /**
+     * @brief Register interest in `objectName` and return immediately.
+     *
+     * Never blocks and never spins a nested event loop.
+     *
+     * @return true  the request was accepted; `onReady` WILL be invoked exactly
+     *               once, on a later event-loop turn, never synchronously from
+     *               inside this call and never from inside the transport's own
+     *               read stack.
+     * @return false the transport declined (it cannot defer, or is not in a
+     *               state to try). `onReady` is NOT invoked, now or ever, and
+     *               the caller owns the retry.
+     */
+    virtual bool requestObjectWhenAvailable(const QString& objectName,
+                                            AcquireCallback onReady) = 0;
 };
 
 #endif // LOGOS_TRANSPORT_H

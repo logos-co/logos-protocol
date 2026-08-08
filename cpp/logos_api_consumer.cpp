@@ -14,6 +14,290 @@
 #include <QTimer>
 #include <QTime>
 #include <QPointer>
+#include <QElapsedTimer>
+#include <QSet>
+#include <QVector>
+
+// ── LogosPendingSubscriptions ────────────────────────────────────────────────
+//
+// The registry behind LogosAPIConsumer::onEventWhenAvailable(). It holds every
+// subscription whose target object is not reachable yet and arms it the moment
+// it becomes reachable — see the contract on the header declaration.
+//
+// Defined here rather than in the header on purpose: all of its state is
+// instance state reached through one owned pointer, so nothing about it can
+// become a per-image duplicate on Windows.
+class LogosPendingSubscriptions
+{
+public:
+    LogosPendingSubscriptions(LogosAPIConsumer* owner,
+                              LogosTransportConnection* transport)
+        : m_owner(owner), m_transport(transport) {}
+
+    ~LogosPendingSubscriptions()
+    {
+        if (m_timer) { m_timer->stop(); delete m_timer; }
+        for (LogosObject* obj : m_handles)
+            if (obj) obj->release();
+        m_handles.clear();
+    }
+
+    void add(const QString& objectName, const QString& eventName,
+             LogosObject::EventCallback cb, std::function<void(bool)> onArmed)
+    {
+        Entry e;
+        e.objectName = objectName;
+        e.eventName  = eventName;
+        e.callback   = std::move(cb);
+        e.onArmed    = std::move(onArmed);
+        e.since.start();
+        m_entries.push_back(std::move(e));
+
+        // If a handle for this object is already live, arm right now.
+        if (LogosObject* obj = liveHandle(objectName)) {
+            armAgainst(objectName, obj);
+            return;
+        }
+        qDebug().nospace() << "LogosAPIConsumer: '" << objectName << "::" << eventName
+                           << "' deferred pending the module becoming reachable";
+        startAcquire(objectName);
+        ensureTimer();
+    }
+
+    QStringList pending() const
+    {
+        QStringList out;
+        for (const Entry& e : m_entries)
+            out << (e.objectName + QStringLiteral("::") + e.eventName);
+        return out;
+    }
+
+    // The connection was torn down and rebuilt (LogosAPIConsumer::reconnect):
+    // every handle we hold points at a replica whose node is gone. Put the
+    // armed subscriptions back into the pending set so they re-arm against the
+    // new connection instead of going quietly dead.
+    //
+    // NOTE this is NOT the module-unload path. A module that unloads and comes
+    // back drives its replica Suspect → Valid on the SAME node, and the event
+    // helper is attached to that replica, so those subscriptions survive on
+    // their own with nothing to do here.
+    void reconnected()
+    {
+        for (LogosObject* obj : m_handles)
+            if (obj) obj->release();
+        m_handles.clear();
+        m_acquiring.clear();
+
+        QVector<Entry> revive = std::move(m_armed);
+        m_armed.clear();
+        QSet<QString> objects;
+        for (Entry& e : revive) {
+            e.since.start();
+            e.warnLevel = 0;
+            objects.insert(e.objectName);
+            m_entries.push_back(std::move(e));
+        }
+        for (const QString& name : objects)
+            startAcquire(name);
+    }
+
+private:
+    struct Entry {
+        QString objectName;
+        QString eventName;
+        LogosObject::EventCallback callback;
+        std::function<void(bool)> onArmed;
+        QElapsedTimer since;
+        int warnLevel = 0;   // 0 = quiet, 1 = warned at 3s, 2 = warned at 60s
+    };
+
+    LogosObject* liveHandle(const QString& objectName) const
+    {
+        LogosObject* obj = m_handles.value(objectName, nullptr);
+        return (obj && obj->isValid()) ? obj : nullptr;
+    }
+
+    // Ask the transport for a handle. Prefers the deferred path; falls back to
+    // a bounded-backoff poll for transports that cannot defer.
+    void startAcquire(const QString& objectName)
+    {
+        if (m_acquiring.contains(objectName)) return;   // one acquire per object
+
+        if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport)) {
+            QPointer<LogosAPIConsumer> guard(m_owner);
+            const QString name = objectName;
+            if (async->requestObjectWhenAvailable(name, [this, guard, name](LogosObject* obj) {
+                    if (!guard) return;               // consumer died first
+                    m_acquiring.remove(name);
+                    if (obj) armAgainst(name, obj);
+                    else     abandon(name);
+                })) {
+                m_acquiring.insert(objectName);
+                return;
+            }
+        }
+        // No deferred acquire on this transport (qt_local / mock / plain). Their
+        // requestObject() is a registry hash lookup or an in-memory socket
+        // check — non-blocking and cheap enough to poll; tick() will do it.
+        // Deliberately NOT used for qt_remote, whose requestObject() enters
+        // QRemoteObjectReplica::waitForSource()'s nested event loop even with a
+        // 0 timeout (QTBUG-94570 comment aside, timeout>=0 still calls
+        // loop.exec()) — a GUI-thread hazard smuggled in through the retry.
+    }
+
+    // One timer per consumer, running only while something is pending.
+    //
+    // On qt_remote it does NO polling at all — every pending object is in
+    // m_acquiring, so tick() finds nothing to ask for and the timer exists
+    // purely as the log watchdog below. On the other transports it also retries
+    // requestObject(), at 250 ms → 5 s, costing a hash lookup or an in-memory
+    // socket-state read per pending object per tick.
+    //
+    // Known cost, stated rather than hidden: on qt_local/mock a retry against a
+    // module that is not registered makes the transport log its own "plugin not
+    // found" warning, so a long-pending subscription there produces roughly one
+    // such line per 5 s per object. That noise is deliberate — it is the
+    // transport truthfully reporting a module that is not there — and silencing
+    // it would be the silent-failure shape this whole change exists to remove.
+    void ensureTimer()
+    {
+        if (m_entries.isEmpty()) return;
+        if (!m_timer) {
+            m_timer = new QTimer(m_owner);
+            QObject::connect(m_timer, &QTimer::timeout, m_owner, [this]() { tick(); });
+        }
+        m_intervalMs = 250;                            // a new pending resets the backoff
+        m_timer->start(m_intervalMs);
+    }
+
+    void tick()
+    {
+        QSet<QString> wanted;
+        for (const Entry& e : m_entries)
+            if (!m_acquiring.contains(e.objectName)) wanted.insert(e.objectName);
+
+        for (const QString& name : wanted) {
+            LogosObject* obj = m_transport->requestObject(name, 0);
+            if (obj) armAgainst(name, obj);
+        }
+
+        reportStillPending();
+
+        if (m_entries.isEmpty()) { m_timer->stop(); return; }
+        // 250 ms → 5 s cap. Unbounded in TIME on purpose: a module can be
+        // installed and loaded mid-session, so any give-up would silently break
+        // the package manager's core flow. What is bounded is the noise — two
+        // log lines per (object, event), ever.
+        if (m_intervalMs < 5000) {
+            m_intervalMs = qMin(5000, m_intervalMs * 2);
+            m_timer->start(m_intervalMs);
+        }
+    }
+
+    // Bounded diagnostics. A subscription that is deferred for a few
+    // milliseconds during normal startup is not news and must not spam the log;
+    // one that is still waiting seconds later is the shape of the original bug
+    // and has to leave a durable record. So: one warning at 3 s, one more at
+    // 60 s, then silence — never per retry.
+    void reportStillPending()
+    {
+        for (Entry& e : m_entries) {
+            const qint64 ms = e.since.elapsed();
+            if (e.warnLevel == 0 && ms >= 3000) {
+                e.warnLevel = 1;
+                qWarning().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' still not reachable after " << ms
+                    << " ms -- subscription is DEFERRED, not lost; it will arm when the "
+                       "module appears. Is the module loaded?";
+            } else if (e.warnLevel == 1 && ms >= 60000) {
+                e.warnLevel = 2;
+                qWarning().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' still pending after " << ms
+                    << " ms. Still retrying; this is the last message about it.";
+            }
+        }
+    }
+
+    // A handle arrived: attach every pending subscription for that object.
+    void armAgainst(const QString& objectName, LogosObject* obj)
+    {
+        LogosObject* handle = m_handles.value(objectName, nullptr);
+        if (handle && handle != obj && !handle->isValid()) {
+            handle->release();
+            handle = nullptr;
+        }
+        if (!handle) {
+            m_handles.insert(objectName, obj);
+            handle = obj;
+        } else if (handle != obj) {
+            obj->release();                            // already had a live one
+        }
+
+        // Split FIRST, run callbacks after. onArmed / onEvent can re-enter
+        // add() (a consumer re-subscribing on arm), and mutating m_entries
+        // while iterating it would be a use-after-free.
+        QVector<Entry> matched = takeMatching(objectName);
+        for (Entry& e : matched) {
+            handle->onEvent(e.eventName, e.callback);
+            // Log at the level that matches what was already said: if we
+            // warned that this one was pending, close the loop out loud;
+            // otherwise it armed promptly and is not news.
+            if (e.warnLevel > 0)
+                qInfo().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' subscription ARMED after " << e.since.elapsed() << " ms";
+            else
+                qDebug().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' subscription armed after " << e.since.elapsed() << " ms";
+            if (e.onArmed) e.onArmed(true);
+            m_armed.push_back(std::move(e));           // keep, so reconnect can re-arm
+        }
+    }
+
+    QVector<Entry> takeMatching(const QString& objectName)
+    {
+        QVector<Entry> matched, remaining;
+        for (Entry& e : m_entries) {
+            if (e.objectName == objectName) matched.push_back(std::move(e));
+            else                            remaining.push_back(std::move(e));
+        }
+        m_entries = std::move(remaining);
+        if (m_entries.isEmpty() && m_timer) m_timer->stop();
+        return matched;
+    }
+
+    // The transport proved this object can never be acquired on this
+    // connection. Drop the subscriptions LOUDLY — a permanently dead
+    // subscription that still looks pending is the original bug wearing a
+    // different hat.
+    void abandon(const QString& objectName)
+    {
+        const QVector<Entry> matched = takeMatching(objectName);
+        for (const Entry& e : matched) {
+            qWarning().nospace()
+                << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                << "' ABANDONED -- the transport reported this object permanently "
+                   "unavailable. This subscription will never fire.";
+            if (e.onArmed) e.onArmed(false);
+        }
+    }
+
+    LogosAPIConsumer* m_owner;
+    LogosTransportConnection* m_transport;
+    QVector<Entry> m_entries;   // waiting to arm
+    QVector<Entry> m_armed;     // live; retained only so reconnected() can re-arm
+    QSet<QString> m_acquiring;
+    // Subscription handles, one per object, deliberately SEPARATE from
+    // LogosAPIConsumer::m_objectCache. Sharing that cache would let the call
+    // path release() a handle a live subscription is attached to (it drops a
+    // stale entry on the next call), killing the subscription with no trace.
+    QHash<QString, LogosObject*> m_handles;
+    QTimer* m_timer = nullptr;
+    int m_intervalMs = 250;
+};
 
 LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
                                    const QString& origin_module,
@@ -64,8 +348,32 @@ LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
 LogosAPIConsumer::~LogosAPIConsumer()
 {
     // Release cached handles while m_transport is still alive (the destructor
-    // body runs before member destruction).
+    // body runs before member destruction). Same for the subscription registry,
+    // which owns handles of its own.
+    delete m_pendingSubs;
+    m_pendingSubs = nullptr;
     clearObjectCache();
+}
+
+void LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
+                                            const QString& eventName,
+                                            std::function<void(const QString&, const QVariantList&)> callback,
+                                            std::function<void(bool)> onArmed)
+{
+    if (objectName.isEmpty() || eventName.isEmpty() || !callback) {
+        qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object/event name "
+                      "or null callback -- refusing" << objectName << eventName;
+        if (onArmed) onArmed(false);
+        return;
+    }
+    if (!m_pendingSubs)
+        m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
+    m_pendingSubs->add(objectName, eventName, std::move(callback), std::move(onArmed));
+}
+
+QStringList LogosAPIConsumer::pendingSubscriptions() const
+{
+    return m_pendingSubs ? m_pendingSubs->pending() : QStringList();
 }
 
 LogosObject* LogosAPIConsumer::requestObject(const QString& objectName, Timeout timeout)
@@ -105,7 +413,11 @@ bool LogosAPIConsumer::reconnect()
     // Handles from the old connection point at replicas that are now dead; drop
     // them so the next call re-acquires against the fresh connection.
     clearObjectCache();
-    return m_transport->reconnect();
+    const bool ok = m_transport->reconnect();
+    // Same problem, different owner: deferred subscriptions hold their own
+    // handles. Re-arm them rather than leaving them attached to dead replicas.
+    if (m_pendingSubs) m_pendingSubs->reconnected();
+    return ok;
 }
 
 QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,

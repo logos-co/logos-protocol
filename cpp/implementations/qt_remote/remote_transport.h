@@ -21,7 +21,8 @@ private:
     QString m_registryUrl;
 };
 
-class RemoteTransportConnection : public LogosTransportConnection {
+class RemoteTransportConnection : public LogosTransportConnection,
+                                  public LogosTransportAsyncAcquire {
 public:
     explicit RemoteTransportConnection(const QString& registryUrl);
     ~RemoteTransportConnection() override;
@@ -30,6 +31,12 @@ public:
     bool isConnected() const override;
     bool reconnect() override;
     LogosObject* requestObject(const QString& objectName, int timeoutMs) override;
+
+    // Non-blocking acquire; see LogosTransportAsyncAcquire. Costs one pending
+    // QRemoteObjectDynamicReplica and NO timer of ours — the node is already
+    // retrying the endpoint every 250 ms whether or not anyone is waiting.
+    bool requestObjectWhenAvailable(const QString& objectName,
+                                    AcquireCallback onReady) override;
 
     // Test hook: how many times requestObject() acquired a fresh replica
     // (process-wide). Lets a test assert the consumer's handle cache reuses one
@@ -41,6 +48,10 @@ private:
     bool connectToRegistry();
 
     QRemoteObjectNode* m_node;
+    // Parent of every in-flight PendingAcquire (defined in the .cpp). Destroying
+    // it cancels them; it is reset explicitly at the TOP of the destructor so
+    // pending replicas die before the node they belong to.
+    QObject* m_pendingAcquires;
     // Does the registry endpoint currently have a listener?
     //
     // Separate from m_connected because connectToNode() cannot answer it: it
