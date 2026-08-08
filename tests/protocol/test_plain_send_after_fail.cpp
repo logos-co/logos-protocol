@@ -53,7 +53,7 @@
 // asserted about a single round: each runs many and asserts on the aggregate.
 // It leans on std::mutex BARGING — a hot thread taking a just-released mutex
 // ahead of a waiter the kernel is still waking — which is how both libc++ on
-// Darwin (measured: 39 of 40 rounds) and glibc's default non-PI mutex behave,
+// Darwin (measured: 39-40 of 40 rounds) and glibc's default non-PI mutex behave,
 // neither of which promises it. An implementation that instead handed ownership
 // straight to the queued waiter would reach the interleaving in NO round, and
 // the "was never reached" assertions below are there so that shows up as a
@@ -74,17 +74,17 @@
 // not against a switch, a build option or a getenv() probe in this tree. The
 // numbers those runs produced on an aarch64-darwin box are recorded on each
 // test below. Summarised: the parking trick reaches the target interleaving in
-// 39 of 40 rounds, all four tests are RED on cf1b9b0, and the suite spends
-// 154 seconds there against 9 here — almost all of it callers sitting out
-// deadlines that had already been decided.
+// 39-40 of 40 rounds, all four tests are RED on cf1b9b0, and they take 159
+// seconds there against 9 here — almost all of the difference is callers
+// sitting out deadlines that had already been decided.
 //
 // WHICH OF THESE ARE DETECTORS OF WHAT, because it is not uniform:
 //
 //   * tests 1-3 detect the DROPPED call. Each is red on cf1b9b0 by a wide
-//     margin (39/40 calls never answered; 39/40 answered as "timeout" at
-//     833ms; a 5053ms getMethods).
+//     margin (40/40 calls never answered; 40/40 answered as "timeout" at
+//     828ms; a 5049ms getMethods).
 //   * test 4 detects it only weakly — the unaided race is a few instructions
-//     wide, and cf1b9b0 loses 5 calls in 10,000. What test 4 is a strong
+//     wide, and cf1b9b0 loses 14 calls in 10,000. What test 4 is a strong
 //     detector of is the DOUBLE, which is the failure the fix could newly
 //     introduce; see the note on it.
 
@@ -163,15 +163,36 @@ template struct Rob<PendingMethodsTag, &LocalConn::m_pendingMethods>;
 // A provider on the far end of the socketpair that answers everything at once.
 // It exists so the warm-up call in the object-level test completes for real;
 // the racing call never reaches it, because the connection dies first.
+//
+// It can also be told to HOLD its replies. That is what lets the volume test
+// below guarantee — rather than hope — that fail()'s sweep has something to
+// sweep at the moment it runs.
 class EagerProvider : public IncomingCallHandler {
 public:
     void onCall(const CallMessage& req, CallReply reply) override
     {
+        if (m_hold.load()) {
+            std::lock_guard<std::mutex> g(m_mu);
+            m_held.push_back(std::move(reply));
+            return;
+        }
         ResultMessage res;
         res.id = req.id;
         res.ok = true;
         res.value = RpcValue{static_cast<int64_t>(1)};
         reply(std::move(res));
+    }
+
+    void hold(bool on) { m_hold.store(on); }
+    void dropHeld()
+    {
+        std::vector<CallReply> gone;
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            gone.swap(m_held);
+        }
+        // Destroyed here, outside the lock: each closure holds a share of its
+        // connection, so this is also what lets that connection die.
     }
     void onMethods(const MethodsMessage& req, MethodsReply reply) override
     {
@@ -181,6 +202,11 @@ public:
     void onUnsubscribe(const UnsubscribeMessage&, const void*) override {}
     void onConnectionClosed(const void*) override {}
     void onToken(const TokenMessage&) override {}
+
+private:
+    std::atomic<bool>      m_hold{false};
+    std::mutex             m_mu;
+    std::vector<CallReply> m_held;
 };
 
 // One io_context and worker thread, shared by every connection a test builds.
@@ -337,10 +363,10 @@ protected:
 // measured is the registration itself rather than anything the handle does to
 // compensate for it.
 //
-// PRE-FIX (cf1b9b0), 40 rounds: 39 rounds reached the interleaving and in all
-// 39 the handler was NEVER INVOKED, each leaving its registration parked in the
-// pending map of a connection that had already been torn down (unanswered=39,
-// leaked=39). POST-FIX: reached 40, unanswered 0, leaked 0.
+// PRE-FIX (cf1b9b0), 40 rounds: ALL 40 reached the interleaving and in all 40
+// the handler was NEVER INVOKED, each leaving its registration parked in the
+// pending map of a connection that had already been torn down (unanswered=40,
+// leaked=40). POST-FIX: 39-40 answered by the reclaim, unanswered 0, leaked 0.
 TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswered)
 {
     IoWorker io;
@@ -421,10 +447,10 @@ TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswere
 // party, since the transport knew the connection was gone before the call was
 // ever written.
 //
-// PRE-FIX (cf1b9b0), 40 rounds with an 800ms deadline: 39 were answered only by
-// the deadline — worst 833ms — with code "timeout". POST-FIX: 0 reported as a
-// timeout, worst latency 88ms (which is this test's own 30ms parking sleep plus
-// the hop through the Qt loop).
+// PRE-FIX (cf1b9b0), 40 rounds with an 800ms deadline: all 40 were answered only
+// by the deadline — worst 828ms — with code "timeout". POST-FIX: 0 reported as a
+// timeout, worst latency 30-88ms (which is this test's own 30ms parking sleep
+// plus the hop through the Qt loop).
 TEST_F(PlainSendAfterFailTest,
        TheCallerIsToldTheTransportClosedInsteadOfWaitingOutItsDeadline)
 {
@@ -531,10 +557,10 @@ TEST_F(PlainSendAfterFailTest,
 // losing this registration is a fixed five-second stall per introspection —
 // which is what module discovery does on a connection that has just dropped.
 //
-// PRE-FIX (cf1b9b0), 25 rounds: 23 reached the interleaving and each blocked its
-// caller for the full five seconds (worst 5053ms) before giving up with no
-// answer, leaving 23 promises parked on dead connections. POST-FIX: worst wait
-// 44ms, 0 promises left.
+// PRE-FIX (cf1b9b0), 25 rounds: 24 reached the interleaving and each blocked its
+// caller for the full five seconds (worst 5049ms) before giving up with no
+// answer, leaving 24 promises parked on dead connections. POST-FIX: worst wait
+// 30-44ms, 0 promises left.
 TEST_F(PlainSendAfterFailTest,
        GetMethodsDoesNotWaitOutItsFiveSecondFutureWhenTheConnectionFails)
 {
@@ -608,7 +634,7 @@ TEST_F(PlainSendAfterFailTest,
 // fix rather than an imaginary one: a throwaway checkout in which sendCallAsync
 // COPIES its handler into the map and then delivers that copy without the
 // extract-and-erase (the "I already have the handler, why look it up" version).
-// It reports 5, 5, 7 and 10 doubles per 10,000 over four runs. Thrown away with
+// It reports 4, 6, 7 and 8 doubles per 10,000 over four runs. Thrown away with
 // the checkout; nothing in this tree switches it on.
 //
 // AND WHY IT IS NEEDED AT ALL, given the suite already has a 10,000-call
@@ -618,18 +644,21 @@ TEST_F(PlainSendAfterFailTest,
 // stays up, so sendCallAsync's stopped branch is never taken. The contended
 // object has to be the connection.
 //
-// PRE-FIX (cf1b9b0): 5 of the 10,000 calls dropped — a real but weak signal,
-// since the unaided window is only a few instructions wide (tests 1-3 are the
-// wide detectors of the drop). POST-FIX: 0 dropped, 0 doubled.
+// PRE-FIX (cf1b9b0): 14 of the 10,000 calls dropped, and 14 registrations left
+// on dead connections — a real but weak signal, since the unaided window is only
+// a few instructions wide (tests 1-3 are the wide detectors of the drop).
+// POST-FIX: 0 dropped, 0 doubled, over 8 runs.
 TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallExactlyOnce)
 {
     IoWorker io;
     EagerProvider provider;
 
-    constexpr int kRounds  = 10;
-    constexpr int kThreads = 4;
-    constexpr int kPer     = 250;   // 10 x 4 x 250 = 10,000 calls
-    constexpr int kTotal   = kRounds * kThreads * kPer;
+    constexpr int kRounds   = 10;
+    constexpr int kWarm     = 40;
+    constexpr int kThreads  = 4;
+    constexpr int kPer      = 240;
+    constexpr int kPerRound = kWarm + kThreads * kPer;   // 1,000
+    constexpr int kTotal    = kRounds * kPerRound;       // 10,000
 
     int doubled  = 0;
     int dropped  = 0;
@@ -643,49 +672,78 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
         Wire w = makeWire(io.ioc(), &provider);
         ASSERT_NE(w.client, nullptr);
         auto client = w.client;
+        provider.hold(false);
 
         // Shared-owned for the same reason as Outcome above: a handler that
         // loses the race still runs, on a thread this loop does not join.
-        auto counts = std::make_shared<std::vector<std::atomic<int>>>(kThreads * kPer);
+        auto counts = std::make_shared<std::vector<std::atomic<int>>>(kPerRound);
         auto reply  = std::make_shared<std::atomic<int>>(0);
         auto closed = std::make_shared<std::atomic<int>>(0);
         auto swept  = std::make_shared<std::atomic<int>>(0);
+        auto issued = std::make_shared<std::atomic<int>>(0);
+
+        auto send = [client, counts, reply, closed, swept](int slot) {
+            CallMessage msg;
+            msg.id     = client->nextId();
+            msg.object = "probe";
+            msg.method = "ping";
+            client->sendCallAsync(std::move(msg),
+                [counts, reply, closed, swept, slot](ResultMessage res) {
+                    if (res.ok)                                 reply->fetch_add(1);
+                    else if (res.errCode == "TRANSPORT_CLOSED") closed->fetch_add(1);
+                    else                                        swept->fetch_add(1);
+                    (*counts)[slot].fetch_add(1);
+                });
+        };
+
+        // ── EACH RESOLVER IS MADE LIVE BY CONSTRUCTION, NOT BY TIMING ────────
+        //
+        // The three "this resolver ran" assertions at the bottom are what stops
+        // a green run from being vacuous, so none of them may rest on a sleep.
+        // An earlier cut set the teardown off after a fixed delay and then after
+        // the first reply, and both are wrong in opposite directions on a slow
+        // box: the first landed the stop ahead of the whole burst, and the
+        // second behind all of it (measured on a 3-core macOS CI runner — 0
+        // calls took the stopped path, so the run proved nothing about it).
+        //
+        // Phase 1 answers normally and is WAITED for, which is what makes a
+        // reply-resolved call certain.
+        for (int i = 0; i < kWarm; ++i) send(i);
+        {
+            QElapsedTimer t; t.start();
+            while (reply->load() == 0 && t.elapsed() < 15000)
+                std::this_thread::yield();
+        }
+        ASSERT_GT(reply->load(), 0)
+            << "round " << r << ": the provider never answered anything";
+
+        // Phase 2 answers NOTHING — the provider holds every reply — so every
+        // call registered between here and the stop is still pending when
+        // fail() sweeps, which is what makes a sweep-resolved call certain.
+        provider.hold(true);
 
         std::vector<std::thread> callers;
         callers.reserve(kThreads);
         for (int t = 0; t < kThreads; ++t) {
-            callers.emplace_back([client, counts, reply, closed, swept, t] {
+            callers.emplace_back([send, issued, t] {
                 for (int i = 0; i < kPer; ++i) {
-                    const int slot = t * kPer + i;
-                    CallMessage msg;
-                    msg.id = client->nextId();
-                    msg.object = "probe";
-                    msg.method = "ping";
-                    client->sendCallAsync(std::move(msg),
-                        [counts, reply, closed, swept, slot](ResultMessage res) {
-                            if (res.ok)                                 reply->fetch_add(1);
-                            else if (res.errCode == "TRANSPORT_CLOSED") closed->fetch_add(1);
-                            else                                        swept->fetch_add(1);
-                            (*counts)[slot].fetch_add(1);
-                        });
+                    send(kWarm + t * kPer + i);
+                    issued->fetch_add(1);
                 }
             });
         }
 
-        // Land the teardown inside the burst, sweeping where across rounds.
-        //
-        // The trigger is a REPLY rather than a sleep, because "some calls were
-        // answered normally" is asserted below and a sleep does not guarantee
-        // it: under Guard Malloc, or on a loaded CI runner, everything before
-        // the first reply takes long enough that a fixed delay lands the stop
-        // ahead of the whole burst. Waiting for the wire to prove itself live
-        // and only then jittering makes the assertion structural.
+        // And the stop is triggered by a COUNT of registrations rather than a
+        // clock, so calls are still being issued when it lands however slow the
+        // box is — which is what makes a reclaim-resolved call certain. The
+        // trigger sweeps across rounds and stays far below the 960 the burst
+        // will issue.
+        const int trigger = 80 + r * 60;
         {
             QElapsedTimer t; t.start();
-            while (reply->load() == 0 && t.elapsed() < 5000)
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            while (issued->load() < trigger && t.elapsed() < 15000)
+                std::this_thread::yield();
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(200 + r * 350));
         client->stop("peer vanished mid-burst");
 
         for (auto& th : callers) th.join();
@@ -702,6 +760,7 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
 
         leaked += static_cast<int>(pendingCalls(client));
         w.provider->stop();
+        provider.dropHeld();
     }
 
     std::cout << "  " << kTotal << " calls racing stop() -> answered=" << answered
@@ -717,7 +776,9 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
            "no longer makes the reclaim and fail()'s sweep mutually exclusive";
     EXPECT_EQ(leaked, 0);
     // All three resolvers have to have been live, or the burst did not straddle
-    // the teardown and this test raced nothing.
+    // the teardown and this test raced nothing. Each is arranged for above
+    // rather than hoped for; a failure here is a broken harness, not a broken
+    // transport, and says which of the three did not run.
     EXPECT_GT(byReply, 0)  << "no call was answered by a reply";
     EXPECT_GT(bySweep, 0)  << "no call was answered by fail()'s sweep";
     EXPECT_GT(byClosed, 0) << "no call was answered as a stopped connection";
