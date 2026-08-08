@@ -102,6 +102,7 @@ add_executable(protocol_tests
     test_concurrent_dispatch.cpp
     # The token-only handshake surface published before a module's initializer.
     test_handshake_surface.cpp
+    test_handshake_surface_transport.cpp
     # The in-band pending-call sentinel's shape check. Detection used to be a
     # bare contains(), so any user map carrying the key hung the call for the
     # full timeout. Includes what the guard does NOT close.
