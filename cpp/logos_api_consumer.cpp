@@ -340,6 +340,19 @@ private:
             // exact failure this class exists to remove. Move them back to the
             // pending set so takeMatching() below re-arms them on the new
             // handle, THEN release.
+            //
+            // NOT COVERED BY A TEST, deliberately, and it is worth knowing why
+            // before anyone simplifies it away. LogosObject::isValid() defaults
+            // to true and is overridden ONLY by qt_remote's RemoteLogosObject,
+            // so on qt_local / mock / plain a held handle is always "live" and
+            // add() short-circuits before a second acquire can start — this
+            // branch is structurally unreachable there. On qt_remote it is
+            // reachable but not reliably reproducible: QtRO shares one replica
+            // implementation per object name on a node, so a reload usually
+            // restores the old handle to Valid before the new acquire's
+            // callback runs. The branch survives on an invariant of QtRO's that
+            // nothing in this file controls; a test for it would be a race, and
+            // a racing test is worse than none.
             reviveArmed(objectName);
             handle->release();
             handle = nullptr;
