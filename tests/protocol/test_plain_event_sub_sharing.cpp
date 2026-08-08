@@ -21,15 +21,15 @@
 //
 //   ASecondHandleDoesNotStealTheFirstsCompletionChannel
 //        handle A alone         -> 8/8 answered, 0 ms avg
-//        handle A once B exists -> 0/8 answered, 1505 ms avg, 8 timeouts
+//        handle A once B exists -> 0/8 answered, 1508 ms avg, 8 timeouts
 //   TheSameTheftThroughTheRealHost
-//        handle A once B exists -> 0/4 answered, 1502 ms avg, 4 timeouts
+//        handle A once B exists -> 0/4 answered, 1501 ms avg, 4 timeouts
 //   EveryHandleGetsEveryEmission        A=0 of 5, B=5, wildcard=5
 //   ANamedAndAWildcardSubscriberEachGetOneCopy
 //                                       named=10 and wildcard=10 for 5 emissions
 //   ReleasingOneHandleLeavesTheOtherSubscribed
 //                                       B=0 of 5 after A left; host sinks=0
-//   SubscriptionsSurviveChurn           215 of 480 audited slots lost a delivery
+//   SubscriptionsSurviveChurn           214 of 480 audited slots lost a delivery
 //   ACompletionThatOvertakesItsOwnResultIsStillDelivered
 //                                       sync 4/6, async 2/4
 //   ANewConsumerAgainstAnOldHost        A=0 of 4; the old host was unsubscribed
@@ -336,6 +336,20 @@ struct WirePair {
     ~WirePair() { client->stop(); server->stop(); }
 };
 
+// A round trip that proves every frame written before it has been applied.
+//
+// Frames go out in post order on the connection's strand and are dispatched in
+// arrival order on the peer's, so a reply to a request issued LAST cannot arrive
+// before the effects of everything issued earlier — in either direction. getMethods
+// blocks on that reply, so returning from it means both the Subscribe/Unsubscribe
+// frames this side wrote AND the Event frames the peer wrote before answering have
+// been processed. That is what lets the assertions below be exact counts rather
+// than "wait a bit and hope"; a sleep here is a coin flip on a loaded CI runner.
+//
+// The probe is a handle that never subscribes to anything (getMethods does not
+// touch the completion channel), so it changes nothing it is measuring.
+void wireBarrier(PlainLogosObject* probe) { probe->getMethods(); }
+
 // Spin until `pred` holds or `budgetMs` elapses. Returns whether it held.
 template <typename Pred>
 bool waitFor(Pred pred, int budgetMs)
@@ -507,6 +521,7 @@ TEST(PlainEventSubSharingTest, EveryHandleGetsEveryEmission)
     MirrorProvider provider;
     WirePair wire(&provider);
 
+    auto* probe = new PlainLogosObject("evmod", wire.client);
     auto* a = new PlainLogosObject("evmod", wire.client);
     auto* b = new PlainLogosObject("evmod", wire.client);
     auto* c = new PlainLogosObject("evmod", wire.client);
@@ -518,15 +533,13 @@ TEST(PlainEventSubSharingTest, EveryHandleGetsEveryEmission)
     // clobber, or be clobbered by, the two named ones.
     c->onEvent(QString(), [nc](const QString&, const QVariantList&) { nc->fetch_add(1); });
 
-    ASSERT_TRUE(waitFor([&] { return provider.sinkCount() == 2; }, 2000))
-        << "expected one named sink and one wildcard sink for this connection, got "
-        << provider.sinkCount();
+    wireBarrier(probe);
+    ASSERT_EQ(provider.sinkCount(), 2)
+        << "expected one named sink and one wildcard sink for this connection";
 
     for (int i = 0; i < kEmissions; ++i)
         provider.emitEvent("evmod", "tick", QVariantList{ QVariant(i) });
-
-    waitFor([&] { return na->load() >= kEmissions && nb->load() >= kEmissions
-                      && nc->load() >= kEmissions; }, 3000);
+    wireBarrier(probe);
 
     std::cout << "  " << kEmissions << " emissions -> A=" << na->load()
               << " B=" << nb->load() << " wildcard=" << nc->load() << std::endl;
@@ -538,6 +551,7 @@ TEST(PlainEventSubSharingTest, EveryHandleGetsEveryEmission)
     a->release();
     b->release();
     c->release();
+    probe->release();
 }
 
 // ── one copy per connection, however many of its sinks match ────────────────
@@ -620,6 +634,7 @@ TEST(PlainEventSubSharingTest, ReleasingOneHandleLeavesTheOtherSubscribed)
     MirrorProvider provider;
     WirePair wire(&provider);
 
+    auto* probe = new PlainLogosObject("evmod", wire.client);
     auto* a = new PlainLogosObject("evmod", wire.client);
     auto* b = new PlainLogosObject("evmod", wire.client);
 
@@ -627,18 +642,19 @@ TEST(PlainEventSubSharingTest, ReleasingOneHandleLeavesTheOtherSubscribed)
     a->onEvent(QStringLiteral("tick"), [na](const QString&, const QVariantList&) { na->fetch_add(1); });
     b->onEvent(QStringLiteral("tick"), [nb](const QString&, const QVariantList&) { nb->fetch_add(1); });
 
-    ASSERT_TRUE(waitFor([&] { return provider.subscribeFrames() >= 2; }, 2000));
+    wireBarrier(probe);
+    ASSERT_EQ(provider.subscribeFrames(), 2);
 
     // A goes away. Its Unsubscribe must not evict the sink B is still using, and
     // must not take B's callback out of the connection's table either.
     a->release();
-    ASSERT_TRUE(waitFor([&] { return provider.sinkCount() >= 1; }, 500))
+    wireBarrier(probe);
+    ASSERT_EQ(provider.sinkCount(), 1)
         << "the host-side sink was removed while a handle was still subscribed";
 
     for (int i = 0; i < kEmissions; ++i)
         provider.emitEvent("evmod", "tick", QVariantList{ QVariant(i) });
-
-    waitFor([&] { return nb->load() >= kEmissions; }, 3000);
+    wireBarrier(probe);
 
     std::cout << "  after A released: A=" << na->load() << " B=" << nb->load()
               << " host sinks=" << provider.sinkCount() << std::endl;
@@ -648,6 +664,7 @@ TEST(PlainEventSubSharingTest, ReleasingOneHandleLeavesTheOtherSubscribed)
     EXPECT_EQ(na->load(), 0) << "a released handle must not keep receiving events";
 
     b->release();
+    probe->release();
 }
 
 // ── and teardown still removes everything ───────────────────────────────────
@@ -660,6 +677,7 @@ TEST(PlainEventSubSharingTest, TeardownRemovesEverySubscription)
     MirrorProvider provider;
     WirePair wire(&provider);
 
+    auto* probe = new PlainLogosObject("evmod", wire.client);
     auto* a = new PlainLogosObject("evmod", wire.client);
     auto* b = new PlainLogosObject("evmod", wire.client);
 
@@ -668,12 +686,14 @@ TEST(PlainEventSubSharingTest, TeardownRemovesEverySubscription)
     b->onEvent(QStringLiteral("tick"), [nb](const QString&, const QVariantList&) { nb->fetch_add(1); });
     a->onEvent(QStringLiteral("tock"), [na](const QString&, const QVariantList&) { na->fetch_add(1); });
 
-    ASSERT_TRUE(waitFor([&] { return provider.sinkCount() == 2; }, 2000));
+    wireBarrier(probe);
+    ASSERT_EQ(provider.sinkCount(), 2);
 
     a->release();
     b->release();
+    wireBarrier(probe);
 
-    EXPECT_TRUE(waitFor([&] { return provider.sinkCount() == 0; }, 2000))
+    EXPECT_EQ(provider.sinkCount(), 0)
         << "the host still holds " << provider.sinkCount()
         << " sink(s) after every handle was released";
 
@@ -684,7 +704,7 @@ TEST(PlainEventSubSharingTest, TeardownRemovesEverySubscription)
     evt.eventName = "tick";
     evt.data      = qvariantListToRpcList(QVariantList{ QVariant(1) });
     wire.server->sendEvent(std::move(evt));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    wireBarrier(probe);
 
     std::cout << "  after teardown: sinks=" << provider.sinkCount()
               << " unsubscribe frames=" << provider.unsubscribeFrames()
@@ -693,6 +713,7 @@ TEST(PlainEventSubSharingTest, TeardownRemovesEverySubscription)
 
     EXPECT_EQ(na->load(), 0);
     EXPECT_EQ(nb->load(), 0);
+    probe->release();
 }
 
 // ── no subscription is lost under subscribe / unsubscribe / release churn ───
@@ -710,6 +731,7 @@ TEST(PlainEventSubSharingTest, SubscriptionsSurviveChurn)
 
     MirrorProvider provider;
     WirePair wire(&provider);
+    auto* probe = new PlainLogosObject("churn", wire.client);
 
     struct Handle {
         PlainLogosObject* obj = nullptr;
@@ -764,18 +786,16 @@ TEST(PlainEventSubSharingTest, SubscriptionsSurviveChurn)
         while (arrived.load(std::memory_order_acquire) < kThreads)
             std::this_thread::yield();
 
-        // Quiesced: nothing is churning now. Let the wire settle, then audit.
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        // Quiesced: nothing is churning now, and the barrier proves every frame
+        // the churn produced has reached the provider. The audit that follows is
+        // therefore an EXACT count, not a poll with a timeout.
+        wireBarrier(probe);
         int live = 0;
         for (auto& s : handles) if (s.subscribed) ++live;
         for (auto& s : handles) if (s.subscribed) ++s.expected;
 
         provider.emitEvent("churn", "beat", QVariantList{ QVariant(r) });
-
-        waitFor([&] {
-            for (auto& s : handles) if (s.hits->load() < s.expected) return false;
-            return true;
-        }, 2000);
+        wireBarrier(probe);
 
         for (auto& s : handles) {
             ++audited;
@@ -799,6 +819,7 @@ TEST(PlainEventSubSharingTest, SubscriptionsSurviveChurn)
                                           "not subscribed for";
 
     for (auto& s : handles) if (s.obj) s.obj->release();
+    probe->release();
 }
 
 // ── a completion that overtakes its own Result is still delivered ────────────
@@ -873,6 +894,7 @@ TEST(PlainEventSubSharingTest, ANewConsumerAgainstAnOldHost)
     oldHost.setLegacyFanOut(true);
     WirePair wire(&oldHost);
 
+    auto* probe = new PlainLogosObject("evmod", wire.client);
     auto* a = new PlainLogosObject("evmod", wire.client);
     auto* b = new PlainLogosObject("evmod", wire.client);
 
@@ -880,22 +902,24 @@ TEST(PlainEventSubSharingTest, ANewConsumerAgainstAnOldHost)
     a->onEvent(QStringLiteral("tick"), [na](const QString&, const QVariantList&) { na->fetch_add(1); });
     b->onEvent(QStringLiteral("tick"), [nb](const QString&, const QVariantList&) { nb->fetch_add(1); });
 
-    ASSERT_TRUE(waitFor([&] { return oldHost.subscribeFrames() >= 2; }, 2000));
+    wireBarrier(probe);
+    ASSERT_EQ(oldHost.subscribeFrames(), 2);
     // An old host holds ONE sink for the pair however many Subscribes arrive —
     // which is exactly why the consumer, not the host, has to demultiplex.
     EXPECT_EQ(oldHost.sinkCount(), 1);
 
     for (int i = 0; i < kEmissions; ++i)
         oldHost.emitEvent("evmod", "tick", QVariantList{ QVariant(i) });
-    waitFor([&] { return na->load() >= kEmissions && nb->load() >= kEmissions; }, 3000);
+    wireBarrier(probe);
     EXPECT_EQ(na->load(), kEmissions);
     EXPECT_EQ(nb->load(), kEmissions);
 
     // A leaves; the old host is told nothing, so B keeps its sink.
     a->release();
+    wireBarrier(probe);
     for (int i = 0; i < kEmissions; ++i)
         oldHost.emitEvent("evmod", "tick", QVariantList{ QVariant(i) });
-    waitFor([&] { return nb->load() >= 2 * kEmissions; }, 3000);
+    wireBarrier(probe);
 
     std::cout << "  new consumer / old host: A=" << na->load() << " B=" << nb->load()
               << " sinks=" << oldHost.sinkCount()
@@ -907,8 +931,10 @@ TEST(PlainEventSubSharingTest, ANewConsumerAgainstAnOldHost)
 
     // B leaves: now the old host hears about it, and its table is empty.
     b->release();
-    EXPECT_TRUE(waitFor([&] { return oldHost.sinkCount() == 0; }, 2000));
+    wireBarrier(probe);
+    EXPECT_EQ(oldHost.sinkCount(), 0);
     EXPECT_EQ(oldHost.unsubscribeFrames(), 1);
+    probe->release();
 }
 
 // ── mixed versions, direction 2: an OLD consumer against the NEW host ───────
@@ -962,8 +988,12 @@ TEST(PlainEventSubSharingTest, AnOldConsumersFrameSequenceAgainstTheNewHost)
             off += n;
         }
     };
-    // Pump both sides for a while, collecting any Event frames that arrive.
-    const auto pumpFor = [&](int ms, std::vector<EventMessage>* into) {
+    std::vector<EventMessage> events;
+    std::atomic<uint64_t> lastMethodsResult{0};
+
+    // Pump both sides for a while, collecting Event frames and noting the id of
+    // any MethodsResult that comes back (the barrier below reads that).
+    const auto pumpFor = [&](int ms) {
         QElapsedTimer t; t.start();
         while (t.elapsed() < ms) {
             QCoreApplication::processEvents(QEventLoop::AllEvents, 1);
@@ -974,28 +1004,47 @@ TEST(PlainEventSubSharingTest, AnOldConsumersFrameSequenceAgainstTheNewHost)
             MessageType tag;
             std::vector<uint8_t> payload;
             while (reader.next(tag, payload)) {
-                if (tag != MessageType::Event) continue;
                 auto any = codec->decode(tag, payload.data(), payload.size());
-                if (into) into->push_back(std::get<EventMessage>(any));
+                if (tag == MessageType::Event)
+                    events.push_back(std::get<EventMessage>(any));
+                else if (tag == MessageType::MethodsResult)
+                    lastMethodsResult.store(std::get<MethodsResultMessage>(any).id);
             }
         }
     };
+
+    // AN IN-BAND BARRIER instead of a sleep, because a sleep here is a coin flip
+    // on a loaded runner and a wrong one fails the test rather than skipping it.
+    // A Methods request travels the same socket and is dispatched on the same
+    // strand as everything written before it, and its reply comes back only after
+    // the host's Qt thread has answered — so a MethodsResult in hand proves every
+    // earlier Subscribe/Unsubscribe frame has been applied.
+    uint64_t barrierId = 1000;
+    const auto barrier = [&]() {
+        const uint64_t id = ++barrierId;
+        writeMsg(MethodsMessage{id, "tok", "emitmod"});
+        QElapsedTimer t; t.start();
+        while (lastMethodsResult.load() != id && t.elapsed() < 10000) pumpFor(10);
+        return lastMethodsResult.load() == id;
+    };
+
     // Emitting straight through the module, so no Call frame (and no token
-    // handshake) is needed to make the host fan an event out. The settle first is
-    // not optional: the frames written above are read on the host's io thread, and
-    // an emission that beats them out would prove nothing.
-    const auto emitAndCount = [&](int budgetMs) {
-        pumpFor(250, nullptr);
-        std::vector<EventMessage> events;
+    // handshake) is needed to make the host fan an event out.
+    const auto emitAndCount = [&]() {
+        events.clear();
         mod.callMethod(QStringLiteral("ping"), QVariantList{});
-        pumpFor(budgetMs, &events);
+        // One more barrier: the Event frame is written on the same strand and
+        // therefore lands ahead of the MethodsResult that follows it.
+        barrier();
+        pumpFor(50);
         return events;
     };
 
     // Two "handles", each sending its own Subscribe frame for the same pair.
     writeMsg(SubscribeMessage{"emitmod", "tick"});
     writeMsg(SubscribeMessage{"emitmod", "tick"});
-    auto got = emitAndCount(400);
+    ASSERT_TRUE(barrier()) << "the host never answered — nothing below is meaningful";
+    auto got = emitAndCount();
     ASSERT_EQ(got.size(), 1u)
         << "an old peer must still get exactly one copy per emission";
     // The frame itself is byte-for-byte what it always was.
@@ -1008,19 +1057,22 @@ TEST(PlainEventSubSharingTest, AnOldConsumersFrameSequenceAgainstTheNewHost)
     // both by name and by wildcard, it used to be sent two copies of the same
     // event and delivered each to both of its callbacks. Now it is sent one.
     writeMsg(SubscribeMessage{"emitmod", ""});
-    got = emitAndCount(400);
+    ASSERT_TRUE(barrier());
+    got = emitAndCount();
     EXPECT_EQ(got.size(), 1u)
         << "a connection matching twice must still be sent one copy";
 
     // And its per-handle Unsubscribe frames still mean what they always meant.
     writeMsg(UnsubscribeMessage{"emitmod", ""});
     writeMsg(UnsubscribeMessage{"emitmod", "tick"});
-    got = emitAndCount(400);
+    ASSERT_TRUE(barrier());
+    got = emitAndCount();
     EXPECT_EQ(got.size(), 0u) << "the host kept sending after Unsubscribe";
     // A second, redundant Unsubscribe (an old consumer sends one per handle)
     // must be harmless.
     writeMsg(UnsubscribeMessage{"emitmod", "tick"});
-    got = emitAndCount(300);
+    ASSERT_TRUE(barrier());
+    got = emitAndCount();
     EXPECT_EQ(got.size(), 0u);
 
     sock.close(ec);
