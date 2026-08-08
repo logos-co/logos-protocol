@@ -602,6 +602,25 @@ TEST_F(NoQtLoopTest, ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop)
                                              d->record(i, std::move(v), e);
                                          });
         }
+        // WAIT FOR THE FIRST REPLY, then release — and this is not a tidy-up,
+        // it is what makes the test a race at all.
+        //
+        // In this binary the provider and the consumer share the process's ONE
+        // io thread (the QtFreeHandler runs on the same strand that writes the
+        // client's frames), unlike the Qt twin in test_iofold.cpp whose provider
+        // sits on its own QThread. So the issuing thread can enqueue all 500
+        // calls and release before the io thread has drained a single one: on a
+        // slow sandbox that produced answered-by-reply=0,
+        // cancelled-by-teardown=10000 — one resolver, no race, and the
+        // exactly-once assertions below reduced to decoration. (It still
+        // reported 0 doubles and 0 drops, which is exactly why the
+        // "both resolvers were live" guards further down have to exist.)
+        //
+        // Waiting for one delivery proves the reply path is running; with 500
+        // calls in the burst, hundreds are still outstanding for teardown to
+        // cancel. The jittered nudge then sweeps where in the burst it lands.
+        ASSERT_TRUE(waitFor(*d, 1, 20000))
+            << "round " << r << ": no reply came back at all before the release";
         std::this_thread::sleep_for(std::chrono::microseconds((r % 6) * 120));
         obj->release();
 

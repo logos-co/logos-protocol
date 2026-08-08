@@ -480,10 +480,18 @@ TEST_F(SyncCallReleaseRaceTest, ConcurrentCallersThatHaveReturnedAreNotAccused)
 
 // The shipped reentrant shape: an event callback, running on the io thread,
 // releasing the handle it was delivered through. test_iofold.cpp pins that this
-// does not wedge; what it has to also not do now is trip the detector, because
-// the count is read from the io thread while the main thread is nowhere near a
-// call. (It is also the shape the thread-local depth in the detector exists to
-// tolerate if a future guarded method ever does invoke user code.)
+// does not wedge; what it has to also not do is trip the detector, because the
+// count is read from the io thread while the main thread is nowhere near a call
+// on that handle. (It is also the shape the thread-local depth in the detector
+// exists to tolerate if a future guarded method ever does invoke user code.)
+//
+// THE EVENT IS TRIGGERED THROUGH A SECOND HANDLE, for the reason spelled out in
+// test_iofold.cpp: firing through the handle that is about to be released means
+// the io thread destroys it while the main thread is still inside its
+// callMethodAsyncWithError, which is the very contract violation this file
+// documents, and it would make this test's outcome depend on winning a race it
+// is not about. (The detector found that in both tests; with the window widened
+// by hand it reports callMethodAsyncWithError() by name.)
 TEST_F(SyncCallReleaseRaceTest, ReleaseFromInsideAnEventCallbackIsNotAccused)
 {
     LiveHost host;
@@ -493,8 +501,11 @@ TEST_F(SyncCallReleaseRaceTest, ReleaseFromInsideAnEventCallbackIsNotAccused)
 
     LogosObject* obj = conn->requestObject(QStringLiteral("racer_module"), 5000);
     ASSERT_NE(obj, nullptr);
-    auto* ch = channelFor(obj);
-    ASSERT_NE(ch, nullptr);
+
+    LogosObject* trigger = conn->requestObject(QStringLiteral("racer_module"), 5000);
+    ASSERT_NE(trigger, nullptr);
+    auto* triggerCh = channelFor(trigger);
+    ASSERT_NE(triggerCh, nullptr);
 
     std::atomic<bool> released{false};
     std::atomic<bool> onIoThread{false};
@@ -507,10 +518,10 @@ TEST_F(SyncCallReleaseRaceTest, ReleaseFromInsideAnEventCallbackIsNotAccused)
     });
 
     std::atomic<int> fired{0};
-    ch->callMethodAsyncWithError(kToken, QStringLiteral("fire"), {}, 5000,
-                                 [&fired](QVariant, const logos::CallError&) {
-                                     fired.fetch_add(1);
-                                 });
+    triggerCh->callMethodAsyncWithError(kToken, QStringLiteral("fire"), {}, 5000,
+                                        [&fired](QVariant, const logos::CallError&) {
+                                            fired.fetch_add(1);
+                                        });
 
     QElapsedTimer t;
     t.start();
@@ -526,4 +537,6 @@ TEST_F(SyncCallReleaseRaceTest, ReleaseFromInsideAnEventCallbackIsNotAccused)
            "exercising the reentrancy it claims to";
     host.provider().letGo();
     pump(200);
+    trigger->release();
+    pump(50);
 }

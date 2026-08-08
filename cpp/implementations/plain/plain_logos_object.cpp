@@ -520,26 +520,52 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
 // become an exported thread-local in the shared build.
 static thread_local int t_entryDepth = 0;
 
+// THE COUNTER IS THE FIRST AND THE LAST THING EITHER OF THESE TOUCHES, and that
+// ordering is the whole safety argument for the detector itself.
+//
+// A guard whose bookkeeping outlives its own count is a use-after-free the
+// detector INVENTED. The first cut restored m_lastEntryPoint after the
+// decrement, which opens a window exactly one store wide: the count reaches
+// zero, a release() racing on another thread reads zero, decides nothing is in
+// flight and runs `delete this` — and then that store lands in freed memory.
+// It is not theoretical; it segfaulted a CI run on Linux, in an existing test
+// whose io-thread event callback releases the handle (IoFoldTest
+// .ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge), and it is precisely
+// the class of bug this whole change is about — introduced by the thing meant
+// to detect it.
+//
+// So: raise the count before any other access, drop it after every other
+// access. Between those two points the object is covered — a concurrent
+// release() sees a non-zero count and REPORTS instead of silently racing.
+// Outside them the guard touches nothing at all. The residual instant is the
+// increment itself, and code that can lose there was already about to fault on
+// m_conn one line later.
+//
+// The cost is a slightly vaguer message: restoring the name before the
+// decrement means a concurrent reader can see the OUTER frame's name rather
+// than the inner one. That is a diagnostic string; correctness of the count is
+// what matters, and a vaguer string beats a store into freed memory.
 PlainLogosObject::EntryGuard::EntryGuard(PlainLogosObject* obj,
                                          const char* entryPoint)
     : m_obj(obj)
-    , m_prev(obj->m_lastEntryPoint.exchange(entryPoint,
-                                            std::memory_order_relaxed))
+    , m_prev(nullptr)
 {
-    ++t_entryDepth;
-    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);
+    ++t_entryDepth;                                        // thread-local
+    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);   // FIRST
+    m_prev = m_obj->m_lastEntryPoint.exchange(entryPoint,
+                                              std::memory_order_relaxed);
 }
 
 PlainLogosObject::EntryGuard::~EntryGuard()
 {
-    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);
-    --t_entryDepth;
-    // Hand the name back, so a nested entry does not leave the diagnostic
+    // Hand the name back first, so a nested entry does not leave the diagnostic
     // blaming onEvent() for a caller that is really parked in
     // callMethodWithError(). Across threads this is last-writer-wins and
     // therefore approximate — it names ONE of the callers in flight, which is
     // all the message claims.
     m_obj->m_lastEntryPoint.store(m_prev, std::memory_order_relaxed);
+    --t_entryDepth;                                        // thread-local
+    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);   // LAST
 }
 
 void PlainLogosObject::reportConcurrentCallers(const char* where) const

@@ -1444,6 +1444,13 @@ TEST_F(IoFoldTest, ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge)
     auto* ch = channelFor(obj);
     ASSERT_NE(ch, nullptr);
 
+    // A SECOND handle, whose only job is to trigger the event, and it is not
+    // decoration — see the note below the subscription.
+    LogosObject* trigger = conn->requestObject(QStringLiteral("omni_module"), 5000);
+    ASSERT_NE(trigger, nullptr);
+    auto* triggerCh = channelFor(trigger);
+    ASSERT_NE(triggerCh, nullptr);
+
     std::atomic<bool> releasedFromCallback{false};
     std::atomic<bool> onIoThread{false};
     const std::thread::id mainThread = std::this_thread::get_id();
@@ -1454,6 +1461,32 @@ TEST_F(IoFoldTest, ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge)
                      obj->release();                 // reentrant, on the io thread
                      releasedFromCallback.store(true);
                  });
+
+    // WHY THE TRIGGER IS A DIFFERENT HANDLE. This test used to issue the `fire`
+    // call on `obj` itself, which meant the io thread could run obj->release()
+    // while the main thread was still inside obj's own
+    // callMethodAsyncWithError — a call racing its own handle's destruction,
+    // which is undefined behaviour regardless of what this test is about.
+    //
+    // Be exact about the history, because it is easy to overclaim. The
+    // violation was always there and was always UB; it was also always SILENT,
+    // because the pre-existing code touches no member after sendCallAsync()
+    // returns, so losing the race cost nothing observable. That stopped being
+    // true the moment the release()-teardown detector added bookkeeping to the
+    // epilogue of every entry point, and the next Linux CI run segfaulted here.
+    // Two things came out of that, and both are fixed: the detector's guard now
+    // touches the object only between raising and dropping its count (see
+    // EntryGuard in plain_logos_object.cpp), and this test stops violating the
+    // contract. Widen the window by hand and the detector names it exactly:
+    //
+    //   LOGOS FATAL: PlainLogosObject::release() on 'omni_module' ran while
+    //   1 call(s) from other threads are still inside this object (most recent
+    //   entry: PlainLogosObject::callMethodAsyncWithError()).
+    //
+    // Firing through a second handle removes that unrelated violation and
+    // changes nothing about the subject: the event still arrives on the io
+    // thread, the handler still releases the handle it was delivered through,
+    // and that handle still has an outstanding call for teardown to cancel.
 
     // A call left outstanding, so the reentrant release has real work to do:
     // it must cancel this and deliver its callback.
@@ -1481,10 +1514,10 @@ TEST_F(IoFoldTest, ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge)
     // Fire the event. The provider's own reply to `fire` is irrelevant; what
     // matters is that the event handler runs on the io thread and releases.
     auto fired = std::make_shared<Deliveries>(1);
-    ch->callMethodAsyncWithError(kToken, QStringLiteral("fire"), {}, 5000,
-                                 [fired](QVariant v, const logos::CallError& e) {
-                                     fired->record(0, std::move(v), e);
-                                 });
+    triggerCh->callMethodAsyncWithError(kToken, QStringLiteral("fire"), {}, 5000,
+                                        [fired](QVariant v, const logos::CallError& e) {
+                                            fired->record(0, std::move(v), e);
+                                        });
 
     QElapsedTimer t;
     t.start();
@@ -1511,4 +1544,6 @@ TEST_F(IoFoldTest, ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge)
 
     host.provider().letGo();
     pump(200);
+    trigger->release();
+    pump(50);
 }
