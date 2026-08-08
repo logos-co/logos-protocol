@@ -245,11 +245,23 @@ lp_subscription* lp_subscribe(lp_client* client,
                               lp_event_cb cb,
                               void* user_data);
 
-/** Cancel a subscription. After this returns the callback will not fire
- *  again (already-running invocations are allowed to finish first), and the
- *  client stops tracking it — a subscription cancelled while still waiting for
- *  its module leaves the retry machinery entirely instead of being warned
- *  about forever. */
+/** Cancel a subscription. After this returns the callback will not fire again
+ *  (already-running invocations are allowed to finish first) — that part is
+ *  synchronous and unconditional.
+ *
+ *  The client also stops TRACKING it, so a subscription cancelled while still
+ *  waiting for its module leaves the retry machinery instead of being warned
+ *  about forever. That half is EVENTUAL, not immediate: it is posted to the
+ *  client's owner thread and takes effect on a later turn of that thread's
+ *  event loop. Doing it synchronously would mean blocking on the owner thread
+ *  while holding a lock that thread's delivery callback also takes — a
+ *  deadlock, and an outright hang once that event loop has stopped, which is
+ *  exactly when a language binding's subscription handle is dropped.
+ *
+ *  Consequence for callers: lp_pending_subscriptions() may still list a
+ *  just-cancelled subscription until the owner thread runs. If the client is
+ *  destroyed first the cancellation simply never runs, which is correct — the
+ *  registry died with it. */
 void lp_unsubscribe(lp_subscription* sub);
 
 /** Diagnostics: a JSON array of "<module>::<event>" for every subscription on

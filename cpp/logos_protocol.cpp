@@ -461,9 +461,51 @@ void lp_unsubscribe(lp_subscription* sub)
     // pendingEventSubscriptions() diagnostics this whole change relies on for
     // its own credibility.
     if (sub->id && sub->owner && sub->ownerGuard) {
-        std::lock_guard<std::recursive_mutex> ownerLock(sub->ownerGuard->mutex);
-        if (sub->ownerGuard->alive)
-            sub->owner->cancelEventSubscription(sub->id);
+        // POSTED, and deliberately NOT under ownerGuard->mutex.
+        //
+        // cancelEventSubscription() marshals to the owner thread with a
+        // BLOCKING queued connection, and the delivery callback installed by
+        // lp_subscribe takes this very mutex ON that thread (ownerGuard and the
+        // callback's clientGuard are the same CbGuard). Taking it here and then
+        // waiting for the owner thread is a lock-order inversion that
+        // deadlocks; and it hangs outright once the owner's event loop has
+        // stopped, which is exactly when a Rust EventSubscription drops.
+        //
+        // Posting instead: the lambda runs ON the owner thread, so the marshal
+        // inside cancelEventSubscription() becomes a direct call, and taking
+        // the guard there cannot wait on anyone. Qt drops posted events for a
+        // destroyed QObject, so a client torn down before delivery simply means
+        // the cancel never runs — which is correct, since the registry died
+        // with it.
+        auto ownerGuard = sub->ownerGuard;
+        LogosAPIClient* owner = sub->owner;
+        const quint64 id = sub->id;
+        std::lock_guard<std::recursive_mutex> ownerLock(ownerGuard->mutex);
+        if (ownerGuard->alive) {
+            // The guard is held across the POST but not across the cancel.
+            // That distinction is the whole fix, and both halves are load-bearing:
+            //
+            //  - It must be HELD here, because QMetaObject::invokeMethod
+            //    dereferences `owner` (it reads object->thread()) before the
+            //    lambda can run, so an `alive` check inside the lambda is
+            //    unreachable — lp_client_destroy sets alive=false and deletes
+            //    the client synchronously, and this struct's own contract says
+            //    a subscription may outlive it. Checking inside was a
+            //    use-after-free.
+            //  - It must NOT be held across cancelEventSubscription(), which
+            //    marshals to the owner thread with a BLOCKING queued connection
+            //    while that thread's delivery callback takes this same mutex —
+            //    a lock-order inversion that deadlocks, and hangs outright once
+            //    that event loop has stopped.
+            //
+            // Posting never waits on the owner thread, so holding the mutex
+            // across it cannot invert. Only the blocking marshal had to move.
+            QMetaObject::invokeMethod(owner, [ownerGuard, owner, id]() {
+                std::lock_guard<std::recursive_mutex> lock(ownerGuard->mutex);
+                if (ownerGuard->alive)
+                    owner->cancelEventSubscription(id);
+            }, Qt::QueuedConnection);
+        }
     }
     delete sub;
 }

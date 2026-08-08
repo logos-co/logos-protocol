@@ -600,9 +600,14 @@ TEST_P(EventDeliveryMatrix, LpUnsubscribeWhilePending_LeavesTheRegistry)
 
     lp_unsubscribe(sub);
 
-    EXPECT_EQ(lpPending(client), "[]")
+    // Un-registration is EVENTUAL by design — it is posted to the owner thread
+    // rather than done under a lock that thread's delivery callback also takes,
+    // which would deadlock. So pump; what must hold is that it drains, not that
+    // it drained by the time lp_unsubscribe returned.
+    EXPECT_TRUE(pumpUntil([&] { return lpPending(client) == "[]"; }, 5000))
         << "lp_unsubscribe left the entry in the registry: it keeps the retry timer "
-           "alive and keeps warning about a subscription nobody wants";
+           "alive and keeps warning about a subscription nobody wants. Still pending: "
+        << lpPending(client);
 
     // The ABI's own promise, and the half that IS observable on every transport
     // including the ones that armed immediately: bring the module up, fire
