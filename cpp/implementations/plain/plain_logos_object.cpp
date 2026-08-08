@@ -20,6 +20,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <future>
 #include <string>
 #include <thread>
@@ -96,7 +99,7 @@ logos::CallError callErrorReleased(const std::string& objectName,
 // fire timers. It restores the independence the per-call waiter threads had, at
 // one thread instead of one per pending call, which is the entire point of the
 // fold. Nothing else may ever be posted here; user code reaches the Qt loop via
-// postToQtEventLoop, and AsyncCall::deliver() is a flag, two map erases and a
+// postDelivery, and AsyncCall::deliver() is a flag, two map erases and a
 // post.
 // -----------------------------------------------------------------------------
 class DeadlineService {
@@ -145,23 +148,130 @@ boost::asio::io_context& deadlineContext()
     return DeadlineService::shared().context();
 }
 
-// Hand `callback(result)` over to the Qt event loop so PlainLogosObject's
-// async path matches LogosObject's interface contract: callbacks are
-// always delivered on a subsequent event-loop iteration, on the Qt
-// thread, never synchronously and never racing with QObjects/UI code.
+// -----------------------------------------------------------------------------
+// DeliveryService — the thread user callbacks land on in a process that has NO
+// Qt event loop. A THIRD singleton thread, and the reasons it is neither of the
+// other two are the whole design.
 //
-// Using QCoreApplication::instance() as the anchor means the queued
-// invocation lands on whichever thread runs the Qt event loop in this
-// process, regardless of which worker thread completed the call.
-// If the application has shut down (instance() is null), we drop the
-// callback rather than invoke it from an arbitrary thread.
+// WHAT WAS WRONG. The delivery hop below used to be exactly this:
+//
+//     QCoreApplication* app = QCoreApplication::instance();
+//     if (!app) return;                       // <- the callback, dropped
+//
+// In a Qt host that branch only fires after QCoreApplication is gone, i.e.
+// during shutdown, which is why it read as a reasonable guard. In a host that
+// never had one it fires for EVERY call, forever: callMethodAsyncWithError,
+// lp_invoke_async and every generated async wrapper promise their callback
+// exactly once, and the plain transport — the transport whose entire reason for
+// existing is to work without Qt — delivered zero. Not an error, not a
+// timeout: silence, which turns a bounded call into an unbounded wait in every
+// caller that awaits it. The header's guarantee was unconditional and untrue.
+//
+// WHAT IT IS NOT, which is the constraint that rules out the obvious fix.
+// "Just call it inline when there is no loop" would run user code on whatever
+// stack completed the call — the Asio read handler on the connection's strand,
+// the deadline thread, or the middle of release(). That is the re-entrancy
+// class this codebase has already paid for once: a deferred-multi completion
+// running inline on the QtRO read stack, SIGSEGV, fixed by pushing it off the
+// stack with QTimer::singleShot(0) (remote_transport.cpp). The whole point of
+// this hop is that no user callback ever runs on an Asio handler stack, and a
+// fix that delivers by removing the hop is not a fix.
+//
+// NOR IS IT THE DEADLINE THREAD. Posting user callbacks onto DeadlineService
+// would make every deadline in the process hostage to user code — a callback
+// that makes a synchronous call, or blocks, stops the clock for every other
+// pending call. That is precisely the coupling DeadlineService was extracted to
+// prevent, and its comment above says nothing else may ever be posted there.
+// One thread each, therefore, and they cost nothing until used: a Qt host never
+// starts this one at all.
+//
+// NOR IS IT "fail the call at issue time when there is no loop". That answer
+// would make the plain transport unusable in exactly the deployment it was
+// built for, and it still needs somewhere to deliver the failure it invents.
+//
+// ORDERING. A single thread draining a FIFO, so callbacks are delivered in the
+// order they were resolved — the same property the Qt queued connection gives.
+class DeliveryService {
+public:
+    static DeliveryService& shared()
+    {
+        // Lazy, like IoContextPool::shared() and DeadlineService::shared(): a
+        // process with a Qt event loop never constructs this and never starts
+        // its thread.
+        static DeliveryService svc;
+        return svc;
+    }
+
+    void post(std::function<void()> fn)
+    {
+        boost::asio::post(m_ioc, std::move(fn));
+    }
+
+    DeliveryService(const DeliveryService&) = delete;
+    DeliveryService& operator=(const DeliveryService&) = delete;
+
+private:
+    DeliveryService()
+        : m_guard(boost::asio::make_work_guard(m_ioc))
+        , m_thread([this] { m_ioc.run(); })
+    {}
+
+    ~DeliveryService()
+    {
+        // stop() means no FURTHER callback is started, so the join can only be
+        // waiting on one already running. A user callback that blocks forever
+        // at static-destruction time would hang here — and would equally hang a
+        // Qt event loop being torn down at the same moment, so this is not a new
+        // exposure. Joining is still the right side to err on: the alternative
+        // is a detached thread running user code while the statics it may touch
+        // are being destroyed.
+        m_guard.reset();
+        m_ioc.stop();
+        if (m_thread.joinable())
+            m_thread.join();
+    }
+
+    boost::asio::io_context m_ioc;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> m_guard;
+    std::thread m_thread;
+};
+
+// Hand `callback(result, err)` over to a LATER stack, so PlainLogosObject's
+// async path matches LogosObject's interface contract: callbacks are never
+// delivered synchronously inside the call that issued them, and never on the
+// transport's io thread.
+//
+// TWO VEHICLES, one rule. When this process runs a Qt event loop the callback
+// is queued onto it exactly as before, so it lands on the Qt thread and cannot
+// race QObjects or UI code — unchanged behaviour for every Qt host. When this
+// process has never had one, the callback goes to the dedicated delivery thread
+// above instead of being dropped. Nothing in between: there is no path that
+// runs it on the completing thread.
+//
+// WHY "HAS NEVER HAD ONE" AND NOT "DOES NOT HAVE ONE RIGHT NOW", which is the
+// one subtlety in this function. instance() also goes null during
+// ~QCoreApplication, so the naive test would start delivering on a foreign
+// thread while the Qt app is being torn down — and module teardown after the
+// application is gone is not exotic, it is what static-destruction ordering
+// produces, with stopAndCancelCalls() handing every in-flight call a
+// cancellation callback at exactly that moment. Running user code on a side
+// thread into half-destroyed module state is a worse outcome than not running
+// it, and it would be a NEW failure mode introduced into every Qt app by a
+// bug-fix change. So the flag latches: a process that has ever been seen with
+// an event loop keeps the old shutdown behaviour (the callback is dropped),
+// and a process that has never had one gets the delivery thread. A Qt host
+// therefore sees no behavioural difference at all — which is the point.
+//
+// The residue is stated rather than hidden: the delivery guarantee holds for
+// the whole life of a Qt-free process, and in a Qt process it holds until the
+// application is destroyed. logos_object.h says so.
 //
 // Deliberately a FREE function taking everything BY VALUE, and deliberately not
-// a member: the queued lambda runs on a later event-loop iteration, which for a
-// call cancelled by teardown is after the PlainLogosObject is already gone.
-// Nothing it touches may belong to the object — which is why AsyncCall copies
-// objectName/method up front instead of reading m_objectName from inside here.
-// Do not give this a `this`.
+// a member: the queued lambda runs later, which for a call cancelled by
+// teardown is after the PlainLogosObject is already gone. Nothing it touches
+// may belong to the object — which is why AsyncCall copies objectName/method up
+// front instead of reading m_objectName from inside here. Do not give this a
+// `this`.
 //
 // THE FOLD MADE THIS LOAD-BEARING TWICE OVER. It was already the reason a
 // delivery could outlive the handle. It is now also the answer to the
@@ -172,17 +282,31 @@ boost::asio::io_context& deadlineContext()
 // ever runs on an Asio handler stack. That is the class of bug that produced the
 // deferred-multi SIGSEGV on the QtRO twin, whose fix (remote_transport.cpp) is
 // the same move by a different vehicle: QTimer::singleShot(0).
-void postToQtEventLoop(PlainLogosObject::AsyncResultErrorCallback callback,
-                       QVariant result, logos::CallError err)
+// Latched the first time an event loop is seen; never cleared. See postDelivery.
+std::atomic<bool> g_processHadQtLoop{false};
+
+void postDelivery(PlainLogosObject::AsyncResultErrorCallback callback,
+                  QVariant result, logos::CallError err)
 {
-    QCoreApplication* app = QCoreApplication::instance();
-    if (!app) return;
-    QMetaObject::invokeMethod(app,
+    if (QCoreApplication* app = QCoreApplication::instance()) {
+        g_processHadQtLoop.store(true, std::memory_order_relaxed);
+        QMetaObject::invokeMethod(app,
+            [callback = std::move(callback), result = std::move(result),
+             err = std::move(err)]() mutable {
+                callback(result, err);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+    // The application existed and is gone: this is shutdown, and the old
+    // behaviour — drop it — is deliberately kept. See above.
+    if (g_processHadQtLoop.load(std::memory_order_relaxed)) return;
+
+    DeliveryService::shared().post(
         [callback = std::move(callback), result = std::move(result),
          err = std::move(err)]() mutable {
             callback(result, err);
-        },
-        Qt::QueuedConnection);
+        });
 }
 
 } // anonymous namespace
@@ -332,7 +456,7 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
 
         cancelTimer();
         // Last, and never with a lock held: the delivery hop.
-        if (cb) postToQtEventLoop(std::move(cb), std::move(value), std::move(err));
+        if (cb) postDelivery(std::move(cb), std::move(value), std::move(err));
     }
 
     // Callable from ANY thread: the arm is POSTED onto the timer's own strand,
@@ -371,6 +495,93 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
     }
 };
 
+// -----------------------------------------------------------------------------
+// The use-after-free DETECTOR. Two counters and a printf; the reasoning is the
+// part worth reading, and it lives over release().
+// -----------------------------------------------------------------------------
+
+// This thread's nesting depth inside ANY PlainLogosObject entry point, used to
+// subtract the caller's own frames from the count it reads.
+//
+// THE SHAPE THIS EXISTS TO IGNORE: a thread that is inside a public method and,
+// from there, reaches release() on the same object — a callback invoked from
+// within a call, releasing the handle it was called through. That is a
+// well-defined single-threaded sequence, not the race, and reporting it would
+// be a false alarm. No path in this file does that today (no guarded method
+// invokes user code synchronously), so this is guarding a shape that does not
+// yet exist — which is exactly when it is cheap to guard.
+//
+// It counts entries into ANY object rather than into a particular one, because
+// a per-object thread-local is a map lookup on every call and the difference
+// only matters for a thread that is inside object A while releasing object B.
+// That case is not the defect, and the bias it introduces is the safe one:
+// this can only ever make the detector MISS a real race, never invent one.
+// Internal linkage: nothing outside this file may read it, and it must not
+// become an exported thread-local in the shared build.
+static thread_local int t_entryDepth = 0;
+
+PlainLogosObject::EntryGuard::EntryGuard(PlainLogosObject* obj,
+                                         const char* entryPoint)
+    : m_obj(obj)
+    , m_prev(obj->m_lastEntryPoint.exchange(entryPoint,
+                                            std::memory_order_relaxed))
+{
+    ++t_entryDepth;
+    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);
+}
+
+PlainLogosObject::EntryGuard::~EntryGuard()
+{
+    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);
+    --t_entryDepth;
+    // Hand the name back, so a nested entry does not leave the diagnostic
+    // blaming onEvent() for a caller that is really parked in
+    // callMethodWithError(). Across threads this is last-writer-wins and
+    // therefore approximate — it names ONE of the callers in flight, which is
+    // all the message claims.
+    m_obj->m_lastEntryPoint.store(m_prev, std::memory_order_relaxed);
+}
+
+void PlainLogosObject::reportConcurrentCallers(const char* where) const
+{
+    // `- t_entryDepth` removes this thread's own frames; see t_entryDepth.
+    const int others =
+        m_callsInFlight.load(std::memory_order_acquire) - t_entryDepth;
+    if (others <= 0) return;
+
+    const char* entry = m_lastEntryPoint.load(std::memory_order_relaxed);
+
+    // Written straight to stderr, not through qWarning/qCritical, on purpose.
+    // By the time this fires the program has already committed the error and
+    // may be one instruction from a SIGSEGV, so the message must not depend on
+    // a Qt message handler being installed, being reachable, or flushing — and
+    // must not depend on a QCoreApplication existing at all, which on this
+    // transport it may not.
+    std::fprintf(stderr,
+        "\nLOGOS FATAL: PlainLogosObject::%s on '%s' ran while %d call(s) from "
+        "other threads are still inside this object (most recent entry: "
+        "PlainLogosObject::%s).\n"
+        "  release() ends in `delete this`, so those calls are now using freed "
+        "memory. A LogosObject handle is safe to use from several threads at "
+        "once; it is NOT safe to use concurrently with its own release(). The "
+        "caller must order the two.\n"
+        "  This is a diagnostic, not a rescue: the object is destroyed either "
+        "way. See the note over PlainLogosObject::release().\n",
+        where, m_objectName.c_str(), others,
+        entry ? entry : "<unknown>");
+    std::fflush(stderr);
+
+    // Debug builds stop here, so the misuse is a named abort at the line that
+    // committed it rather than a SIGSEGV somewhere else. Release builds carry
+    // on into the same crash they would have had, with a log line naming the
+    // cause — the point being that turning a shipped app's latent misuse into a
+    // hard abort is not a decision a bug-fix release gets to make for its
+    // consumers.
+#ifndef NDEBUG
+    std::abort();
+#endif
+}
+
 PlainLogosObject::PlainLogosObject(std::string objectName,
                                    std::shared_ptr<RpcConnectionBase> conn)
     : m_objectName(std::move(objectName))
@@ -380,6 +591,10 @@ PlainLogosObject::PlainLogosObject(std::string objectName,
 
 PlainLogosObject::~PlainLogosObject()
 {
+    // BEFORE anything is torn down: the handle may also be deleted directly
+    // (`delete obj`) rather than through release(), and that path has exactly
+    // the same hazard.
+    reportConcurrentCallers("~PlainLogosObject()");
     disconnectEvents();
     stopAndCancelCalls();
 }
@@ -449,6 +664,7 @@ QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
                                                int timeoutMs,
                                                logos::CallError* err)
 {
+    EntryGuard guard(this, "callMethodWithError()");
     if (err) err->clear();
     if (!m_conn || !m_conn->isOpen()) {
         if (err)
@@ -643,11 +859,12 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
                                                 int timeoutMs,
                                                 AsyncResultErrorCallback callback)
 {
+    EntryGuard guard(this, "callMethodAsyncWithError()");
     if (!callback) return;
     if (!m_conn || !m_conn->isOpen()) {
         // Defer even the failure path — LogosObject's contract requires
         // callbacks on a subsequent event-loop iteration, never inline.
-        postToQtEventLoop(std::move(callback), QVariant(),
+        postDelivery(std::move(callback), QVariant(),
                           logos::callErrorTransport(
                               m_objectName,
                               "connection to '" + m_objectName + "' is not open"));
@@ -793,6 +1010,7 @@ bool PlainLogosObject::informModuleToken(const QString& authToken,
                                          const QString& token,
                                          int /*timeoutMs*/)
 {
+    EntryGuard guard(this, "informModuleToken()");
     if (!m_conn || !m_conn->isOpen()) return false;
     TokenMessage msg;
     msg.authToken  = authToken.toStdString();
@@ -804,6 +1022,7 @@ bool PlainLogosObject::informModuleToken(const QString& authToken,
 
 void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 {
+    EntryGuard guard(this, "onEvent()");
     if (!m_conn || !m_conn->isOpen() || !callback) return;
 
     {
@@ -824,6 +1043,7 @@ void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 
 void PlainLogosObject::disconnectEvents()
 {
+    EntryGuard guard(this, "disconnectEvents()");
     std::vector<std::pair<QString, EventCallback>> subs;
     {
         std::lock_guard<std::mutex> g(m_mu);
@@ -840,6 +1060,7 @@ void PlainLogosObject::disconnectEvents()
 
 void PlainLogosObject::emitEvent(const QString& eventName, const QVariantList& data)
 {
+    EntryGuard guard(this, "emitEvent()");
     if (!m_conn || !m_conn->isOpen()) return;
     EventMessage msg;
     msg.object    = m_objectName;
@@ -850,6 +1071,7 @@ void PlainLogosObject::emitEvent(const QString& eventName, const QVariantList& d
 
 QJsonArray PlainLogosObject::getMethods()
 {
+    EntryGuard guard(this, "getMethods()");
     if (!m_conn || !m_conn->isOpen()) return QJsonArray();
 
     MethodsMessage msg;
@@ -888,6 +1110,67 @@ void PlainLogosObject::release()
     // running on the single io thread — the reentrant shape remote_transport.cpp
     // documents — which a "post a no-op onto the strand and wait for it" barrier
     // could not have been: it would have deadlocked against itself.
+    //
+    // ── AND THE ONE THING IT IS STILL NOT SAFE AGAINST ──────────────────────
+    //
+    // A CALL RUNNING ON ANOTHER THREAD RIGHT NOW. `delete this` below frees the
+    // object while that thread is inside it, and every member it goes on to
+    // touch — m_conn, m_objectName, m_state — is freed memory. Reproduced
+    // deterministically: a synchronous callMethod parked in its future wait,
+    // released from another thread, faults on the very next line it executes
+    // (`m_conn->cancelPending(...)`), with and without Guard Malloc, on master
+    // and on both pending PRs. It is not the fold's doing and the fold does not
+    // help it.
+    //
+    // THIS IS A CALLER CONTRACT, AND THAT IS NOT AN EXCUSE — it is the only
+    // thing it can be, and the argument is short enough to check. Any mechanism
+    // that could make the racing call safe has to be REACHED THROUGH `this`:
+    // a reference count, a flag, a lock, an epoch — all of them are members,
+    // and the racing thread's first act would be to load one out of the object
+    // whose storage has just been freed. There is no synchronisation with a
+    // destruction you can only learn about by reading the destroyed object. The
+    // only designs that work put the state OUTSIDE the object, and the ABI
+    // forbids every one of them: requestObject hands out a raw LogosObject*
+    // (logos_object.h explains why that vtable cannot move), callers dispatch
+    // virtuals straight through it, and release() is defined as deleting it.
+    //
+    // THE THREE ALTERNATIVES, and why each was rejected rather than shipped:
+    //
+    //   * AN ATOMIC "alive" FLAG checked on entry. The check is a load through
+    //     `this`, so it reads freed memory to decide whether the memory is
+    //     freed, and even a true answer is stale the instant after it is read.
+    //     It converts a reliable crash into an unreliable one, which is a worse
+    //     bug than the one it replaces.
+    //   * release() BLOCKS UNTIL IN-FLIGHT CALLS FINISH. Breaks the guarantee
+    //     the two preceding changes exist to establish — teardown waits for
+    //     nothing — by making it wait for up to a caller's full timeout, and
+    //     deadlocks outright in the shipped reentrant shape above, where the
+    //     releasing thread IS the thread that would have to finish the call.
+    //     And it does not even close the race: a call ENTERING after the check
+    //     is unaffected.
+    //   * AN IMMORTAL FORWARDING HANDLE — hand out a small stable object that
+    //     holds a shared_ptr to the implementation, and have release() drop the
+    //     implementation instead of freeing the handle. This one genuinely
+    //     works, and it is rejected on cost rather than on correctness: the
+    //     handle can never be freed (freeing it reintroduces the identical
+    //     race), so it becomes permanent retention proportional to the number
+    //     of requestObject calls on a connection that lives as long as the
+    //     process — in a transport whose two preceding changes were spent
+    //     proving retention does not grow with call count. It would also fix
+    //     ONE of four transports: qt_remote, qt_local and mock all end release()
+    //     in `delete this` too, so the contract has to exist and be documented
+    //     regardless, and a transport-local trick mainly makes the contract
+    //     LOOK satisfied on whichever transport the caller happened to test on.
+    //
+    // So: the contract is stated (here, in plain_logos_object.h, and in
+    // logos_object.h where every transport's callers will read it), and what
+    // this class adds is a DETECTOR that makes breaking it loud. It reports
+    // from the only side that is provably alive at the moment it looks — this
+    // one — and in a debug build it aborts, so the misuse is a named diagnostic
+    // at the line that committed it instead of a SIGSEGV somewhere else a
+    // moment later. It does not, and cannot, save the racing call.
+    reportConcurrentCallers("release()");
+
     disconnectEvents();
     stopAndCancelCalls();
     m_conn.reset();

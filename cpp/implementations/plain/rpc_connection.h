@@ -55,7 +55,7 @@ public:
     //     was registering, which is a race sendCallAsync resolves by reclaiming
     //     its own entry rather than by hoping fail() sees it.
     // It must therefore not block and must not run user code directly — see
-    // postToQtEventLoop in plain_logos_object.cpp.
+    // postDelivery in plain_logos_object.cpp.
     //
     // AT MOST ONCE is a property of the REGISTRATION, and it is weaker than it
     // sounds. Four things contend for a registered handler — dispatchIncoming,

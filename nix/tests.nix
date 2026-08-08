@@ -40,6 +40,10 @@ pkgs.stdenv.mkDerivation {
 
     mkdir -p $out/bin
     cp build-tests/protocol/protocol_tests $out/bin/
+    # The Qt-LOOP-FREE half. A separate binary because "this process has no
+    # QCoreApplication" is a property of the process, and protocol_tests' main()
+    # constructs one before the first test runs. See tests/protocol/CMakeLists.txt.
+    cp build-tests/protocol/protocol_noqt_tests $out/bin/
 
     runHook postInstall
   '';

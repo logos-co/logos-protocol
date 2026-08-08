@@ -39,3 +39,10 @@ jobs:
         run: ./result/bin/protocol_tests
         env:
           QT_QPA_PLATFORM: offscreen
+
+      # The Qt-loop-free half, in its own process because that is the whole
+      # point: QCoreApplication is a process-wide singleton and protocol_tests
+      # constructs one before its first test, so no test in that binary can
+      # reach the state a Qt-free host is permanently in.
+      - name: Run protocol tests (no Qt event loop)
+        run: ./result/bin/protocol_noqt_tests

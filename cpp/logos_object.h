@@ -17,6 +17,30 @@
  * Each transport (local/Qt Remote Objects/mock/JSON-RPC/...) provides its
  * own concrete subclass.  Callers interact exclusively through this
  * interface and never need to know the implementation type.
+ *
+ * THREAD SAFETY, precisely — the two halves are not the same answer.
+ *
+ *   * CALLS are safe to make from several threads at once. The transports
+ *     serialize what has to be serialized internally.
+ *
+ *   * release() IS NOT SAFE AGAINST A CONCURRENT CALL, and cannot be made so.
+ *     release() destroys the object (every transport ends it in `delete this`),
+ *     so a call still executing on another thread is left dereferencing freed
+ *     memory. It is the caller's job to order the two: every call on a handle
+ *     must have RETURNED before release() is entered.
+ *
+ *     This is not a gap waiting to be closed. Anything that could make the
+ *     racing call safe would have to be reached THROUGH the handle pointer, and
+ *     reading through a pointer to a destroyed object is exactly the
+ *     use-after-free it would be there to prevent; the only designs that work
+ *     keep the state outside the object, which the raw-pointer ABI documented
+ *     below rules out. The plain transport carries a debug-build detector that
+ *     turns the misuse into a named abort at the offending release() instead of
+ *     a SIGSEGV somewhere else (see plain_logos_object.cpp); the other
+ *     transports have the same rule and no detector yet.
+ *
+ *     The common shape that trips this is a handle shared with a worker thread
+ *     and released on teardown without waiting for the worker. Wait for it.
  */
 class LogosObject {
 public:
@@ -40,8 +64,27 @@ public:
     /**
      * @brief Invoke a method asynchronously; result is delivered via callback.
      *
-     * Returns immediately. The callback is always invoked on a subsequent
-     * event-loop iteration, never synchronously inside this call.
+     * Returns immediately. The callback is invoked EXACTLY ONCE, always from a
+     * later stack — never synchronously inside this call, and never on a
+     * transport's IO thread.
+     *
+     * WHERE it runs, which is a property of the process and not of the call:
+     * when the process runs a Qt event loop the callback is queued onto it and
+     * therefore lands on the Qt thread, which is what every Qt host sees. A
+     * transport that supports Qt-free hosts (the plain transport) delivers on
+     * its own dedicated delivery thread when the process has no such loop,
+     * rather than dropping the callback — which is what it used to do, making
+     * "exactly once" mean "never" in a Qt-free process. Callers that need their
+     * own thread affinity must hop themselves; callers in a Qt host see no
+     * change.
+     *
+     * THE ONE EXCEPTION, stated rather than glossed: a callback that becomes
+     * ready in a Qt process AFTER QCoreApplication has been destroyed is
+     * dropped. There is nowhere left to deliver it that is worth the cost —
+     * running user code on a side thread while the objects it closes over are
+     * being torn down is a worse outcome than silence — so "exactly once" holds
+     * for the whole life of a Qt-free process, and up to application teardown
+     * in a Qt one.
      *
      * @param authToken Authentication token for the operation
      * @param methodName Method to call on the underlying module
@@ -109,6 +152,11 @@ public:
      * After calling release() the object must not be used again.
      * Implementations that own the underlying resource (e.g. a
      * QRemoteObjectReplica) will delete it here.
+     *
+     * "Must not be used again" includes USES THAT ARE ALREADY RUNNING on other
+     * threads — see the thread-safety note on this class. release() must be
+     * ordered after every call on this handle has returned, not merely after
+     * the caller stopped starting new ones.
      */
     virtual void release() = 0;
 
@@ -183,10 +231,12 @@ public:
     /**
      * @brief callMethodAsync, whose callback carries the reason on failure.
      *
-     * Same delivery contract as LogosObject::callMethodAsync: the callback
-     * fires on a subsequent event-loop iteration, never synchronously, and
-     * exactly once. On success the error argument is a default-constructed
-     * (ok()) CallError.
+     * Same delivery contract as LogosObject::callMethodAsync — including where
+     * it runs and including the post-QCoreApplication-teardown exception
+     * documented there: the callback fires from a later stack, never
+     * synchronously, never on a transport IO thread, and exactly once, in a
+     * process with no Qt event loop as much as in one that has it. On success
+     * the error argument is a default-constructed (ok()) CallError.
      */
     virtual void callMethodAsyncWithError(const QString& authToken,
                                           const QString& methodName,

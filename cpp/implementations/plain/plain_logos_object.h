@@ -70,6 +70,26 @@ public:
     void disconnectEvents() override;
     void emitEvent(const QString& eventName, const QVariantList& data) override;
     QJsonArray getMethods() override;
+
+    // TEARDOWN IS NOT THREAD-SAFE AGAINST CALLS, AND CANNOT BE MADE SO HERE.
+    //
+    // release() ends in `delete this`. A caller that has another thread inside
+    // any method of this object at that moment has a use-after-free, and no
+    // amount of care in this class can repair it: every mechanism that could
+    // has to be REACHED THROUGH `this`, and reaching through a pointer to a
+    // destroyed object is the use-after-free the mechanism was supposed to
+    // prevent. See the long note over release() in plain_logos_object.cpp for
+    // what was tried and why each alternative was rejected.
+    //
+    // So this is a CONTRACT, stated where it can be seen: a LogosObject handle
+    // is safe to use concurrently from many threads, and is NOT safe to use
+    // concurrently with its own release(). The caller must order the two.
+    //
+    // What this class adds is a DETECTOR, not a fix. Entries into the public
+    // methods are counted, and release() (and the destructor) report loudly
+    // when the count is not zero — aborting in debug builds — so the misuse
+    // fails as a named diagnostic at the exact line that committed it instead
+    // of as a SIGSEGV somewhere else milliseconds later.
     void release() override;
     quintptr id() const override;
 
@@ -166,6 +186,50 @@ private:
     QVariant awaitCompletion(const QString& callId, int timeoutMs,
                              const QString& methodName = QString(),
                              logos::CallError* err = nullptr);
+
+    // ── the use-after-free DETECTOR (not a guard) ───────────────────────────
+    //
+    // Counts the callers currently inside a public entry point of THIS object.
+    // Read by release() and by the destructor, which are the only two moments
+    // at which a non-zero count means the calling program is already wrong.
+    //
+    // BE CLEAR ABOUT WHAT THIS IS. It is not a barrier and not an alive-flag:
+    // it does not make the racing call safe, it does not delay the delete, and
+    // nothing consults it before touching the object. It exists so the misuse
+    // is REPORTED, from the one side that is provably still alive when it looks
+    // — release() is being executed on this object, so this object exists for
+    // the duration of the check.
+    //
+    // It is deliberately biased to UNDER-report and never to false-alarm; see
+    // reportConcurrentCallers() for the one shape it deliberately ignores. A
+    // detector that can fire on a correct program is worse than no detector.
+    //
+    // The members are present in every build, NDEBUG or not, so this class has
+    // one layout everywhere: this header ships in the source export and is
+    // compiled into consumers whose optimisation settings are not ours to
+    // choose. Only the ABORT is conditional.
+    std::atomic<int>         m_callsInFlight{0};
+    std::atomic<const char*> m_lastEntryPoint{nullptr};
+
+    // One per public entry point. RAII so an early return — of which
+    // callMethodWithError has four — cannot leak a count, and so a nested entry
+    // (callMethodWithError calls ensureCompletionSub, which calls onEvent) hands
+    // the name back on the way out instead of leaving the diagnostic pointing at
+    // the innermost frame that happened to run last.
+    class EntryGuard {
+    public:
+        EntryGuard(PlainLogosObject* obj, const char* entryPoint);
+        ~EntryGuard();
+        EntryGuard(const EntryGuard&) = delete;
+        EntryGuard& operator=(const EntryGuard&) = delete;
+    private:
+        PlainLogosObject* m_obj;
+        const char*       m_prev;
+    };
+
+    // Prints the diagnostic and, in a debug build, aborts. `where` names the
+    // teardown entry point that found the object busy.
+    void reportConcurrentCallers(const char* where) const;
 
     // Raise the stop flag, then cancel every outstanding async call — each of
     // which delivers its callback, once, with callErrorReleased — and wake the
