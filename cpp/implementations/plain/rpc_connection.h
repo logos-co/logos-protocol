@@ -55,8 +55,25 @@ public:
     // It must therefore not block and must not run user code directly — see
     // postToQtEventLoop in plain_logos_object.cpp.
     //
-    // AT MOST ONCE, not exactly once: a caller that gives up before the reply
-    // arrives calls cancelPending() and is never called back at all.
+    // AT MOST ONCE is a property of the REGISTRATION, and it is weaker than it
+    // sounds. Three things contend for a registered handler — dispatchIncoming,
+    // fail()'s sweep and cancelPending() — and the extract-and-erase under m_mu
+    // lets exactly one of them have it, so no handler is ever invoked twice.
+    //
+    // What that does NOT buy is a cancel that arrives in time. dispatchIncoming
+    // copies the handler out under m_mu and invokes it with the mutex RELEASED,
+    // so a cancelPending() landing in that gap erases nothing and the handler
+    // runs to completion AFTER cancelPending() has already returned. A caller
+    // that gives up must therefore be able to absorb one more call. Both callers
+    // here are:
+    //   * PlainLogosObject funnels every outcome into AsyncCall::deliver(),
+    //     whose CAS makes the later arrival a no-op — that CAS, and nothing at
+    //     this layer, is what makes DELIVERY to the user exactly-once;
+    //   * sendCall()'s promise handler cannot be reached twice at all (only one
+    //     contender ever gets it) and fulfilling a future its caller has already
+    //     walked away from is a no-op.
+    // test_plain_cancel_pending_race.cpp builds that interleaving by hand rather
+    // than racing for it, and pins both.
     using ResultHandler = std::function<void(ResultMessage)>;
 
     virtual ~RpcConnectionBase() = default;
@@ -92,6 +109,12 @@ public:
     // Safe to call at any time and from any thread, including for an id that
     // has already been answered (the erase simply finds nothing). Ids come from
     // nextId() and are unique across BOTH maps, so one entry point covers them.
+    //
+    // BEST EFFORT AGAINST A REPLY ALREADY IN FLIGHT, and deliberately not more.
+    // It withdraws a REGISTRATION; it does not stop a handler dispatchIncoming
+    // has already taken out of the map. Returning from this is therefore not a
+    // guarantee of silence — see ResultHandler for who has to absorb the
+    // difference and how.
     virtual void cancelPending(uint64_t id) = 0;
 
     virtual void sendSubscribe(SubscribeMessage msg,
@@ -285,9 +308,14 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                     m_pendingCalls.erase(it);
                 }
             }
-            // Erased under the lock BEFORE the call, so this and fail()'s sweep
-            // cannot both get the same handler — that, not the handler itself,
-            // is what makes delivery at-most-once at this layer.
+            // Erased under the lock BEFORE the call, so this, fail()'s sweep and
+            // cancelPending() cannot all get the same handler — that is what
+            // makes INVOCATION at-most-once at this layer, and it is the whole
+            // of what this layer promises. It is NOT a cancellation barrier: the
+            // call below runs with m_mu released, so a cancelPending() racing it
+            // finds the entry already gone, erases nothing, and returns while
+            // this handler is still running. Exactly-once DELIVERY belongs to the
+            // handler — see ResultHandler.
             if (h) h(std::forward<decltype(m)>(m));
 
         } else if constexpr (std::is_same_v<T, MethodsResultMessage>) {

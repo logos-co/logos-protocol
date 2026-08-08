@@ -33,12 +33,25 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # by any packaging, so a shipped build cannot have it.
 #
 #   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
-#   ./build-broken/protocol/protocol_tests --gtest_filter='IoFoldTest.*'
+#   ./build-broken/protocol/protocol_tests --gtest_filter='IoFoldTest.*:\
+#PlainCompletionSubOrderTest.*:PlainCancelPendingRaceTest.*'
 #
-# Three tests must go RED there, and test_iofold.cpp names them at the top with
-# the numbers they were seen to fail with. A green run of those in this build
-# means the corresponding real assertion is not exercising what it claims to,
-# which is a bug in the test, not a licence to trust it.
+# SIX tests must go RED there, and no others:
+#
+#   IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce
+#   IoFoldTest.DeadlineFiresOnTimeWhileTheIoThreadIsBusy
+#   IoFoldTest.DeadlineFiresWhileTheIoThreadIsBlockedForever
+#   PlainCompletionSubOrderTest.AConcurrentFirstCallCannotOutrunTheSubscription
+#   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
+#   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
+#
+# A green run of any of those in this build means the corresponding real
+# assertion is not exercising what it claims to, which is a bug in the test, not
+# a licence to trust it. Note what is NOT on the list: the per-path exactly-once
+# tests stay GREEN with the CAS removed. They are pins, not detectors — only
+# racing teardown against replies in flight (the first entry) and the
+# hand-built extract-then-cancel interleaving (the last) actually catch a
+# doubled callback.
 option(LOGOS_PROTOCOL_DETECTOR_INVERSIONS
        "Compile the plain transport with its exactly-once gate and its \
 independent deadline clock REMOVED, so the tests that assert them can be shown \
@@ -154,6 +167,13 @@ add_executable(protocol_tests
     # subscription the host had not registered and the completion was dropped.
     # Costs a caller its whole timeout and leaves nothing behind — see the file.
     test_plain_completion_sub_order.cpp
+    # cancelPending() and the two things it is NOT. dispatchIncoming copies a
+    # handler out under the connection mutex and invokes it unlocked, so a
+    # cancel arriving in that gap stops nothing — at-most-once INVOCATION is the
+    # extract-and-erase, and exactly-once DELIVERY is AsyncCall::deliver()'s CAS.
+    # Constructs the interleaving by hand rather than racing for it, and covers
+    # the OTHER handler shape (the promise sendCall registers) too.
+    test_plain_cancel_pending_race.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

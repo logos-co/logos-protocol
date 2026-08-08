@@ -39,7 +39,10 @@
 //   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
 //
 // which compiles the transport with (a) the exactly-once CAS removed and (b) the
-// deadline back on the shared io_context. In that build these must go RED, and
+// deadline back on the shared io_context. (It also removes a third mechanism,
+// the completion-subscription serialization, which belongs to
+// test_plain_completion_sub_order.cpp — see tests/protocol/CMakeLists.txt for
+// the full list of what must go red.) In that build these must go RED, and
 // these are the numbers they were seen to go red with:
 //
 //   ReleaseRacingRepliesInFlightDeliversEachCallOnce  (a)  6-16 double
