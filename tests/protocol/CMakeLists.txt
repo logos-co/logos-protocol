@@ -2,29 +2,19 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
 # ── validating the detectors ────────────────────────────────────────────────
 #
-# A race assertion that has never been seen to fail is not evidence. This option
-# compiles the plain transport with the mechanism the tests exist to prove
-# REMOVED, so the suite can be shown to go red on the code the fix replaced:
+# A race assertion that has never been seen to fail is not evidence, so the race
+# tests in this directory are checked against the code they were written for:
+# copy the test file onto the pre-fix tree and run it there. For the completion
+# subscription that tree is `master` — it has both the racy ensureCompletionSub()
+# and the raw-`this` handler capture — and the numbers those runs produced are
+# recorded in the test files themselves.
 #
-#   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
-#   ./build-broken/protocol/protocol_tests \
-#       --gtest_filter='PlainCompletionSubOrderTest.*'
-#
-# Both tests in test_plain_completion_sub_order.cpp must FAIL there. A green run
-# means those assertions are not exercising what they claim to, which is a bug
-# in the test and not a licence to trust it.
-option(LOGOS_PROTOCOL_DETECTOR_INVERSIONS
-       "Compile the plain transport with the mechanisms its race tests assert \
-REMOVED, so those tests can be shown to fail. Never enable outside a throwaway \
-detector build." OFF)
-
-if(LOGOS_PROTOCOL_DETECTOR_INVERSIONS)
-    message(WARNING "LOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON: this build is "
-                    "DELIBERATELY BROKEN and is only useful for validating the "
-                    "test suite's detectors.")
-    target_compile_definitions(logos_protocol PUBLIC
-        LOGOS_PLAIN_DETECTOR_BREAK_SUB_ORDER=1)
-endif()
+# Deliberately no build flag, no environment probe and no second implementation
+# in the shipped source. An earlier draft carried both, and the cost is the same
+# either way: production code grows a path whose only purpose is to be wrong.
+# Running the real pre-fix code is also the stronger evidence, because it proves
+# the test catches the bug that actually existed rather than a hand-written
+# imitation of it.
 
 add_executable(protocol_tests
     test_main.cpp

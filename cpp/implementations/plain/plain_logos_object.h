@@ -115,17 +115,18 @@ private:
     // into a subscription the host has not registered — PlainTransportHost::
     // fanOutEvent finds no sink for that connection and DROPS it — and the
     // caller then waits out its full timeout for a result that was computed and
-    // thrown away. Measured on pristine master: 42 of 400 two-thread first-call
-    // rounds inverted on the wire, every one of them a dropped completion and a
-    // timed-out caller; 10 of 600 calls through the real host stack.
+    // thrown away. Measured on pristine master, four runs: 18 to 28 of 250
+    // two-thread first-call rounds inverted on the wire, every one of them a
+    // dropped completion and a timed-out caller; 6 to 10 of 500 calls through
+    // the real host stack.
     //
     // Ordering, once the two are serialized, is a property of asio and not of
     // luck: handlers posted to a strand run in the order they were posted when
     // the posts are ordered by a happens-before edge, and the release/acquire
     // pair below (or call_once's own edge) is that edge.
     void ensureCompletionSub();
-    // The subscribe itself, run by exactly one caller. Split out only so the
-    // detector inversion in ensureCompletionSub can reach it.
+    // The subscribe itself, run by exactly one caller — the one that wins
+    // m_completionSubOnce.
     void subscribeToCompletions();
     // `err` (optional) receives the reason when no completion lands: the
     // timeout when the deadline elapses (a deferred call that gives up is a

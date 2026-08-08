@@ -317,15 +317,6 @@ void PlainLogosObject::ensureCompletionSub()
     // established (see the header).
     if (m_completionSubscribed.load(std::memory_order_acquire)) return;
 
-#ifdef LOGOS_PLAIN_DETECTOR_BREAK_SUB_ORDER
-    // THE INVERSION: the pre-fix shape restored exactly — publish "subscribed"
-    // and let every other caller straight through, subscribed or not. Defined
-    // ONLY by an explicit `-DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON` configure of
-    // the tests tree; test_plain_completion_sub_order.cpp must go RED there, or
-    // its assertions are decoration.
-    if (m_completionSubscribed.exchange(true, std::memory_order_acq_rel)) return;
-    subscribeToCompletions();
-#else
     // Serializing is the whole fix. A second caller that arrives while the
     // first is still inside subscribeToCompletions() BLOCKS here instead of
     // racing ahead with a Call the provider can answer before the Subscribe
@@ -336,7 +327,6 @@ void PlainLogosObject::ensureCompletionSub()
         // a subscription that is not yet on the strand.
         m_completionSubscribed.store(true, std::memory_order_release);
     });
-#endif
 }
 
 void PlainLogosObject::subscribeToCompletions()

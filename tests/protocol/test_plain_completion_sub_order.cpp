@@ -25,11 +25,25 @@
 //     is PlainTransportHost::fanOutEvent's, and all this test can see is a
 //     caller that timed out.
 //
-// Both must go RED under -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON, which restores
-// the pre-fix shape in ensureCompletionSub(). Numbers seen there, on this
-// machine: raw wire 28/400 rounds inverted and dropped, real stack 10/600 calls
-// timed out. Pristine master reproduces the same way (42/400), which is the
-// attribution: this predates the lifetime fix it ships with.
+// BOTH ARE VALIDATED DETECTORS, and validated against the real thing rather
+// than an imitation of it: this file compiles unmodified on master, where
+// ensureCompletionSub() still raises its flag under the rendezvous mutex and
+// drops the mutex before subscribing. Both go RED there, in every run. Numbers
+// from four runs on an aarch64-darwin box:
+//
+//   raw wire     18 / 26 / 27 / 28 of 250 rounds put the Call on the wire ahead
+//                of the Subscribe frame; every one of those rounds also dropped
+//                the completion and timed its caller out
+//   real stack   6 to 10 of 500 calls lost their completion at
+//                PlainTransportHost::fanOutEvent and timed out
+//
+// That is also the attribution: the bug is on master, so it predates the
+// lifetime fix this ships with instead of being introduced by it.
+//
+// Reproducing the check costs a worktree on master, a copy of this file into
+// tests/protocol and one line in that directory's CMakeLists. Deliberately
+// that, and not a compile-time switch that would put a second, knowingly wrong
+// ensureCompletionSub() into the shipped transport.
 
 #include <gtest/gtest.h>
 

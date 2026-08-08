@@ -436,7 +436,9 @@ TEST_F(PlainCompletionSubLifetimeTest, CompletionEventDispatchedAcrossReleaseIsS
         // exception unwinds out of the handler into RpcConnection::doRead()'s
         // catch — which calls fail() and tears the whole connection down. So a
         // dead connection HERE is the use-after-free landing on recycled memory,
-        // not a flaky socket. Measured on master: reached within ~5 rounds.
+        // not a flaky socket. Measured on master with no allocator detector at
+        // all: RED in 11 of 12 solo runs, the connection dying at round 6 in 9
+        // of those 11.
         ASSERT_TRUE(conn->isConnected())
             << "round " << round << ": the connection died mid-run — a completion "
                "handler threw out of the io thread, which is what a released "
