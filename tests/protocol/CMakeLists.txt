@@ -34,6 +34,7 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   PlainCompletionSubOrderTest.AConcurrentFirstCallCannotOutrunTheSubscription
 #   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
 #   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
+#   PlainSendAfterFailTest.*   (all four; validated on cf1b9b0)
 #
 # Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
 # the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
@@ -41,6 +42,14 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # replies in flight (the first entry) and the hand-built extract-then-cancel
 # interleaving (the last) actually catch a doubled callback. Do not read a green
 # per-path test as evidence the gate is there.
+#
+# AND DO NOT READ ReleaseRacingRepliesInFlightDeliversEachCallOnce AS COVERING
+# EVERY DOUBLE. It races teardown of the HANDLE against replies with the
+# connection still up, so it never enters sendCallAsync's stopped branch: against
+# a deliberately broken version of that branch it reports 0 doubles in 10,000
+# calls while PlainSendAfterFailTest's own 10,000-call burst — which stops the
+# CONNECTION mid-burst — reports 5 to 10. Same shape, different contended object,
+# and only the second one sees that path.
 
 add_executable(protocol_tests
     test_main.cpp
@@ -150,6 +159,15 @@ add_executable(protocol_tests
     # Constructs the interleaving by hand rather than racing for it, and covers
     # the OTHER handler shape (the promise sendCall registers) too.
     test_plain_cancel_pending_race.cpp
+    # The gap between sendCallAsync's stopped-check and its registration under
+    # m_mu. A fail() that completes in it sweeps a map the caller has not
+    # written to yet, so the handler lands on a connection nobody will ever
+    # sweep again and the call is answered by NOTHING — the caller waits out its
+    # whole deadline and is then told "timeout" for a connection that was
+    # already gone. Predates the fold (master has it on the promise path).
+    # Builds the interleaving by parking the caller on the connection's own
+    # mutex rather than racing for it.
+    test_plain_send_after_fail.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

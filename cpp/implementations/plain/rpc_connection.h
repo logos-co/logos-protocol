@@ -51,14 +51,22 @@ public:
     //     call when the connection is torn down (stop(), ~PlainTransport-
     //     Connection, RpcServer::stop());
     //   * INLINE on the calling thread, inside sendCallAsync itself, when the
-    //     connection is already stopped.
+    //     connection is stopped — either before the call was made, or while it
+    //     was registering, which is a race sendCallAsync resolves by reclaiming
+    //     its own entry rather than by hoping fail() sees it.
     // It must therefore not block and must not run user code directly — see
     // postToQtEventLoop in plain_logos_object.cpp.
     //
     // AT MOST ONCE is a property of the REGISTRATION, and it is weaker than it
-    // sounds. Three things contend for a registered handler — dispatchIncoming,
-    // fail()'s sweep and cancelPending() — and the extract-and-erase under m_mu
-    // lets exactly one of them have it, so no handler is ever invoked twice.
+    // sounds. Four things contend for a registered handler — dispatchIncoming,
+    // fail()'s sweep, cancelPending() and sendCallAsync's own reclaim — and the
+    // extract-and-erase under m_mu lets exactly one of them have it, so no
+    // handler is ever invoked twice.
+    //
+    // AT LEAST ONCE is the other half, and it is not free either: it holds only
+    // because a registration is made BEFORE m_stopped is re-read, so a teardown
+    // and a registration cannot pass each other unseen. Get that order wrong and
+    // a handler sits in the map of a dead connection forever — see sendCallAsync.
     //
     // What that does NOT buy is a cancel that arrives in time. dispatchIncoming
     // copies the handler out under m_mu and invokes it with the mutex RELEASED,
@@ -386,56 +394,198 @@ RpcConnection<Stream>::sendCall(CallMessage msg)
     auto p = std::make_shared<std::promise<ResultMessage>>();
     auto f = p->get_future();
     // The promise is now just one shape of handler. Everything the future path
-    // relied on — registration under m_mu before the write, the stopped
-    // early-out, fail()'s sweep — lives in sendCallAsync and is shared verbatim.
+    // relied on — registration under m_mu before the write, the stopped answer,
+    // fail()'s sweep — lives in sendCallAsync and is shared verbatim, which is
+    // also why this path inherits the register-then-re-check ordering there
+    // instead of needing its own.
     sendCallAsync(std::move(msg), [p](ResultMessage r) {
         try { p->set_value(std::move(r)); } catch (...) {}
     });
     return f;
 }
 
+// REGISTER FIRST, THEN RE-CHECK — the order is the whole of this function, and
+// it is the opposite of what reads naturally.
+//
+// The obvious spelling is "if stopped, answer inline; otherwise register". It
+// has a hole, because the two things it does are ordered the opposite way round
+// from fail(): this reads m_stopped and then takes m_mu, while fail() writes
+// m_stopped and then takes m_mu. A fail() that completes in between sweeps a
+// map this caller has not written to yet —
+//
+//     caller                              fail()
+//     ------------------------------      -------------------------------
+//     m_stopped.load()  -> false
+//                                         CAS m_stopped -> true
+//                                         lock(m_mu); swap(m_pendingCalls)
+//                                         unlock(m_mu)   ... the map was EMPTY
+//     lock(m_mu); m_pendingCalls[id] = h
+//     writeFrame()                        ... drops: stopped
+//
+// — and the handler is left in the pending map of a connection nobody will
+// sweep again. fail() runs once and has been; no reply can arrive on a closed
+// socket; the frame was never written. THE CALL IS ANSWERED BY NOTHING, and
+// what answers instead is the caller's deadline: callMethodAsyncWithError
+// reports "timeout" after its full timeoutMs, and getMethods() after a
+// hard-coded five seconds. A connection already known to be gone is reported as
+// a peer that was merely slow, which is also the code callers retry on.
+//
+// Registering unconditionally and then re-reading m_stopped closes it, and the
+// reason it closes it is an ordering argument rather than a smaller window:
+//
+//   * if fail()'s sweep ran BEFORE the registration, then its CAS ran before
+//     that, so this re-read cannot see false. The reclaim below finds the
+//     entry and answers the call.
+//   * if this re-read DOES see false, then in the total order over m_stopped
+//     this load precedes fail()'s store, and the registration is
+//     sequenced-before this load, so it precedes fail()'s lock of m_mu — the
+//     sweep is guaranteed to find the entry and answer the call.
+//
+// There is no third case, and neither branch can lose the handler: exactly one
+// of the reclaim and the sweep extracts it, because both extract-and-erase
+// under m_mu. That is the same single-winner rule dispatchIncoming and
+// cancelPending already play by, with one more contender.
+//
+// WHAT WAS REJECTED, since the tempting fixes are the ones that deadlock:
+//
+//   * "Hold m_mu across the check AND the delivery" — i.e. answer the doomed
+//     call from inside the lock. It self-deadlocks on the first inline
+//     delivery: a handler here is AsyncCall's, which calls deliver(), which
+//     calls RpcConnectionBase::cancelPending() to withdraw its own
+//     registration, which takes m_mu — and m_mu is not recursive. The same
+//     objection kills the symmetric version (fail() invoking its swept handlers
+//     under the lock). Nothing in this class may invoke a handler with m_mu
+//     held, which is why the reclaim below drops the lock first.
+//   * "Move fail()'s once-only CAS under m_mu and check m_stopped under the
+//     same lock here." Correct, and it does not deadlock — but it makes
+//     teardown's flag wait on a mutex every in-flight send and every decoded
+//     reply also takes, so m_stopped stops being the instantly-visible "stop
+//     writing" signal that writeFrame(), doWrite() and doRead() all read
+//     lock-free. That trades a race for a teardown-latency regression, and
+//     teardown latency is a guarantee here.
+//   * "Let writeFrame() notice." It already re-checks m_stopped on the strand
+//     — and DROPS, silently, which is exactly the state being fixed. It also
+//     cannot answer anything if the io_context is stopped and the posted
+//     handler never runs.
+//
+// The cost is one map insert plus one erase for a call made on a connection
+// that is already dead — a case that used to return without touching the map.
+// That buys a single registration path (the already-stopped call and the raced
+// one are now the same code) instead of two that have to be kept in agreement.
+//
+// ONE BEHAVIOURAL CONSEQUENCE OF REGISTERING UNCONDITIONALLY, which is benign
+// but is not obvious: a call on an already-dead connection is now briefly
+// visible in m_pendingCalls, so a cancelPending() for the same id landing in
+// that window takes the entry and this function delivers nothing. That is
+// correct rather than tolerated. The only thing that can cancel an id whose
+// sendCallAsync has not returned yet is AsyncCall's deadline (armTimer runs
+// before the send), and reaching deliver() means the caller has already had its
+// one callback — a second one would be the bug. It is also exactly what
+// cancelPending() is documented to mean: the caller has been answered, so a
+// later answer must be dropped.
 template <typename Stream>
 void RpcConnection<Stream>::sendCallAsync(CallMessage msg, ResultHandler handler)
 {
     if (!handler) return;
-    if (m_stopped.load()) {
-        // Answered INLINE, on the caller's thread. That is the same shape the
-        // future path had (it set the promise before returning it), and it is
-        // why every handler in this codebase has to be non-blocking and has to
-        // hand user code off to the Qt loop rather than run it here.
-        ResultMessage r;
-        r.id = msg.id; r.ok = false;
-        r.err = "connection stopped"; r.errCode = "TRANSPORT_CLOSED";
-        handler(std::move(r));
-        return;
-    }
+    const uint64_t id = msg.id;
     {
         std::lock_guard<std::mutex> g(m_mu);
-        m_pendingCalls[msg.id] = std::move(handler);
+        m_pendingCalls[id] = std::move(handler);
     }
+
+    if (m_stopped.load()) {
+        // Take back OUR OWN registration — by id, so this can never remove
+        // somebody else's (ids come from nextId() and are unique across both
+        // pending maps). Finding nothing is the ordinary outcome when fail()'s
+        // sweep got here first, and it means the call has already been
+        // answered.
+        ResultHandler mine;
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            auto it = m_pendingCalls.find(id);
+            if (it != m_pendingCalls.end()) {
+                mine = std::move(it->second);
+                m_pendingCalls.erase(it);
+            }
+        }
+        // Answered INLINE, on the caller's thread, with m_mu RELEASED. That is
+        // the same shape the future path had (it set the promise before
+        // returning it), and it is why every handler in this codebase has to be
+        // non-blocking and has to hand user code off to the Qt loop rather than
+        // run it here — this thread can be the io thread, since a user event
+        // callback runs inline on it and is allowed to make calls.
+        if (mine) {
+            ResultMessage r;
+            r.id = id; r.ok = false;
+            r.err = "connection stopped"; r.errCode = "TRANSPORT_CLOSED";
+            mine(std::move(r));
+        }
+        return;
+    }
+
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
 }
 
+// The same register-then-re-check as sendCallAsync, for the same reason and
+// with the same ordering argument — see the comment there. Kept as its own
+// registration rather than folded into that one because the maps hold different
+// things (a promise, not a handler); what must not diverge is the ORDER, and it
+// does not.
+//
+// It matters more here, if anything: the only caller, getMethods(), waits on
+// this future for a hard-coded five seconds that no caller can shorten, so a
+// lost registration is a fixed five-second stall in module introspection every
+// time a connection drops underneath it.
 template <typename Stream>
 std::future<MethodsResultMessage>
 RpcConnection<Stream>::sendMethods(MethodsMessage msg)
 {
     auto p = std::make_shared<std::promise<MethodsResultMessage>>();
     auto f = p->get_future();
-    if (m_stopped.load()) {
-        MethodsResultMessage r;
-        r.id = msg.id; r.ok = false; r.err = "connection stopped";
-        p->set_value(std::move(r));
-        return f;
-    }
+    const uint64_t id = msg.id;
     {
         std::lock_guard<std::mutex> g(m_mu);
-        m_pendingMethods[msg.id] = p;
+        m_pendingMethods[id] = p;
     }
+
+    if (m_stopped.load()) {
+        std::shared_ptr<std::promise<MethodsResultMessage>> mine;
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            auto it = m_pendingMethods.find(id);
+            if (it != m_pendingMethods.end()) {
+                mine = std::move(it->second);
+                m_pendingMethods.erase(it);
+            }
+        }
+        if (mine) {
+            MethodsResultMessage r;
+            r.id = id; r.ok = false; r.err = "connection stopped";
+            // Same containment as fail()'s sweep: a promise whose future has
+            // already been consumed throws, and that is not this caller's
+            // problem.
+            try { mine->set_value(std::move(r)); } catch (...) {}
+        }
+        return f;
+    }
+
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
     return f;
 }
 
+// THE THIRD REGISTRATION WITH THE SAME SHAPE, and deliberately NOT given the
+// same treatment — recorded here so the next reader does not have to wonder
+// whether it was missed. A fail() landing between the map write below and the
+// writeFrame() leaves a callback in m_eventCallbacks that fail() has already
+// cleared, exactly as it would have left a pending call.
+//
+// What that costs is different in kind, and that is the whole reason: nobody is
+// WAITING on a subscription. There is no deadline to blow, no error code to get
+// wrong and no caller to strand — the connection is dead, so no event can ever
+// arrive to invoke it, and the entry dies with the connection (which the handle
+// does not outlive). Adding a reclaim here would buy one map erase and a second
+// mutex round trip on the subscribe path in exchange for nothing observable, so
+// the pending maps get the fix and this does not.
 template <typename Stream>
 void RpcConnection<Stream>::sendSubscribe(SubscribeMessage msg,
                                           std::function<void(EventMessage)> cb)
