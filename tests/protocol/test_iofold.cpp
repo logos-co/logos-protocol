@@ -84,6 +84,8 @@
 #include "plain_transport_connection.h"
 #include "plain_transport_host.h"
 
+#include "live_host_teardown.h"
+
 #include <boost/asio/ip/tcp.hpp>
 
 #include <QCoreApplication>
@@ -399,7 +401,8 @@ public:
     {
         m_provider.letGo();
         QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
-        m_host.reset();
+        // On the PROXY's thread, not this one — see live_host_teardown.h.
+        logos::testing::destroyHostOnProxyThread(m_host, m_proxy);
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
         m_thread->quit();
         m_thread->wait();

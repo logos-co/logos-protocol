@@ -59,6 +59,12 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # the failure mode that would make the whole thing unshippable. Every one of
 # those was checked by running it — against the pre-fix commit for the first two
 # groups, against a throwaway local edit for the last.
+#   PlainHostEventTeardownTest.QueuedEmissionsNeverOutliveTheHost
+#
+# The last one is a detector for the HARNESS rather than for the transport, and
+# it is checked the same way: put a plain `m_host.reset()` back in its fixture
+# and it takes the process down with SIGSEGV on the first round, with or without
+# a memory detector. The backtrace it produces is recorded in the file.
 #
 # Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
 # the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
@@ -216,6 +222,16 @@ add_executable(protocol_tests
     # early-return path, many threads at once, and the shipped
     # release()-from-an-io-thread-event-callback shape.
     test_sync_call_release_race.cpp
+    # A test of the HARNESS the five tests above run on. Each of them puts a
+    # ModuleProxy on a worker QThread and publishes it through a
+    # PlainTransportHost, and each of them used to free that host from the TEST
+    # thread — while the worker was inside the direct-connection lambda
+    # publishObject() hooked onto eventResponse, which locks the host's m_mu
+    # after converting the payload. Shared fixture code, so a fault there can
+    # corrupt any run in this binary. Pins the ordering that live_host_teardown.h
+    # now owns: the host is destroyed ON the proxy's thread, every emission
+    # queued before that runs against a live host, and none runs after.
+    test_plain_host_event_teardown.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp

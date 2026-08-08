@@ -44,6 +44,8 @@
 
 #include "plain_transport_host.h"
 
+#include "live_host_teardown.h"
+
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QJsonArray>
@@ -154,8 +156,9 @@ public:
     {
         // Order matters: tear the host down FIRST so no inbound frame can be
         // dispatched to the proxy while we are dismantling it, then stop the
-        // proxy's thread, then delete the proxy it was serving.
-        m_host.reset();
+        // proxy's thread, then delete the proxy it was serving. The teardown
+        // itself runs on the PROXY's thread — see live_host_teardown.h.
+        logos::testing::destroyHostOnProxyThread(m_host, m_proxy);
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
         m_thread->quit();
         m_thread->wait();
