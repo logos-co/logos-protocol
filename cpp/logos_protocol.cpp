@@ -424,6 +424,23 @@ lp_subscription* lp_subscribe(lp_client* client,
             const QByteArray nameUtf8 = name.toUtf8();
             cb(nameUtf8.constData(), json.c_str(), user_data);
         });
+
+    if (!sub->id) {
+        // The consumer refused the arguments (empty object/event name, or a
+        // null callback). Returning the handle anyway would hand the caller
+        // something that can never fire, while the ABI documents NULL as the
+        // one signal that the arguments were refused — a silent dead
+        // subscription, which is the exact failure this whole change removes.
+        //
+        // Defensive, and not reachable today: the guard at the top of this
+        // function already rejects an empty event name and a null callback, and
+        // lp_client_create rejects an empty target, so the three inputs that
+        // make onEventWhenAvailable() return 0 cannot all arrive here. Hence no
+        // test drives it — the two contracts simply have to agree, and one of
+        // them changing is how they would stop agreeing.
+        delete sub;
+        return nullptr;
+    }
     return sub;
 }
 

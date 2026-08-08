@@ -155,13 +155,24 @@ public:
      *
      * Never blocks and never spins a nested event loop.
      *
-     * @return true  the request was accepted; `onReady` WILL be invoked exactly
+     * @return true  the request was accepted; `onReady` will be invoked AT MOST
      *               once, on a later event-loop turn, never synchronously from
      *               inside this call and never from inside the transport's own
      *               read stack.
      * @return false the transport declined (it cannot defer, or is not in a
      *               state to try). `onReady` is NOT invoked, now or ever, and
      *               the caller owns the retry.
+     *
+     * AT MOST once, not exactly once. An accepted request is CANCELLED —
+     * silently, with no callback — if the connection is torn down or rebuilt
+     * (reconnect) or the transport is destroyed, because the in-flight acquires
+     * belong to the connection that owns them. A caller that must not be left
+     * waiting forever therefore cannot treat acceptance as a guaranteed answer:
+     * it has to re-issue after a reconnect, or carry its own deadline. Both are
+     * what LogosAPIConsumer's pending-subscription registry does — reconnected()
+     * re-issues every entry it still holds, which is why a subscription made
+     * through onEventWhenAvailable() survives something the raw transport call
+     * does not.
      */
     virtual bool requestObjectWhenAvailable(const QString& objectName,
                                             AcquireCallback onReady) = 0;
