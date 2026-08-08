@@ -1,6 +1,5 @@
 #include "plain_logos_object.h"
 
-#include "io_context_pool.h"
 #include "logos_async_dispatch.h"
 #include "qvariant_rpc_value.h"
 
@@ -134,20 +133,16 @@ private:
     std::thread m_thread;
 };
 
-// The one place the choice above is made, and the seam that proves it matters.
+// The one place the choice above is made. Every per-call deadline in the process
+// is armed on this context and nothing else is ever posted to it.
 //
-// LOGOS_PLAIN_DETECTOR_BREAK_DEADLINE_ISOLATION is defined ONLY by an explicit
-// `-DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON` configure of the tests tree. It puts
-// the deadline back on the shared io_context — the design this class exists to
-// avoid — so that the tests asserting deadline accuracy under io-thread load can
-// be shown to FAIL. Never defined in a shipped build.
+// The rejected design is one token different — IoContextPool::shared()
+// .ioContext(), the connections' own thread — which is what makes the two tests
+// in test_iofold.cpp that measure deadline accuracy under io-thread load worth
+// having, and how they were validated. See that file for the numbers.
 boost::asio::io_context& deadlineContext()
 {
-#ifdef LOGOS_PLAIN_DETECTOR_BREAK_DEADLINE_ISOLATION
-    return IoContextPool::shared().ioContext();
-#else
     return DeadlineService::shared().context();
-#endif
 }
 
 // Hand `callback(result)` over to the Qt event loop so PlainLogosObject's
@@ -264,43 +259,34 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
     PlainLogosObject::AsyncResultErrorCallback          callback;
     std::atomic<bool>                                   delivered{false};
 
-    // ── the exactly-once gate, and the seam that proves it is load-bearing ───
+    // ── the exactly-once gate ────────────────────────────────────────────────
     //
-    // LOGOS_PLAIN_DETECTOR_BREAK_ONCE is defined by ONE thing: an explicit
-    // `-DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON` configure of the tests tree
-    // (tests/protocol/CMakeLists.txt). It is never defined in a shipped build,
-    // it costs nothing at runtime, and it exists because an "exactly one
-    // callback" assertion that has never been seen to fail is not evidence —
-    // the same suite, built once with the gate removed, must go red. That
-    // replaces the environment-variable probes an earlier draft of this work
-    // carried, which read getenv() once per delivery in the hot path.
-    //
-    // BOTH halves have to go for the assertions to fail, which is itself worth
-    // recording: they are independently sufficient. The CAS is the one that
+    // Three independent callers race for the right to resolve a call — the
+    // reply handler, the deadline and teardown — and exactly one may reach the
+    // user's callback. Two halves, INDEPENDENTLY SUFFICIENT, which is worth
+    // recording because it means neither is redundant: the CAS is the one that
     // also skips the registry erase, the pending withdrawal and the timer
-    // cancel; the swap is what makes the callback itself unrepeatable.
+    // cancel, and the swap is what makes the callback itself unrepeatable.
+    //
+    // This replaced a structural guarantee — one waiter thread, one function
+    // body, and a join proving it had finished — so it is the guarantee in this
+    // file most worth distrusting, and the two tests that actually detect its
+    // absence are named in tests/protocol/CMakeLists.txt. The per-path
+    // exactly-once assertions are NOT among them: a call resolved once calls
+    // deliver() once whatever guards it.
     bool claim()
     {
-#ifdef LOGOS_PLAIN_DETECTOR_BREAK_ONCE
-        delivered.store(true, std::memory_order_release);
-        return true;
-#else
         bool expected = false;
         return delivered.compare_exchange_strong(expected, true,
                                                  std::memory_order_acq_rel);
-#endif
     }
 
     PlainLogosObject::AsyncResultErrorCallback takeCallback()
     {
         std::lock_guard<std::mutex> g(cbMu);
-#ifdef LOGOS_PLAIN_DETECTOR_BREAK_ONCE
-        return callback;                       // copy, so it can fire twice
-#else
         PlainLogosObject::AsyncResultErrorCallback cb;
         cb.swap(callback);
         return cb;
-#endif
     }
 
     // Idempotent by construction: every later caller returns without touching

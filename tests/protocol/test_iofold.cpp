@@ -34,16 +34,28 @@
 //   5. NO USE-AFTER-FREE, which is what replaced the join. Nothing waits for the
 //      io thread; instead no handler can reach the handle.
 //
-// HOW THE DETECTORS ARE VALIDATED. Configure the tests tree once with
+// HOW THE DETECTORS ARE VALIDATED. By running them against a transport that
+// does not have the mechanism, in a throwaway checkout — two edits, neither of
+// which is carried in this tree:
 //
-//   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
+//   (a) AsyncCall::claim() stores `delivered` and returns true unconditionally
+//       instead of compare-exchanging it, and takeCallback() returns a COPY of
+//       the callback instead of swapping it out. Both halves have to go: they
+//       are independently sufficient.
+//   (b) deadlineContext() returns IoContextPool::shared().ioContext() — the
+//       connections' own thread — instead of DeadlineService::shared()
+//       .context(). That is the rejected design named in the DeadlineService
+//       comment, so this measures the regression that class exists to prevent.
 //
-// which compiles the transport with (a) the exactly-once CAS removed and (b) the
-// deadline back on the shared io_context. (It also removes a third mechanism,
-// the completion-subscription serialization, which belongs to
-// test_plain_completion_sub_order.cpp — see tests/protocol/CMakeLists.txt for
-// the full list of what must go red.) In that build these must go RED, and
-// these are the numbers they were seen to go red with:
+// A build option that did this from inside the shipped source was tried and
+// removed: it left a second, knowingly wrong implementation of the exactly-once
+// gate in the production translation unit, which is not a thing a correctness
+// change gets to ship. (An earlier draft used getenv() probes and was worse in
+// the same way.) Doing it as a local edit costs one throwaway build and proves
+// the same thing. The related sub-order detector needs no edit at all — it goes
+// red on pristine master; see test_plain_completion_sub_order.cpp.
+//
+// The numbers those runs produced, on an aarch64-darwin box:
 //
 //   ReleaseRacingRepliesInFlightDeliversEachCallOnce  (a)  6-16 double
 //                                                          deliveries per
@@ -52,10 +64,10 @@
 //                                                          at 2002ms
 //   DeadlineFiresWhileTheIoThreadIsBlockedForever     (b)  never fires at all
 //
-// A green run of those in the inverted build means the test is not exercising
-// what it claims to, and is a bug in the test. Two candidates were REJECTED as
-// exactly-once detectors on exactly that ground — see the comment on
-// ReleaseRacingRepliesInFlightDeliversEachCallOnce.
+// A green run of any of those against the stripped transport means the test is
+// not exercising what it claims to, and is a bug in the test. Two candidates
+// were REJECTED as exactly-once detectors on exactly that ground — see the
+// comment on ReleaseRacingRepliesInFlightDeliversEachCallOnce.
 //
 // Everything runs against a live in-process PlainTransportHost over real TCP.
 
@@ -731,9 +743,9 @@ TEST_F(IoFoldTest, ATimedOutCallThatIsLaterAnsweredStillDeliversOnce)
 // — not a handful of instructions. Both paths then arrive at deliver() for the
 // same AsyncCall, and the CAS is the only thing deciding.
 //
-// With LOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON this must report double
-// deliveries. If it does not, the exactly-once assertions everywhere else in
-// this file are decoration.
+// Against a transport with the gate removed (edit (a) at the top of this file)
+// this must report double deliveries. If it does not, the exactly-once
+// assertions everywhere else in this file are decoration.
 TEST_F(IoFoldTest, ReleaseRacingRepliesInFlightDeliversEachCallOnce)
 {
     LiveHost host;

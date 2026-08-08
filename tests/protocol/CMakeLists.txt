@@ -1,42 +1,32 @@
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
-# ── validating the detectors ────────────────────────────────────────────────
+# ── which of these tests are detectors, and how that was checked ─────────────
 #
-# A race assertion that has never been seen to fail is not evidence, so the race
-# tests in this directory are checked against the code they were written for:
-# copy the test file onto the pre-fix tree and run it there. For the completion
-# subscription that tree is `master` — it has both the racy ensureCompletionSub()
-# and the raw-`this` handler capture — and the numbers those runs produced are
-# recorded in the test files themselves.
-#
-# Deliberately no build flag, no environment probe and no second implementation
-# in the shipped source. An earlier draft carried both, and the cost is the same
-# either way: production code grows a path whose only purpose is to be wrong.
-# Running the real pre-fix code is also the stronger evidence, because it proves
-# the test catches the bug that actually existed rather than a hand-written
-# imitation of it.
-
-# ── detector inversions: OFF, and off in every build that ships ──────────────
-#
-# An assertion that has never been seen to fail is not evidence. Two of the
+# A race assertion that has never been seen to fail is not evidence. Three of the
 # guarantees in this suite are single points of mechanism — the exactly-once CAS
-# in AsyncCall::deliver(), and the deadline living on its own thread rather than
-# the shared io thread — so the suite has to be runnable ONCE with each of them
-# removed, and go red.
+# in AsyncCall::deliver(), the deadline living on its own thread rather than the
+# shared io thread, and the serialization that keeps a concurrent first caller
+# from outrunning the completion subscription — so each was checked by running
+# the tests against code that does not have it.
 #
-# This is a build option rather than the environment-variable probes an earlier
-# draft carried. Those shipped in the production translation unit, read getenv()
-# once per delivery in the hot path, and one of them compiled a raw-`this`
-# use-after-free path into the binary that a released build would happily
-# execute if the variable were set. A compile-time seam costs nothing at runtime
-# and cannot be turned on by accident: it is not referenced by nix/tests.nix or
-# by any packaging, so a shipped build cannot have it.
+# That check is done on the PRE-FIX TREE, not on a switch in this one: copy the
+# test file onto the commit the fix replaced and run it there. For the completion
+# subscription that tree is `master`, which still has both the racy
+# ensureCompletionSub() and the raw-`this` handler capture; for the fold's two
+# mechanisms it is a local edit to the transport, made in a throwaway checkout
+# and thrown away with it. The numbers each run produced are recorded in the test
+# files themselves.
 #
-#   cmake -S tests -B build-broken -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON
-#   ./build-broken/protocol/protocol_tests --gtest_filter='IoFoldTest.*:\
-#PlainCompletionSubOrderTest.*:PlainCancelPendingRaceTest.*'
+# Deliberately not a build option, and not the environment-variable probes an
+# earlier draft carried. Both have the same cost, which the getenv() version only
+# made more obvious: production source ends up holding a second implementation of
+# its own contract whose entire purpose is to be wrong, in a change whose entire
+# purpose is correctness. Running the real pre-fix code is also better evidence,
+# because it proves the test catches the bug that existed rather than a
+# hand-written imitation of it.
 #
-# SIX tests must go RED there, and no others:
+# WHICH TESTS ARE DETECTORS, since it is not all of them and the difference
+# matters when one goes green. Only these fail on code missing the mechanism:
 #
 #   IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce
 #   IoFoldTest.DeadlineFiresOnTimeWhileTheIoThreadIsBusy
@@ -45,26 +35,12 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
 #   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
 #
-# A green run of any of those in this build means the corresponding real
-# assertion is not exercising what it claims to, which is a bug in the test, not
-# a licence to trust it. Note what is NOT on the list: the per-path exactly-once
-# tests stay GREEN with the CAS removed. They are pins, not detectors — only
-# racing teardown against replies in flight (the first entry) and the
-# hand-built extract-then-cancel interleaving (the last) actually catch a
-# doubled callback.
-option(LOGOS_PROTOCOL_DETECTOR_INVERSIONS
-       "Compile the plain transport with its exactly-once gate and its \
-independent deadline clock REMOVED, so the tests that assert them can be shown \
-to fail. Never enable outside a throwaway detector build." OFF)
-
-if(LOGOS_PROTOCOL_DETECTOR_INVERSIONS)
-    message(WARNING "LOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON: this build is "
-                    "DELIBERATELY BROKEN and is only useful for validating the "
-                    "test suite's detectors.")
-    target_compile_definitions(logos_protocol PUBLIC
-        LOGOS_PLAIN_DETECTOR_BREAK_ONCE=1
-        LOGOS_PLAIN_DETECTOR_BREAK_DEADLINE_ISOLATION=1)
-endif()
+# Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
+# the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
+# deliver() once no matter what guards it — and only racing teardown against
+# replies in flight (the first entry) and the hand-built extract-then-cancel
+# interleaving (the last) actually catch a doubled callback. Do not read a green
+# per-path test as evidence the gate is there.
 
 add_executable(protocol_tests
     test_main.cpp

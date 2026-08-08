@@ -21,8 +21,11 @@
 // connection stub reproduces dispatchIncoming's extract-then-invoke exactly and
 // lets the test stand between the two halves.
 //
-// The second test must go RED under -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON,
-// which removes the CAS. Seen there: 2 deliveries for 1 call.
+// The second test is a validated detector: against a transport whose
+// AsyncCall::claim() does not compare-exchange and whose takeCallback() copies
+// rather than swaps — a local edit in a throwaway checkout, not a switch in
+// this tree; see the top of test_iofold.cpp — it reports 2 deliveries for 1
+// call.
 
 #include <gtest/gtest.h>
 
@@ -207,8 +210,8 @@ TEST(PlainCancelPendingRaceTest, CancelPendingCannotStopAnAlreadyExtractedHandle
 //
 // The same gap, but with the second resolver being the one that actually exists
 // in production — teardown, which cancels every outstanding call. Both paths
-// reach AsyncCall::deliver() for the same call. Under
-// -DLOGOS_PROTOCOL_DETECTOR_INVERSIONS=ON this reports 2.
+// reach AsyncCall::deliver() for the same call. With the CAS removed this
+// reports 2.
 TEST(PlainCancelPendingRaceTest, AnExtractedReplyRacingTeardownDeliversExactlyOnce)
 {
     ensureApp();
