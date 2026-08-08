@@ -14,10 +14,10 @@
 // it, which is why these tests are written straight-line rather than as races.
 //
 // VALIDATED AGAINST THE REAL PRE-FIX CODE, not against an imitation of it. Every
-// test below except the last three compiles UNMODIFIED on
-// feat/plain-async-io-fold (#46, cf1b9b0) and on master (c1b0a0f) — neither
-// causes or fixes this — and every one of them goes RED there. Numbers from
-// aarch64-darwin, Qt 6.9.2, Debug, on cf1b9b0 (master is within noise of it):
+// PlainEventSubSharingTest below compiles UNMODIFIED on feat/plain-async-io-fold
+// (#46, cf1b9b0) and on master (c1b0a0f) — neither causes or fixes this — and
+// nine of the ten go RED on both. Numbers from aarch64-darwin, Qt 6.9.2, Debug,
+// on cf1b9b0 (master is within noise of it):
 //
 //   ASecondHandleDoesNotStealTheFirstsCompletionChannel
 //        handle A alone         -> 8/8 answered, 0 ms avg
@@ -349,18 +349,6 @@ struct WirePair {
 // The probe is a handle that never subscribes to anything (getMethods does not
 // touch the completion channel), so it changes nothing it is measuring.
 void wireBarrier(PlainLogosObject* probe) { probe->getMethods(); }
-
-// Spin until `pred` holds or `budgetMs` elapses. Returns whether it held.
-template <typename Pred>
-bool waitFor(Pred pred, int budgetMs)
-{
-    QElapsedTimer t; t.start();
-    while (!pred()) {
-        if (t.elapsed() > budgetMs) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
-}
 
 // A counter the subscription callback owns a share of, so it stays valid after
 // the handle that created it has been deleted.
@@ -790,8 +778,6 @@ TEST(PlainEventSubSharingTest, SubscriptionsSurviveChurn)
         // the churn produced has reached the provider. The audit that follows is
         // therefore an EXACT count, not a poll with a timeout.
         wireBarrier(probe);
-        int live = 0;
-        for (auto& s : handles) if (s.subscribed) ++live;
         for (auto& s : handles) if (s.subscribed) ++s.expected;
 
         provider.emitEvent("churn", "beat", QVariantList{ QVariant(r) });
@@ -803,7 +789,6 @@ TEST(PlainEventSubSharingTest, SubscriptionsSurviveChurn)
             if (got < s.expected) { ++lost; s.expected = got; }
             else if (got > s.expected) { ++spurious; s.expected = got; }
         }
-        (void)live;
     }
 
     stop.store(true);
