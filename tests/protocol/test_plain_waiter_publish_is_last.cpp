@@ -932,15 +932,50 @@ TEST_F(PlainWaiterPublishIsLastTest, PublishedWaiterDoesNotTouchTheRegistryAgain
     // Every registry read below is a TRY-lock: if the reap ever started joining
     // with m_waiterMu held, a blocking lock here would hang the suite instead of
     // reporting it.
+    //
+    // THE LOCK IS DROPPED BEFORE THE SLEEP, and that inner scope is the whole
+    // reason this probe terminates. Every condition it waits for is one only the
+    // WAITER can produce, and the waiter produces all of them under this very
+    // mutex — reapFinishedWaiters() takes it to erase the bait,
+    // publishFinishedWaiter() takes it to append the id. Sleeping inside the
+    // lock's scope therefore does not poll the waiter, it BLOCKS it: the probe
+    // would hold m_waiterMu for the whole 200us and yield it only for the few
+    // nanoseconds between the unlock and the next try_to_lock, and std::mutex
+    // hands off by barging rather than FIFO, so the waiter only gets in when it
+    // happens to be running on another core at that instant. That is a lottery
+    // with no bound on it, and it is what made this test flaky:
+    //
+    //   * measured with the lock held across the sleep, by counting iterations:
+    //     the probe acquired the mutex on essentially EVERY iteration (455/455,
+    //     567/567, ~0 try-lock misses) while the waiter needed anywhere from 1
+    //     to 700+ attempts to get a single acquisition through;
+    //   * the wall clock is that count times the cost of an iteration, and on a
+    //     loaded or virtualised runner the 200us sleep really costs ~20ms, so a
+    //     few hundred attempts is the 10s budget. Under deliberate CPU
+    //     oversubscription both CI failures reproduced from this one cause, 3
+    //     runs in 25: "the waiter's exit guard never reaped the planted entry"
+    //     (the reap's acquisition lost) and "the waiter never published" (the
+    //     publish's did);
+    //   * on an idle many-core box the woken waiter is dispatched fast enough to
+    //     win within a few dozen attempts, which is why this only ever failed in
+    //     CI and never locally.
+    //
+    // With the lock released the waiter simply blocks on it and takes it the
+    // moment the probe lets go, so each phase completes in one or two
+    // iterations instead of hundreds. Nothing about what is being tested moves:
+    // the window this test needs is held open by gate1, not by timing, and the
+    // budget below stays a backstop rather than the mechanism.
     auto tryWithRegistry = [&](const std::function<bool()>& fn, int budgetMs,
                                bool* lockedAtLeastOnce) -> bool {
         QElapsedTimer t;
         t.start();
         while (t.elapsed() < budgetMs) {
-            std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
-            if (lk.owns_lock()) {
-                if (lockedAtLeastOnce) *lockedAtLeastOnce = true;
-                if (fn()) return true;
+            {
+                std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+                if (lk.owns_lock()) {
+                    if (lockedAtLeastOnce) *lockedAtLeastOnce = true;
+                    if (fn()) return true;
+                }
             }
             QThread::usleep(200);
         }
