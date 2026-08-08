@@ -383,6 +383,16 @@ quint64 LogosAPIClient::onEventWhenAvailable(const QString& objectName, const QS
     });
 }
 
+quint64 LogosAPIClient::whenObjectAvailable(const QString& objectName,
+                                            std::function<void(bool)> onReady)
+{
+    // Same owner-thread marshalling as onEventWhenAvailable: the registry
+    // touches a QtRO node that only works on the thread that created it.
+    return logos::runOnOwnerThread(this, [&]() -> quint64 {
+        return m_consumer->whenObjectAvailable(objectName, std::move(onReady));
+    });
+}
+
 bool LogosAPIClient::cancelEventSubscription(quint64 subscriptionId)
 {
     return logos::runOnOwnerThread(this, [&]() -> bool {

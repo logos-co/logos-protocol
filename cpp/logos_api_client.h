@@ -278,6 +278,21 @@ public:
     }
 
     /**
+     * @brief Call `onReady` once, as soon as the module becomes acquirable.
+     *
+     * The call-path counterpart of onEventWhenAvailable(), for a caller that
+     * must invoke a method on a module which may still be starting: it neither
+     * fails fast (stranding a UI that will never retry) nor calls straight
+     * through into the transport's acquire timeout on the calling thread. Fires
+     * exactly once, is not re-armed on reconnect, and holds no subscription.
+     * See LogosAPIConsumer::whenObjectAvailable for the full contract.
+     *
+     * @return A non-zero id accepted by cancelEventSubscription(), or 0.
+     */
+    quint64 whenObjectAvailable(const QString& objectName,
+                                std::function<void(bool)> onReady);
+
+    /**
      * @brief Stop tracking the subscription with this id.
      *
      * See LogosAPIConsumer::cancelEventSubscription — in particular that it

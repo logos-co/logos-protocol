@@ -206,6 +206,33 @@ public:
                                  std::function<void(bool)> onArmed = {});
 
     /**
+     * @brief Call `onReady` once, as soon as `objectName` becomes acquirable.
+     *
+     * The CALL-path counterpart of onEventWhenAvailable(): the same question
+     * ("is the module there?") asked without blocking and without giving up on
+     * the first no. A caller that must invoke a method on a module which may
+     * still be starting waits for this instead of either failing fast (which
+     * strands a UI that will never retry) or calling straight through (which
+     * sits in the transport's acquire timeout on whatever thread it was called
+     * from — the GUI thread, in practice).
+     *
+     * Fires exactly once: true when the object is acquirable, false only when
+     * the transport proves it never will be. It is NOT re-armed on reconnect —
+     * a one-shot readiness answer that arrives twice is not an answer — and it
+     * does NOT hold a subscription, so nothing has to be cancelled afterwards.
+     * If the object never appears, it never fires; cancelEventSubscription()
+     * accepts the returned id, and callers with a deadline should use it.
+     *
+     * Shares the same registry, timer and diagnostics as onEventWhenAvailable;
+     * a pending readiness wait shows up in pendingSubscriptions() as
+     * "<object>::(readiness)".
+     *
+     * @return A non-zero id for cancelEventSubscription(), or 0 if refused.
+     */
+    quint64 whenObjectAvailable(const QString& objectName,
+                                std::function<void(bool)> onReady);
+
+    /**
      * @brief Stop tracking the subscription with this id.
      *
      * A subscription that is still PENDING leaves the registry entirely, so it

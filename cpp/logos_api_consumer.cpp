@@ -43,14 +43,16 @@ public:
     }
 
     quint64 add(const QString& objectName, const QString& eventName,
-                LogosObject::EventCallback cb, std::function<void(bool)> onArmed)
+                LogosObject::EventCallback cb, std::function<void(bool)> onArmed,
+                bool readinessOnly = false)
     {
         Entry e;
-        e.id         = m_nextId++;
-        e.objectName = objectName;
-        e.eventName  = eventName;
-        e.callback   = std::move(cb);
-        e.onArmed    = std::move(onArmed);
+        e.id            = m_nextId++;
+        e.objectName    = objectName;
+        e.eventName     = eventName;
+        e.callback      = std::move(cb);
+        e.onArmed       = std::move(onArmed);
+        e.readinessOnly = readinessOnly;
         e.since.start();
         const quint64 id = e.id;
         m_entries.push_back(std::move(e));
@@ -108,7 +110,8 @@ public:
     {
         QStringList out;
         for (const Entry& e : m_entries)
-            out << (e.objectName + QStringLiteral("::") + e.eventName);
+            out << (e.objectName + QStringLiteral("::")
+                    + (e.readinessOnly ? QStringLiteral("(readiness)") : e.eventName));
         return out;
     }
 
@@ -157,6 +160,11 @@ private:
         std::function<void(bool)> onArmed;
         QElapsedTimer since;
         int warnLevel = 0;   // 0 = quiet, 1 = warned at 3s, 2 = warned at 60s
+        // Readiness-only: the caller wants to know WHEN the object becomes
+        // acquirable, not to subscribe to anything. Fires onArmed exactly once
+        // and is then forgotten — it is not re-armed on reconnect, because a
+        // one-shot readiness answer that arrives twice is not an answer.
+        bool readinessOnly = false;
     };
 
     // What the transport said when we asked it to acquire an object.
@@ -395,6 +403,13 @@ private:
         // while iterating it would be a use-after-free.
         QVector<Entry> matched = takeMatching(objectName);
         for (Entry& e : matched) {
+            if (e.readinessOnly) {
+                // No subscription to attach — the caller only wanted to know
+                // the object had become acquirable. Answer once and forget it;
+                // keeping it would re-answer on every reconnect.
+                if (e.onArmed) e.onArmed(true);
+                continue;
+            }
             handle->onEvent(e.eventName, e.callback);
             // Log at the level that matches what was already said: if we
             // warned that this one was pending, close the loop out loud;
@@ -553,6 +568,21 @@ LogosSubscriptionState LogosAPIConsumer::eventSubscriptionState(quint64 subscrip
 {
     if (!subscriptionId || !m_pendingSubs) return LogosSubscriptionState::Unknown;
     return m_pendingSubs->state(subscriptionId);
+}
+
+quint64 LogosAPIConsumer::whenObjectAvailable(const QString& objectName,
+                                              std::function<void(bool)> onReady)
+{
+    if (objectName.isEmpty() || !onReady) {
+        qWarning() << "LogosAPIConsumer::whenObjectAvailable: empty object name or null "
+                      "callback -- refusing" << objectName;
+        if (onReady) onReady(false);
+        return 0;
+    }
+    if (!m_pendingSubs)
+        m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
+    return m_pendingSubs->add(objectName, QString(), {}, std::move(onReady),
+                              /*readinessOnly=*/true);
 }
 
 QStringList LogosAPIConsumer::pendingSubscriptions() const
