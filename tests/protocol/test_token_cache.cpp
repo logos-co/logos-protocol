@@ -38,6 +38,7 @@
 #include "token_manager.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QString>
 #include <QUuid>
@@ -232,4 +233,79 @@ TEST_F(TokenCacheTest, AsyncCallsToSameTargetHandshakeOnceAcrossBursts)
         << capProvider.mintCount() << ". The first burst is coalesced by "
            "m_pendingHandshakes; the second burst should reuse the cached "
            "token written in the requestModule callback.";
+}
+
+// The caller's budget must bound the TOKEN EXCHANGE, not only the call.
+//
+// LogosAPIClient::invokeRemoteMethod takes a Timeout, but on an un-tokened
+// target the capability handshake runs FIRST — and it used to hardcode 20 s
+// twice (the capability_module acquire and the requestModule call on it). So a
+// caller asking for 1500 ms could block on the order of 40 s before the part it
+// had actually bounded even began. logos-view-module-runtime's callModule
+// documented a 1500 ms bound on exactly this path; that bound was not real.
+//
+// capability_module is deliberately NEVER PUBLISHED here, so the acquire runs
+// out its budget instead of succeeding. That is the whole point: this measures
+// the timeout path, which is the one that was wrong. Every other test in this
+// file publishes it and therefore never exercises the wait at all — which is
+// how a hardcoded 20 s survived alongside them.
+//
+// TWO-SIDED on purpose. The upper bound alone would pass if something else made
+// the acquire return instantly, leaving the hardcoded 20 s in place and the test
+// green for the wrong reason:
+//
+//   * >= budget  proves the acquire really did wait, i.e. the timeout path ran;
+//   * <  4×budget proves it waited for the CALLER's budget rather than the 20 s
+//     default. Pre-fix this side fails at ~20 s.
+TEST_F(TokenCacheTest, UnTokenedCallBoundsTheHandshakeByTheCallersBudget)
+{
+    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+
+    PingProvider targetProvider;
+    ModuleProxy  targetProxy(&targetProvider);
+    targetProvider.bindProxy(&targetProxy);
+    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+
+    // A capability token exists, so the client tries the handshake — but there
+    // is no capability_module host and no published object to reach.
+    TokenManager::instance().saveToken(QStringLiteral("capability_module"),
+                                       QStringLiteral("bootstrap-tok-budget"));
+
+    LogosAPIClient client(QStringLiteral("target_module"),
+                          QStringLiteral("test_origin"),
+                          &TokenManager::instance());
+
+    for (int i = 0; i < 100 && !client.isConnected(); ++i) pumpEventLoop(20);
+    ASSERT_TRUE(client.isConnected());
+
+    constexpr int kBudgetMs = 1500;
+
+    QElapsedTimer t;
+    t.start();
+    // The result is not asserted: with capability_module absent the handshake
+    // cannot mint a token, so whether the target accepts the call is a separate
+    // question from the one under test. What is asserted is how long being told
+    // so takes.
+    client.invokeRemoteMethod(QStringLiteral("target_module"),
+                              QStringLiteral("ping"),
+                              QVariantList{},
+                              Timeout(kBudgetMs));
+    const qint64 elapsed = t.elapsed();
+
+    // A 200 ms slack below the budget rather than the exact figure: a deadline
+    // that expires a few ms early is a scheduling detail, and a knife-edge
+    // assertion here would turn this into a flake. Anything that short-circuits
+    // the acquire returns in single-digit ms, so the discrimination is intact.
+    EXPECT_GE(elapsed, kBudgetMs - 200)
+        << "the handshake returned in " << elapsed << "ms without consuming its "
+        << kBudgetMs << "ms budget, so the capability acquire never actually "
+           "waited. This test cannot say anything about the timeout path unless "
+           "that path runs — fix the fixture rather than the bound.";
+
+    EXPECT_LT(elapsed, 4 * kBudgetMs)
+        << "an un-tokened call with a " << kBudgetMs << "ms budget took "
+        << elapsed << "ms. The capability handshake is ignoring the caller's "
+           "budget — it used to hardcode 20000 twice in "
+           "LogosAPIConsumer::requestModule, which is ~40s of blocking in front "
+           "of a bound the caller believed was 1500ms.";
 }
