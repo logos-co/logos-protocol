@@ -13,6 +13,7 @@
 #include <QMetaObject>
 #include <QTimer>
 #include <QTime>
+#include <QElapsedTimer>
 #include <QPointer>
 #include <QElapsedTimer>
 #include <QSet>
@@ -838,9 +839,11 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
         // surface existed. Returning false here instead would hand the caller an
         // empty grant that it has no way to distinguish from a real denial.
         //
-        // This cannot reintroduce the startup wedge: the wait below is bounded by
-        // the caller's own budget (capability_module passes 3000 ms), not by the
-        // 20 s default that made the original deadlock fatal.
+        // The wait below is bounded by the caller's own budget. Note what that
+        // is worth in the path that matters: capability_module reaches here
+        // through the FOUR-argument informModuleToken_module
+        // (capability_module_plugin.cpp:112), so timeoutMs takes this header's
+        // 20 s default. The budget is real, it is just not short.
         qWarning() << "LogosAPIConsumer: handshake surface of" << originModule
                    << "refused the token for" << moduleName
                    << "- it is probably still initializing; retrying on the business object";
@@ -869,20 +872,45 @@ bool LogosAPIConsumer::informModuleTokenViaBusinessObject(const QString& authTok
     return result;
 }
 
-std::string LogosAPIConsumer::requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule)
+// timeoutMs bounds the WHOLE handshake — the capability_module acquire plus the
+// requestModule call on it — not each half. Two hardcoded 20 s waits used to
+// live here, which is why a caller that asked for a short budget did not get
+// one: LogosAPIClient::invokeRemoteMethod takes a Timeout, but the token
+// exchange that runs FIRST on an un-tokened target ignored it, so a call
+// advertising a 1500 ms bound could block on the order of 40 s before the
+// bounded part even started. A budget that only covers the second half of an
+// operation is not a budget.
+//
+// The acquire and the call therefore share one deadline rather than getting one
+// each. Halving it would be arbitrary, and giving each the full amount would
+// make the worst case twice what the caller asked for.
+std::string LogosAPIConsumer::requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule, int timeoutMs)
 {
     const QString qOrigin = QString::fromStdString(originModule);
     const QString qTarget = QString::fromStdString(targetModule);
-    qDebug() << "LogosAPIConsumer: requestModule for origin:" << qOrigin << "target:" << qTarget;
+    qDebug() << "LogosAPIConsumer: requestModule for origin:" << qOrigin << "target:" << qTarget
+             << "budget:" << timeoutMs << "ms";
 
-    LogosObject* plugin = m_transport->requestObject("capability_module", 20000);
+    QElapsedTimer budget;
+    budget.start();
+
+    LogosObject* plugin = m_transport->requestObject("capability_module", timeoutMs);
     if (!plugin) {
-        qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object: capability_module";
+        qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object: capability_module"
+                   << "after" << budget.elapsed() << "ms of a" << timeoutMs << "ms budget";
         return {};
     }
 
+    // What is left of the budget. Never 0: a transport reads 0 as "no timeout"
+    // on some paths, so an exhausted budget must ask for the smallest real wait
+    // rather than accidentally asking for an unbounded one.
+    const qint64 spent = budget.elapsed();
+    const int remaining = timeoutMs <= 0
+        ? timeoutMs
+        : static_cast<int>(qMax<qint64>(1, timeoutMs - spent));
+
     QVariant result = plugin->callMethod(QString::fromStdString(authToken), QStringLiteral("requestModule"),
-                                         QVariantList() << qOrigin << qTarget, 20000);
+                                         QVariantList() << qOrigin << qTarget, remaining);
     plugin->release();
     return result.toString().toStdString();
 }

@@ -245,7 +245,11 @@ public slots:
     // modules built before that surface existed. timeoutMs bounds the fallback
     // acquire and the call; the default preserves the historical 20s.
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
-    std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule);
+    // timeoutMs bounds the whole handshake: the capability_module acquire plus
+    // the requestModule call on it share one deadline. Defaulted so existing
+    // callers are source-compatible and keep today's behaviour; pass the
+    // caller's own budget to make a short bound real (see the definition).
+    std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule, int timeoutMs = 20000);
 
 private:
     // Deliver via the target's business object (the pre-handshake path). Used

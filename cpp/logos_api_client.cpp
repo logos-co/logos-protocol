@@ -101,7 +101,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
 
     QString token = getToken(objectName);
     if (token.isEmpty() && eligible)
-        token = mintAndCacheToken(objectName);   // first exchange (cached for later calls)
+        token = mintAndCacheToken(objectName, timeout);   // first exchange (cached for later calls)
 
     QVariant result = m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
 
@@ -115,7 +115,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
         qWarning() << "LogosAPIClient: token for" << objectName
                    << "rejected by provider; re-exchanging and retrying once";
         m_token_manager->removeToken(objectName);
-        const QString fresh = mintAndCacheToken(objectName);
+        const QString fresh = mintAndCacheToken(objectName, timeout);
         if (!fresh.isEmpty())
             result = m_consumer->invokeRemoteMethod(fresh, objectName, methodName, args, timeout, err);
     }
@@ -136,14 +136,15 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     });
 }
 
-QString LogosAPIClient::mintAndCacheToken(const QString& objectName)
+QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout timeout)
 {
     qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
     const QString capabilityToken = getToken(QStringLiteral("capability_module"));
     const QString token = QString::fromStdString(
         m_capability_consumer->requestModule(capabilityToken.toStdString(),
                                              m_origin_module.toStdString(),
-                                             objectName.toStdString()));
+                                             objectName.toStdString(),
+                                             timeout.ms));
     qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
     // Cache the minted token so subsequent calls skip the handshake — closes the
     // token-rotation race where overlapping requestModule calls mint fresh tokens

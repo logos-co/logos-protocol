@@ -342,7 +342,10 @@ private:
     // the first-exchange logic so both the initial fetch and the
     // rejection-driven re-exchange share one path. (Private method — no effect on
     // the ABI-sensitive data layout below.)
-    QString mintAndCacheToken(const QString& objectName);
+    // `timeout` is the CALLER's budget, and it bounds the handshake too. It has
+    // to: the exchange runs before the call on an un-tokened target, so a bound
+    // that skipped it would describe only the second half of the operation.
+    QString mintAndCacheToken(const QString& objectName, Timeout timeout);
 
     // Async invoke with a bounded retry budget backing the public
     // invokeRemoteMethodAsync overloads. On a provider rejection sentinel it
