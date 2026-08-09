@@ -74,6 +74,16 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # calls while PlainSendAfterFailTest's own 10,000-call burst — which stops the
 # CONNECTION mid-burst — reports 5 to 10. Same shape, different contended object,
 # and only the second one sees that path.
+# AND "THE CAS" IS TWO GATES, which is a correction to the paragraph above and
+# was found while re-validating this on the no-Qt binary. AsyncCall guards a
+# duplicate delivery twice: claim()'s compare-exchange, and the swap in
+# takeCallback() that leaves a second caller holding an empty std::function.
+# Removing the CAS ALONE leaves every test here green (0 doubles) because the
+# swap absorbs the duplicate; removing BOTH makes the release-race shape report
+# 22 doubled deliveries in 20 rounds x 500 calls while the per-path tests stay
+# green. Measured on the no-Qt twin
+# (NoQtLoopTest.ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop). A
+# validation that removes one of the two proves nothing.
 
 add_executable(protocol_tests
     test_main.cpp

@@ -739,6 +739,21 @@ TEST_F(NoQtLoopTest, CancelledCallsDeliverWithNoQtLoopAndNotInsideRelease)
 // in-flight map and then delivers one call at a time with the lock released,
 // so the io thread has a window N deliveries wide in which to answer a call
 // teardown has already claimed.
+//
+// VALIDATED AS A DETECTOR HERE, and the validation turned up something about the
+// mechanism that the note in tests/protocol/CMakeLists.txt does not say. There
+// are TWO gates in AsyncCall, not one: claim()'s compare-exchange, and the
+// swap in takeCallback() which leaves a second caller holding an empty
+// std::function. Removing the CAS alone changes nothing measurable — this test,
+// its Qt twin and PlainCancelPendingRaceTest all stay green, 0 doubles — because
+// the swap still absorbs the duplicate. With BOTH removed this test reports 22
+// doubled deliveries in 20 rounds x 500 calls, while the three PER-PATH tests
+// above stay green, which is the difference between a detector and a pin.
+//
+// So: a validation that removes one of the two gates proves nothing, and the
+// exactly-once guarantee is stronger than the CAS on its own. Neither half is
+// redundant — the CAS is what stops the second caller from also erasing
+// registries and cancelling timers — but the CALLBACK is protected by the swap.
 TEST_F(NoQtLoopTest, ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop)
 {
     QtFreeHost host;
