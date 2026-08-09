@@ -45,7 +45,8 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   SyncCallReleaseRaceTest.ConcurrentCallersThatHaveReturnedAreNotAccused
 #   SyncCallReleaseRaceTest.ReleaseFromInsideAnEventCallbackIsNotAccused
 #   every test in NoQtLoopTest (protocol_noqt_tests — see the second executable
-#   at the bottom of this file)
+#   at the bottom of this file), including the after-main() probe whose verdict
+#   is that binary's EXIT CODE
 #
 # The release-race group is three detectors of three different things, which is
 # why all of it is listed. THE FIX: on cf1b9b0 the survival test's child dies by
@@ -307,6 +308,13 @@ add_executable(protocol_noqt_tests
     # already cost a SIGSEGV here, so a "just call it inline" fix would be
     # worse than the bug), and that exactly-once survives the release-racing-
     # replies shape against the new delivery vehicle.
+    #
+    # It also carries a probe that runs AFTER main() returns — a delivery issued
+    # from a static destructor, which is where a lazily-constructed delivery
+    # vehicle is already destroyed. Its verdict is this binary's EXIT CODE (70 on
+    # failure), because no test case runs in that window; see LateDeliveryProbe.
+    # That is also why a failure there shows up as a build-time error from
+    # gtest_discover_tests, which runs this binary to enumerate its tests.
     test_delivery_without_qt.cpp
 )
 

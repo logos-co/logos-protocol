@@ -191,15 +191,58 @@ boost::asio::io_context& deadlineContext()
 //
 // ORDERING. A single thread draining a FIFO, so callbacks are delivered in the
 // order they were resolved — the same property the Qt queued connection gives.
+//
+// AND IT IS NEVER DESTROYED, which is the one design decision in this class that
+// is not obvious and is not free. The first cut made it an ordinary
+// function-local static, and that is a use-after-free: a function-local static
+// is constructed on FIRST DELIVERY, so anything with static storage that was
+// constructed earlier — which is everything constructed before the first async
+// call in the process — is destroyed LATER. Its destructor's delivery then posts
+// into an io_context that has already run its own destructor, on a thread that
+// has already been joined. Reproduced with nothing but the null-connection
+// early-return path: three runs out of three, SIGSEGV under Guard Malloc inside
+// scheduler::post_immediate_completion, reached from a static destructor through
+// __cxa_finalize; and without Guard Malloc, silently, as delivered=0 — the very
+// drop this class exists to fix, moved to a later moment.
+//
+// SO THE OBJECT OUTLIVES EVERY POSSIBLE CALLER, by never being destroyed at all
+// and never registering a destructor to run. A deliberate, bounded leak: ONE
+// io_context and ONE thread, in a process that is ending. What it buys is that
+// postDelivery has no shutdown window — there is no state in which the vehicle
+// is gone but callers remain — so a delivery issued from a static destructor
+// after main() has returned still lands on a live delivery thread. Pinned by a
+// probe that runs after main() in tests/protocol/test_delivery_without_qt.cpp.
+//
+// AND PROCESS EXIT MUST NOT WAIT FOR IT, which is why the thread is DETACHED
+// rather than merely un-joined. exit() does not join threads, so an abandoned
+// thread cannot hold the process open; detaching says so at the one place a
+// future reader would otherwise reintroduce a join. Note what the old
+// destructor's own comment was worried about — a user callback that blocks
+// forever at static-destruction time hanging the join — and that this shape
+// cannot have that failure at all, because there is no join. The hazard was
+// always the reverse of what that comment described: the service died before its
+// callers did.
+//
+// WHAT THE LEAK COSTS, stated rather than waved past. One thread lives from the
+// first Qt-free async delivery to process exit, where it is sitting in the
+// kernel waiting for work; and a callback that is RUNNING when the process exits
+// can be cut off mid-flight, exactly as a Qt slot can be when the event loop's
+// thread is torn down. What it cannot do is post into freed memory, which is
+// what the alternative did.
 class DeliveryService {
 public:
     static DeliveryService& shared()
     {
         // Lazy, like IoContextPool::shared() and DeadlineService::shared(): a
         // process with a Qt event loop never constructs this and never starts
-        // its thread.
-        static DeliveryService svc;
-        return svc;
+        // its thread. `new`, and never deleted: a function-local static of
+        // OBJECT type would register a destructor with __cxa_atexit, which is
+        // precisely the ordering hazard above. A pointer initialised once has no
+        // destructor to register, so nothing about the moment of first use — the
+        // middle of static destruction included — can leave a caller holding a
+        // dead service.
+        static DeliveryService* const svc = new DeliveryService();
+        return *svc;
     }
 
     void post(std::function<void()> fn)
@@ -214,22 +257,20 @@ private:
     DeliveryService()
         : m_guard(boost::asio::make_work_guard(m_ioc))
         , m_thread([this] { m_ioc.run(); })
-    {}
-
-    ~DeliveryService()
     {
-        // stop() means no FURTHER callback is started, so the join can only be
-        // waiting on one already running. A user callback that blocks forever
-        // at static-destruction time would hang here — and would equally hang a
-        // Qt event loop being torn down at the same moment, so this is not a new
-        // exposure. Joining is still the right side to err on: the alternative
-        // is a detached thread running user code while the statics it may touch
-        // are being destroyed.
-        m_guard.reset();
-        m_ioc.stop();
-        if (m_thread.joinable())
-            m_thread.join();
+        // Detached at birth. Nothing will ever join it — see the note above —
+        // and saying so here is what stops a future edit from adding a join to a
+        // thread whose io_context is never stopped, which would hang exit()
+        // forever rather than not at all.
+        m_thread.detach();
     }
+
+    // DELIBERATELY NOT DESTRUCTIBLE. The compiler now enforces what the comment
+    // asks for: no `static DeliveryService svc;`, no unique_ptr, no `delete`,
+    // and therefore no way to reintroduce a destroyed-before-its-callers
+    // service by accident. `new` needs no destructor, so shared() still
+    // compiles.
+    ~DeliveryService() = delete;
 
     boost::asio::io_context m_ioc;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> m_guard;
@@ -262,9 +303,32 @@ private:
 // and a process that has never had one gets the delivery thread. A Qt host
 // therefore sees no behavioural difference at all — which is the point.
 //
-// The residue is stated rather than hidden: the delivery guarantee holds for
-// the whole life of a Qt-free process, and in a Qt process it holds until the
-// application is destroyed. logos_object.h says so.
+// THE RESIDUE, ENUMERATED, because "exactly once" was untrue here once already
+// and a vague replacement is how that happens twice. Three shapes do NOT get a
+// delivery, and all three are properties of the host process, not of the call:
+//
+//   1. A Qt process AFTER ~QCoreApplication. The callback is dropped, by the
+//      decision above.
+//   2. A process that constructs a QCoreApplication and never runs its event
+//      loop. The delivery is queued onto a loop that never turns, so it never
+//      runs. Nothing here can fix that: the callback's whole contract is that it
+//      arrives on the Qt thread, and delivering it anywhere else would be the
+//      thread-affinity violation this hop exists to prevent. Not new, not
+//      introduced here — this is what "queue it onto the Qt loop" has always
+//      meant — but it is a case where the header used to promise exactly once,
+//      so it is named.
+//   3. A process that had a QCoreApplication TRANSIENTLY — constructed and
+//      destroyed while the process goes on to run Qt-free. The latch keeps
+//      dropping for the rest of that process's life. It is the price of the
+//      choice in (1): from inside postDelivery, "the app is gone because the
+//      process is shutting down" and "the app is gone because a helper's app
+//      object went out of scope" are the same observation, and getting (1) wrong
+//      breaks every existing Qt host at exit while getting (3) wrong breaks a
+//      shape no host in this codebase has. The trade is deliberate and is not
+//      hidden: the guarantee below is worded as "a process with no
+//      QCoreApplication in its life", not "a process without one right now".
+//
+// logos_object.h states all three where callers read the contract.
 //
 // Deliberately a FREE function taking everything BY VALUE, and deliberately not
 // a member: the queued lambda runs later, which for a call cancelled by

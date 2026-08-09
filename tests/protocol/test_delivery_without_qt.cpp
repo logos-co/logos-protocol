@@ -29,11 +29,18 @@
 //      callback running on an Asio read handler is the re-entrancy class that
 //      produced a SIGSEGV on the QtRO twin. So the tests assert the callback
 //      did not run inside the call, did not run on the caller's thread, and did
-//      not run on the io thread.
+//      not run on the io thread. "Inside the call" is measured as NESTING, by
+//      the delivering thread, at delivery time — see IssuingScope, and the note
+//      there about why counting deliveries after the call returns is a race
+//      rather than a check.
 //   3. Exactly once still holds with no Qt loop in the process, including when
 //      release() races a burst of arriving replies — the same shape
 //      test_iofold.cpp uses, run here against the delivery thread instead of
 //      the Qt loop.
+//   4. It still arrives AFTER main() HAS RETURNED, from a static destructor —
+//      the window in which a lazily-constructed delivery vehicle is already
+//      dead. No test case can run there, so that one is a static destructor
+//      whose verdict is this binary's exit code; see LateDeliveryProbe.
 //
 // HOW THE DETECTOR WAS VALIDATED: by running this file against the pre-fix
 // tree (feat/plain-async-io-fold, cf1b9b0). Every test below that waits for a
@@ -190,17 +197,31 @@ public:
     {
         m_server = std::make_shared<RpcServerTcp>(
             IoContextPool::shared().ioContext(), "127.0.0.1", 0,
-            std::make_shared<JsonCodec>(), &m_handler);
+            std::make_shared<JsonCodec>(), m_handler);
         m_started = m_server->start();
     }
     ~QtFreeHost() { if (m_server) m_server->stop(); }
 
     bool ok() const { return m_started && m_server->boundPort() != 0; }
     uint16_t port() const { return m_server->boundPort(); }
-    QtFreeHandler& handler() { return m_handler; }
+    QtFreeHandler& handler() { return *m_handler; }
 
 private:
-    QtFreeHandler                  m_handler;
+    // DELIBERATELY LEAKED, and this is a harness lifetime bug that was worth
+    // finding rather than a style choice. RpcServer keeps a RAW
+    // IncomingCallHandler*, hands it to every connection, and nothing joins the
+    // io thread — not stop(), not the server's destruction. So a frame that has
+    // already been read from the socket can be dispatched into the handler after
+    // this object's members would have been destroyed, and a handler that was a
+    // member died first: SIGBUS on the io thread, inside
+    // RpcConnection::dispatchIncoming calling a virtual on freed storage.
+    //
+    // Observed at 1 run in 25 (and 1 in 5 under Guard Malloc) once the run got
+    // slightly longer — a burst test leaves frames queued, and the process has to
+    // stay alive long enough for the io thread to reach them. It is the test's
+    // bug, not the transport's, and the fix is to let the handler outlive the io
+    // thread: one small object per host, in a test binary that is about to exit.
+    QtFreeHandler*                 m_handler = new QtFreeHandler();
     std::shared_ptr<RpcServerTcp>  m_server;
     bool                           m_started = false;
 };
@@ -221,6 +242,35 @@ LogosObjectErrorChannel* channelFor(LogosObject* obj)
     return dynamic_cast<LogosObjectErrorChannel*>(obj);
 }
 
+// ── the inline check, done properly ─────────────────────────────────────────
+//
+// "Did the callback run INLINE inside the call that issued it" is a question
+// about NESTING, and the only place it can be answered is at the moment of
+// delivery, on the delivering thread. This thread-local depth counter is that
+// answer: IssuingScope raises it around an issuing call, and a callback that
+// runs nested inside that call — which can only happen on the issuing thread,
+// because inline means on this stack — sees its own thread's copy raised. A
+// callback on the delivery thread reads that thread's copy, which is zero.
+// Nothing races: no shared state, no ordering, no timing.
+//
+// WHAT THIS REPLACES, because it was wrong in a way worth remembering. The first
+// version of test 1 read `d.total` AFTER callMethodAsyncWithError returned and
+// asserted it was still zero. That is not an inline check, it is a race with the
+// delivery thread — which is allowed to deliver the instant the call returns —
+// and it failed 3 in 200 plain / 2 in 40 under Guard Malloc, always with
+// on-caller-thread=0, i.e. always with nothing whatsoever having run inline.
+// This file already says as much about tests 2 and 5 ("that measures scheduling
+// luck"); test 1 was doing it anyway. A post-hoc count read cannot distinguish
+// "ran inline" from "ran promptly, elsewhere". Nesting can.
+thread_local int t_insideIssue = 0;
+
+struct IssuingScope {
+    IssuingScope()  { ++t_insideIssue; }
+    ~IssuingScope() { --t_insideIssue; }
+    IssuingScope(const IssuingScope&) = delete;
+    IssuingScope& operator=(const IssuingScope&) = delete;
+};
+
 // Per-call delivery counts, plus where the delivery happened. Both 0 and 2 are
 // failures and both are counted per call, because a double on one call and a
 // drop on another cancel out in a total.
@@ -228,6 +278,10 @@ struct Deliveries {
     explicit Deliveries(int n) : counts(n) {}
     std::vector<std::atomic<int>> counts;
     std::atomic<int>              total{0};
+
+    // Deliveries that ran nested inside the call that issued them. Observed by
+    // the delivering thread itself, at delivery time — see IssuingScope.
+    std::atomic<int>              inlineDeliveries{0};
 
     // A thread no delivery may ever run on, counted rather than sampled.
     // Set before the first call is issued and only read after the last has
@@ -247,6 +301,9 @@ struct Deliveries {
 
     void record(int i, QVariant v, const logos::CallError& e)
     {
+        // FIRST, and on the delivering thread: nesting is only observable from
+        // inside the delivery.
+        if (t_insideIssue > 0) inlineDeliveries.fetch_add(1);
         if (forbiddenThread != std::thread::id{}
             && std::this_thread::get_id() == forbiddenThread)
             onForbiddenThread.fetch_add(1);
@@ -295,6 +352,96 @@ void settle(int ms)
 
 const char* kToken = "noqt-token";
 
+// ── the delivery that happens AFTER main() has returned ─────────────────────
+//
+// THE DEFECT THIS PROBE EXISTS FOR. The delivery vehicle used to be an ordinary
+// function-local static, constructed on the FIRST async delivery in the process.
+// Anything with static storage constructed before that — which is everything
+// constructed during dynamic initialisation — is therefore destroyed AFTER it,
+// so a delivery issued from such a destructor posted into an io_context that had
+// already run its own destructor, on a thread that had already been joined. Under
+// Guard Malloc: SIGSEGV in scheduler::post_immediate_completion, reached through
+// __cxa_finalize, three runs out of three. Without it: silence, delivered=0 —
+// which is the exact bug this file was written to kill, moved to a later moment
+// in the process's life.
+//
+// WHY IT IS A STATIC OBJECT AND NOT A TEST CASE. The moment under test is "after
+// main() returned", and no test case runs there. So the check is a destructor,
+// and its verdict is the PROCESS EXIT CODE: a failure calls _Exit with a
+// distinctive status, which is what CI (and `ninja test`) sees, because gtest has
+// long since printed its summary and returned. There is no other way to assert
+// on this window.
+//
+// ORDERING, which is the whole point and is easy to break by accident: this
+// object must be constructed BEFORE the first delivery in the process, so that on
+// a tree that destroys the vehicle it is destroyed AFTER it. Dynamic
+// initialisation gives that for free — and it is why this probe must NOT warm the
+// vehicle up in its own constructor: doing so would register the vehicle's
+// destructor first and hand it the LONGER life, quietly turning the reproduction
+// into a no-op. TheVehicleOutlivesStaticDestructors below does the warm-up, from
+// inside a test, where it lands after all dynamic initialisation.
+std::atomic<int>  g_lateDeliveries{0};
+std::atomic<bool> g_lateOffTheIssuingThread{false};
+std::atomic<bool> g_lateProbeArmed{false};
+
+struct LateDeliveryProbe {
+    LateDeliveryProbe() { g_lateProbeArmed.store(true); }
+
+    ~LateDeliveryProbe()
+    {
+        const std::thread::id issuing = std::this_thread::get_id();
+        std::fprintf(stderr,
+            "\n[post-main] issuing an async call from a static destructor "
+            "(after main() returned)\n");
+        std::fflush(stderr);
+
+        // The null-connection early return: the smallest path that reaches the
+        // delivery hop, with no socket, no host and no io thread of its own.
+        PlainLogosObject obj("nobody", nullptr);
+        obj.callMethodAsyncWithError(kToken, QStringLiteral("ping"), {}, 1000,
+            [issuing](QVariant, const logos::CallError&) {
+                if (std::this_thread::get_id() != issuing)
+                    g_lateOffTheIssuingThread.store(true);
+                g_lateDeliveries.fetch_add(1);
+            });
+
+        // Bounded, like every other wait in this file: the passing case is fast
+        // and the failing case is unambiguous rather than a hang at exit.
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(5000);
+        while (g_lateDeliveries.load() == 0
+               && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+        const int  delivered = g_lateDeliveries.load();
+        const bool offThread = g_lateOffTheIssuingThread.load();
+        std::fprintf(stderr,
+            "[post-main] delivered=%d off-the-issuing-thread=%d\n",
+            delivered, static_cast<int>(offThread));
+        std::fflush(stderr);
+
+        if (delivered != 1 || !offThread) {
+            std::fprintf(stderr,
+                "\nPOST-MAIN DELIVERY FAILED: callMethodAsyncWithError promises "
+                "its callback exactly once, and a delivery issued after main() "
+                "returned got %d of them%s.\n"
+                "  The delivery vehicle must outlive every possible caller, "
+                "which for a process-wide static means it must never be "
+                "destroyed. See DeliveryService in plain_logos_object.cpp.\n",
+                delivered,
+                (delivered == 1 && !offThread)
+                    ? " (and ran on the issuing thread, which is the inline "
+                      "delivery the hop exists to prevent)"
+                    : "");
+            std::fflush(stderr);
+            std::_Exit(70);
+        }
+    }
+};
+
+// Constructed during dynamic initialisation; destroyed after main(). See above.
+LateDeliveryProbe g_lateDeliveryProbe;
+
 } // namespace
 
 class NoQtLoopTest : public ::testing::Test {
@@ -324,21 +471,25 @@ TEST_F(NoQtLoopTest, AFailedCallDeliversItsCallbackWithNoQtLoop)
     const std::thread::id caller = std::this_thread::get_id();
     d.forbiddenThread = caller;
 
-    obj.callMethodAsyncWithError(kToken, QStringLiteral("ping"), {}, 1000,
-                                 [&d](QVariant v, const logos::CallError& e) {
-                                     d.record(0, std::move(v), e);
-                                 });
-    // One call, so this one IS the inline check: the callback cannot have run
-    // yet, because the only thread that could have run it inline is this one and
-    // it is here.
-    const int inlineDeliveries = d.total.load();
+    {
+        // The nesting marker, raised for exactly the duration of the call. A
+        // callback that runs inline runs INSIDE this scope, on this thread, and
+        // says so from inside itself — which is a fact about the stack and not
+        // about who won a race. Reading d.total after the call returns would be
+        // the race; see IssuingScope.
+        IssuingScope inCall;
+        obj.callMethodAsyncWithError(kToken, QStringLiteral("ping"), {}, 1000,
+                                     [&d](QVariant v, const logos::CallError& e) {
+                                         d.record(0, std::move(v), e);
+                                     });
+    }
 
     const bool arrived = waitFor(d, 1, 5000);
     settle(50);   // a duplicate would land here
 
     std::cout << "  no-Qt failure path: delivered=" << d.total.load()
               << " code='" << d.code() << "'"
-              << " inline=" << inlineDeliveries
+              << " inline=" << d.inlineDeliveries.load()
               << " on-caller-thread=" << d.onForbiddenThread.load() << std::endl;
 
     ASSERT_TRUE(arrived)
@@ -347,7 +498,7 @@ TEST_F(NoQtLoopTest, AFailedCallDeliversItsCallbackWithNoQtLoop)
            "exactly-once promise became exactly-never";
     EXPECT_EQ(d.total.load(), 1);
     EXPECT_EQ(d.code(), "transport_error");
-    EXPECT_EQ(inlineDeliveries, 0)
+    EXPECT_EQ(d.inlineDeliveries.load(), 0)
         << "the callback ran inline inside callMethodAsyncWithError";
     EXPECT_EQ(d.onForbiddenThread.load(), 0)
         << "the callback ran on the caller's thread — delivery must stay off "
@@ -383,6 +534,9 @@ TEST_F(NoQtLoopTest, RepliesDeliverExactlyOnceWithNoQtLoop)
     d.forbiddenThread = caller;
 
     for (int i = 0; i < kCalls; ++i) {
+        // Per call, so the nesting claim covers all 300 issue points and not
+        // just the loop as a whole.
+        IssuingScope inCall;
         ch->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
                                      QVariantList{ QVariant(i) }, 10000,
                                      [&d, i](QVariant v, const logos::CallError& e) {
@@ -401,6 +555,9 @@ TEST_F(NoQtLoopTest, RepliesDeliverExactlyOnceWithNoQtLoop)
 
     ASSERT_TRUE(arrived) << "only " << d.total.load() << " of " << kCalls
                          << " callbacks were delivered with no Qt loop";
+    EXPECT_EQ(d.inlineDeliveries.load(), 0)
+        << d.inlineDeliveries.load() << " callbacks ran nested inside the call "
+           "that issued them";
     EXPECT_EQ(d.onForbiddenThread.load(), 0)
         << d.onForbiddenThread.load() << " callbacks ran on the thread that "
            "issued the call";
@@ -530,6 +687,7 @@ TEST_F(NoQtLoopTest, CancelledCallsDeliverWithNoQtLoopAndNotInsideRelease)
     const std::thread::id caller = std::this_thread::get_id();
     d.forbiddenThread = caller;
     for (int i = 0; i < kCalls; ++i) {
+        IssuingScope inCall;
         ch->callMethodAsyncWithError(kToken, QStringLiteral("never"), {}, 30000,
                                      [&d, i](QVariant v, const logos::CallError& e) {
                                          d.record(i, std::move(v), e);
@@ -538,14 +696,21 @@ TEST_F(NoQtLoopTest, CancelledCallsDeliverWithNoQtLoopAndNotInsideRelease)
     settle(300);   // let every sentinel come back, so the calls are parked
     ASSERT_EQ(d.total.load(), 0) << "the calls resolved before the release";
 
-    obj->release();
+    {
+        // The same nesting marker, around release() this time: a cancellation
+        // callback that ran from inside release() would run inside this scope,
+        // on this thread, and would count itself.
+        IssuingScope inRelease;
+        obj->release();
+    }
 
     const bool arrived = waitFor(d, kCalls, 10000);
     settle(200);
 
     std::cout << "  no-Qt cancellations: " << d.total.load() << "/" << kCalls
               << " worst=" << d.worst() << " code='" << d.code()
-              << "' on-releasing-thread=" << d.onForbiddenThread.load()
+              << "' inside-release=" << d.inlineDeliveries.load()
+              << " on-releasing-thread=" << d.onForbiddenThread.load()
               << std::endl;
 
     ASSERT_TRUE(arrived) << "only " << d.total.load() << " of " << kCalls
@@ -554,9 +719,11 @@ TEST_F(NoQtLoopTest, CancelledCallsDeliverWithNoQtLoopAndNotInsideRelease)
     // check, and measuring it that way is how this test first went red under
     // Guard Malloc: with everything slowed down, the delivery thread finished
     // all twenty before the releasing thread executed its next statement, which
-    // is correct behaviour and reads as a violation. The claim is about the
-    // THREAD, and the releasing thread is the forbidden one — so a callback
-    // that ran inside release() would be counted below and nothing else is.
+    // is correct behaviour and reads as a violation. The claim is about NESTING,
+    // and the marker above measures exactly that — plus the thread, since the
+    // releasing thread is the forbidden one here.
+    EXPECT_EQ(d.inlineDeliveries.load(), 0)
+        << "a cancellation callback ran from inside release()";
     EXPECT_EQ(d.worst(), 1);
     EXPECT_EQ(d.missing(), 0);
     EXPECT_EQ(d.code(), "transport_error");
@@ -651,4 +818,43 @@ TEST_F(NoQtLoopTest, ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop)
                                 "did not happen";
     EXPECT_EQ(doubled, 0) << doubled << " calls were delivered more than once";
     EXPECT_EQ(dropped, 0) << dropped << " calls were never delivered at all";
+}
+
+// ── 7. the delivery vehicle outlives static destruction ─────────────────────
+//
+// The visible half of the post-main probe above: this test WARMS THE VEHICLE UP
+// — constructing it here, i.e. after all dynamic initialisation, is what puts it
+// on the wrong side of the destruction order from the probe — and states where
+// the verdict will appear. The assertion itself cannot live in a test case,
+// because the moment it is about is after main() returns; it lives in
+// LateDeliveryProbe::~LateDeliveryProbe and reports through the process exit
+// code. See the note over that struct.
+//
+// On the tree this was written against (the delivery service as an ordinary
+// function-local static) the run ends in `[post-main] delivered=0` followed by
+// exit 70, or SIGSEGV under Guard Malloc. Both are what a failure looks like
+// here, and both were observed before the fix.
+TEST_F(NoQtLoopTest, TheVehicleOutlivesStaticDestructors)
+{
+    ASSERT_TRUE(g_lateProbeArmed.load())
+        << "the post-main probe was not constructed during dynamic "
+           "initialisation, so nothing will check the after-main() window";
+
+    PlainLogosObject obj("nobody", nullptr);
+    Deliveries d(1);
+    {
+        IssuingScope inCall;
+        obj.callMethodAsyncWithError(kToken, QStringLiteral("ping"), {}, 1000,
+                                     [&d](QVariant v, const logos::CallError& e) {
+                                         d.record(0, std::move(v), e);
+                                     });
+    }
+    ASSERT_TRUE(waitFor(d, 1, 5000))
+        << "the warm-up delivery never arrived, so the vehicle was never "
+           "constructed and the probe below tests nothing";
+    EXPECT_EQ(d.inlineDeliveries.load(), 0);
+
+    std::cout << "  delivery vehicle constructed inside the run; the after-main "
+                 "delivery is checked by LateDeliveryProbe (exit code 70 on "
+                 "failure)" << std::endl;
 }
