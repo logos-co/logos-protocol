@@ -36,21 +36,28 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
 #   PlainSendAfterFailTest.*   (all four; validated on cf1b9b0)
 #   SyncCallReleaseRaceTest.ReleaseWithASyncCallInFlightIsReportedAndFatal
+#   SyncCallReleaseRaceTest.AParkedSyncCallSurvivesReleaseFromAnotherThread
+#   SyncCallReleaseRaceTest.ReleaseDefersDestructionToTheLastCallInFlight
+#   SyncCallReleaseRaceTest.TheReleaseWakeRaceIsSafeEveryTime   (under gmalloc)
+#   SyncCallReleaseRaceTest.DeletingTheHandleWithACallInFlightIsReportedAndFatal
+#   SyncCallReleaseRaceTest.StartingACallAfterReleaseIsReportedAndFatal
 #   SyncCallReleaseRaceTest.EveryEntryPointLeavesTheCountAtZero
 #   SyncCallReleaseRaceTest.ConcurrentCallersThatHaveReturnedAreNotAccused
 #   SyncCallReleaseRaceTest.ReleaseFromInsideAnEventCallbackIsNotAccused
 #   every test in NoQtLoopTest (protocol_noqt_tests — see the second executable
 #   at the bottom of this file)
 #
-# The last four are two detectors of two different things, which is why they are
-# all listed. The death test detects the MISUSE: on cf1b9b0 it reports "died but
-# not with expected error", because release() returns normally there and the
-# racing thread then segfaults instead — three runs out of three. The other three
-# detect a BROKEN DETECTOR: with the decrement removed from EntryGuard's
-# destructor they all abort on a correct program, which is the failure mode that
-# would make the whole thing unshippable. Both halves were checked by running
-# them, the first against the pre-fix commit and the second against a throwaway
-# local edit.
+# The release-race group is three detectors of three different things, which is
+# why all of it is listed. THE FIX: on cf1b9b0 the survival test's child dies by
+# signal ("died but not with expected exit code") and the deferred-destruction
+# test exits 139, both three runs out of three; the release-wake stress is silent
+# there without Guard Malloc and 139 with it, which is why it is marked. THE
+# REMAINING MISUSES: the two death tests fail on cf1b9b0 (no diagnostic exists to
+# match). A BROKEN DETECTOR: with the decrement removed from EntryGuard's
+# destructor the three "not accused" tests abort on a correct program, which is
+# the failure mode that would make the whole thing unshippable. Every one of
+# those was checked by running it — against the pre-fix commit for the first two
+# groups, against a throwaway local edit for the last.
 #
 # Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
 # the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
@@ -185,14 +192,16 @@ add_executable(protocol_tests
     # mutex rather than racing for it.
     test_plain_send_after_fail.cpp
     # release() racing a call still running on another thread — a PRE-EXISTING
-    # use-after-free (reproduced identically on master, on #45 and on #46), and
-    # the one defect in this area that is NOT fixable from inside the object:
-    # every mechanism that could make the racing call safe has to be reached
-    # through the pointer that has just been freed. So the object states the
-    # contract and carries a detector that turns the misuse into a named abort
-    # instead of a SIGSEGV elsewhere. This file pins the detector firing on the
-    # misuse AND — the half that decides whether such a thing is shippable at
-    # all — never firing on a correct program: every entry point, every
+    # use-after-free (reproduced identically on master, on #45 and on #46), now
+    # FIXED by a live-reference count: release() drops the owner's reference and
+    # the last call to leave destroys the object, so a call that entered first is
+    # safe and release() still waits for nothing. This file pins the fix (the
+    # reproduction survives, destruction is deferred and happens exactly once,
+    # the tight release-wake race 400 times over), pins the two shapes that are
+    # still caller errors (`delete obj` with a call in flight, and STARTING a
+    # call after release()) as named aborts rather than a SIGSEGV elsewhere, and
+    # — the half that decides whether a diagnostic is shippable at all — pins
+    # that a correct program is never accused: every entry point, every
     # early-return path, many threads at once, and the shipped
     # release()-from-an-io-thread-event-callback shape.
     test_sync_call_release_race.cpp

@@ -1472,16 +1472,13 @@ TEST_F(IoFoldTest, ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge)
     // violation was always there and was always UB; it was also always SILENT,
     // because the pre-existing code touches no member after sendCallAsync()
     // returns, so losing the race cost nothing observable. That stopped being
-    // true the moment the release()-teardown detector added bookkeeping to the
+    // true the moment the release()-teardown bookkeeping was added to the
     // epilogue of every entry point, and the next Linux CI run segfaulted here.
-    // Two things came out of that, and both are fixed: the detector's guard now
-    // touches the object only between raising and dropping its count (see
-    // EntryGuard in plain_logos_object.cpp), and this test stops violating the
-    // contract. Widen the window by hand and the detector names it exactly:
-    //
-    //   LOGOS FATAL: PlainLogosObject::release() on 'omni_module' ran while
-    //   1 call(s) from other threads are still inside this object (most recent
-    //   entry: PlainLogosObject::callMethodAsyncWithError()).
+    // Three things came out of that, and all three are fixed: the guard now
+    // touches the object only between raising and dropping its reference (see
+    // EntryGuard in plain_logos_object.cpp), that reference is what now makes
+    // release()-racing-a-call safe rather than merely detected, and this test
+    // stops relying on either — it no longer violates the contract at all.
     //
     // Firing through a second handle removes that unrelated violation and
     // changes nothing about the subject: the event still arrives on the io

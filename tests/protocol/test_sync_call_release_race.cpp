@@ -1,10 +1,10 @@
 // release() racing a call that is still running on another thread.
 //
 // THE DEFECT, and it is older than the two changes this file arrived with.
-// release() ends in `delete this`. A synchronous callMethod parks its caller's
-// thread in a future wait for up to timeoutMs, and when it wakes it goes on to
-// touch m_conn, m_objectName and m_state — members of an object another thread
-// may have deleted in the meantime. Reproduced deterministically on
+// release() used to end in `delete this`. A synchronous callMethod parks its
+// caller's thread in a future wait for up to timeoutMs, and when it wakes it
+// goes on to touch m_conn, m_objectName and m_state — members of an object
+// another thread may have deleted in the meantime. Reproduced deterministically on
 // feat/plain-async-io-fold (cf1b9b0), on fix/plain-completion-sub-lifetime and
 // on master, with AND without Guard Malloc:
 //
@@ -19,38 +19,55 @@
 // timeout error — so the reproduction below goes through the error channel,
 // which has a post-wait member access on every one of them.
 //
-// WHAT THIS FILE IS, which is not "the fix". The race cannot be closed from
-// inside the object: every mechanism that could — a refcount, a flag, a lock —
-// is a member, so the racing thread's first act would be to read it out of
-// storage that has just been freed, and there is no synchronising with a
-// destruction you can only learn about by reading the destroyed object. The
-// designs that do work keep the state outside the object and the ABI forbids
-// them (requestObject hands out a raw LogosObject*; release() is defined as
-// deleting it). The long note over PlainLogosObject::release() lists the three
-// alternatives that were considered and why each was rejected — including the
-// one that genuinely works and costs unbounded retention.
+// WHAT THIS FILE IS: the pin on the FIX, plus the pin on the two shapes the fix
+// deliberately does not cover.
 //
-// So the object documents a CONTRACT (calls must have returned before release()
-// is entered) and carries a DETECTOR that makes breaking it loud: entries into
-// the public methods are counted, and release() reports — and in a debug build
-// aborts — when the count is not zero. This file pins BOTH halves, and the
-// second is the one that matters more:
+// IT IS FIXED, and the argument that said it could not be is worth recording
+// because it was nearly right. That argument ran: every mechanism that could save
+// the racing call is a member, so the racing thread's first act would be to read
+// freed storage. True of a call that ENTERS after destruction — and false of a
+// call ALREADY INSIDE the object, which is the defect above. That call published
+// to the member (took a live reference) on its way in, while the object was
+// provably alive, so release() cannot fail to see it. So PlainLogosObject now
+// carries a live-reference count: release() drops the OWNER's reference instead
+// of deleting, and whoever drops the last one — here, the parked call's own
+// thread on its way out — destroys the object. release() still returns
+// immediately and still waits for nothing.
 //
-//   1. THE MISUSE IS CAUGHT. The reproduction above, run under the detector,
-//      must die with the named diagnostic instead of a SIGSEGV somewhere else.
-//   2. A CORRECT PROGRAM IS NEVER ACCUSED. A detector that can fire on a
-//      correct program is worse than no detector, and this one is wired into
-//      every public entry point of a class whose teardown is called from inside
-//      event callbacks. So: every entry point, every early-return path, calls
-//      from many threads at once, nested entries, and the shipped
+//   FIXED:      release() concurrent with a call that entered first, sync or
+//               async, from any number of threads; and release() re-entered from
+//               inside a call or an event callback on the same thread.
+//   DIAGNOSED:  a call that ENTERS at or after release() (its first act is to
+//               increment a counter that may already be freed), and `delete obj`
+//               instead of release() while a call is in flight (destruction NOW,
+//               nothing left to defer). Both are reported and abort in debug
+//               builds whenever the object still exists to notice.
+//
+// WHAT THIS FILE PINS, therefore:
+//
+//   1. THE RACE IS SURVIVED. The reproduction above runs to completion, the
+//      parked call returns its own error, and the object is destroyed EXACTLY
+//      ONCE — after the call leaves, not before.
+//   2. THE TWO REMAINING SHAPES STILL FAIL LOUDLY, as named diagnostics rather
+//      than as a SIGSEGV somewhere else.
+//   3. A CORRECT PROGRAM IS NEVER ACCUSED. The diagnostic is wired into every
+//      public entry point of a class whose teardown is called from inside event
+//      callbacks, and one that can fire on a correct program is worse than none.
+//      So: every entry point, every early-return path, calls from many threads
+//      at once, nested entries, and the shipped
 //      release()-from-an-io-thread-event-callback shape — all followed by a
 //      release() that must stay silent.
 //
-// HOW (1) WAS VALIDATED, since a death test that passes proves less than one
-// that has been seen to fail: on the pre-fix tree the same test reports
-// "died but not with the expected error" — release() returns normally there,
-// the racing thread then faults, and the diagnostic it is matching for does not
-// exist. Numbers in the PR.
+// HOW (1) WAS VALIDATED, since a test that passes proves less than one that has
+// been seen to fail: the same tests run against the pre-fix tree (cf1b9b0) die —
+// SIGSEGV in the parked caller, with and without Guard Malloc. Numbers in the PR.
+//
+// THE DETERMINISTIC HALF USES A CONNECTION DOUBLE rather than the live host: a
+// StalledConnection that accepts a call and never answers it parks the caller in
+// its future wait with no timing assumptions at all, and lets the test own the
+// object (and count its destructions) instead of receiving it from
+// requestObject. The live-host reproduction is kept as well, because a double
+// cannot show that the shape occurs in the real stack.
 
 #include <gtest/gtest.h>
 
@@ -154,6 +171,131 @@ private:
     std::atomic<std::uint64_t> m_counter{0};
 };
 
+// ── the connection double ───────────────────────────────────────────────────
+//
+// A connection that is open, accepts calls, and answers them in exactly one of
+// two ways:
+//
+//   * STALLED (default): the reply never comes. The synchronous caller parks in
+//     `fut.wait_for(timeoutMs)` for the whole timeout and then runs its post-wait
+//     epilogue — m_conn->cancelPending(id), then m_objectName to build the error
+//     — which is the sequence that used to touch a freed object. No sleeps in the
+//     test, no dependence on a provider's scheduling: the park is the double's
+//     doing.
+//   * DEFERRING: the reply comes back immediately carrying a "multi" pending
+//     sentinel, so the caller parks in awaitCompletion() on the state block's
+//     condition variable instead. release() NOTIFIES that wait, so the caller
+//     wakes inside the window rather than after a timeout — which makes the race
+//     tight enough to run hundreds of times in a couple of seconds.
+//
+// Everything else is a no-op. cancelPending is counted, because "the parked
+// caller got as far as its post-wait member access" is what the test is really
+// asserting.
+class StalledConnection : public RpcConnectionBase {
+public:
+    void start() override {}
+    void stop(const std::string& = "stopped") override {}
+    bool isOpen() const override { return true; }
+
+    void setDeferring(bool on) { m_deferring.store(on); }
+
+    std::future<ResultMessage> sendCall(CallMessage msg) override
+    {
+        auto p = std::make_shared<std::promise<ResultMessage>>();
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            // Kept alive for the life of the double: destroying the promise would
+            // break the future and turn the parked wait into an exception, which
+            // is a different test.
+            m_promises.push_back(p);
+        }
+        if (m_deferring.load()) {
+            ResultMessage res;
+            res.id = msg.id;
+            res.ok = true;
+            RpcMap pending;
+            pending.emplace(logos::pendingCallKey().toStdString(),
+                            RpcValue("never-" + std::to_string(msg.id)));
+            res.value = RpcValue(std::move(pending));
+            p->set_value(std::move(res));
+        }
+        m_sent.fetch_add(1);
+        return p->get_future();
+    }
+
+    void sendCallAsync(CallMessage, ResultHandler handler) override
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_handlers.push_back(std::move(handler));   // never invoked
+    }
+
+    std::future<MethodsResultMessage> sendMethods(MethodsMessage) override
+    {
+        auto p = std::make_shared<std::promise<MethodsResultMessage>>();
+        std::lock_guard<std::mutex> g(m_mu);
+        m_methodPromises.push_back(p);
+        return p->get_future();
+    }
+
+    void cancelPending(uint64_t id) override
+    {
+        m_lastCancelled.store(id);
+        m_cancelled.fetch_add(1);
+    }
+
+    void sendSubscribe(SubscribeMessage, std::function<void(EventMessage)>) override {}
+    void sendUnsubscribe(UnsubscribeMessage) override {}
+    void sendEvent(EventMessage) override {}
+    void sendToken(TokenMessage) override {}
+    void setErrorHandler(ErrorHandler) override {}
+    uint64_t nextId() override { return m_nextId.fetch_add(1); }
+
+    int sent() const      { return m_sent.load(); }
+    int cancelled() const { return m_cancelled.load(); }
+
+private:
+    std::mutex m_mu;
+    std::vector<std::shared_ptr<std::promise<ResultMessage>>>       m_promises;
+    std::vector<std::shared_ptr<std::promise<MethodsResultMessage>>> m_methodPromises;
+    std::vector<ResultHandler> m_handlers;
+    std::atomic<bool>          m_deferring{false};
+    std::atomic<int>           m_sent{0};
+    std::atomic<int>           m_cancelled{0};
+    std::atomic<uint64_t>      m_lastCancelled{0};
+    std::atomic<uint64_t>      m_nextId{1};
+};
+
+// PlainLogosObject that says when it is destroyed. "Exactly once, and not before
+// the parked call left" is the whole claim of the fix, and nothing observable
+// from outside the class can show it — the destructor is the only witness.
+class CountedPlainObject : public PlainLogosObject {
+public:
+    CountedPlainObject(std::string name,
+                       std::shared_ptr<RpcConnectionBase> conn,
+                       std::atomic<int>* destructions)
+        : PlainLogosObject(std::move(name), std::move(conn))
+        , m_destructions(destructions)
+    {}
+
+    ~CountedPlainObject() override { m_destructions->fetch_add(1); }
+
+private:
+    std::atomic<int>* m_destructions;
+};
+
+// Spin until `pred` or the budget runs out. Used only for happens-before edges
+// the double publishes (a call has reached the connection), never as a stand-in
+// for one.
+template <typename Pred>
+bool spinUntil(Pred pred, int budgetMs)
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(budgetMs);
+    while (!pred() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return pred();
+}
+
 QCoreApplication* ensureApp()
 {
     static int argc = 0;
@@ -237,8 +379,11 @@ void pump(int ms)
 
 const char* kToken = "live-token";
 
-// The reproduction, as a callable, so the death test and the description of the
-// bug are literally the same code.
+// The reproduction, as a callable, so the test and the description of the bug are
+// literally the same code. It runs in a CHILD PROCESS (see the test) for one
+// reason: on a tree without the fix it does not fail an assertion, it dies — and
+// a death in the middle of protocol_tests takes the other thirty files' results
+// with it, while a death in a child is a legible test failure.
 //
 // The window is opened by a happens-before edge and not by a sleep: the
 // provider counts the calls that have reached `block`, so when that count moves
@@ -298,15 +443,82 @@ const char* kToken = "live-token";
         std::_Exit(9);
     }
 
-    // THE MISUSE. One line, and it is the whole bug.
+    // THE RACE. One line, and it used to be the whole bug.
     obj->release();
 
-    // Only reached on a tree without the detector. Wait out the call's deadline
-    // so the racing thread wakes into freed memory, then leave with a code that
-    // is unambiguously "the diagnostic never happened".
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    // The parked caller must now wake, run its post-wait epilogue against an
+    // object that is still there, and return. On a tree without the fix it
+    // faults here instead (SIGSEGV in callMethodWithError, one line after the
+    // wait) and this process dies without printing the marker below.
+    if (!spinUntil([&] { return callReturned.load(); }, 8000)) {
+        std::fprintf(stderr, "the parked call never returned\n");
+        std::fflush(stderr);
+        std::_Exit(8);
+    }
+    caller.join();
+    host.provider().letGo();
+
+    std::fprintf(stderr, "PARKED SYNC CALL SURVIVED THE RELEASE\n");
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
+// ── the two shapes that are still caller errors ─────────────────────────────
+//
+// Both use the double, so both are deterministic: the call is parked because the
+// connection never answers, not because a provider was slow.
+
+// `delete obj` instead of release(), with a call inside the object. Destruction
+// NOW, so there is nothing to defer and nothing the reference count can do.
+[[noreturn]] void deleteTheHandleWithACallInFlight()
+{
+    auto conn = std::make_shared<StalledConnection>();
+    std::atomic<int> destroyed{0};
+    auto* obj = new CountedPlainObject("racer", conn, &destroyed);
+
+    std::thread caller([obj] {
+        logos::CallError err;
+        obj->callMethodWithError(kToken, QStringLiteral("block"), {}, 5000, &err);
+    });
+    if (!spinUntil([&] { return conn->sent() >= 1; }, 5000)) {
+        std::fprintf(stderr, "harness: the call never reached the connection\n");
+        std::fflush(stderr);
+        std::_Exit(9);
+    }
+
+    delete obj;                 // <- reported by ~PlainLogosObject, aborts in debug
+
     caller.detach();
-    std::fprintf(stderr, "release() returned and nothing was reported\n");
+    std::fprintf(stderr, "delete with a call in flight was not reported\n");
+    std::fflush(stderr);
+    std::_Exit(7);
+}
+
+// A call STARTING after release(). Only observable at all because the parked call
+// is holding the object alive — which is precisely why it is worth reporting: the
+// same program with no parked call is a use-after-free with nothing left to look
+// at.
+[[noreturn]] void enterAfterRelease()
+{
+    auto conn = std::make_shared<StalledConnection>();
+    std::atomic<int> destroyed{0};
+    auto* obj = new CountedPlainObject("racer", conn, &destroyed);
+
+    std::thread caller([obj] {
+        logos::CallError err;
+        obj->callMethodWithError(kToken, QStringLiteral("block"), {}, 5000, &err);
+    });
+    if (!spinUntil([&] { return conn->sent() >= 1; }, 5000)) {
+        std::fprintf(stderr, "harness: the call never reached the connection\n");
+        std::fflush(stderr);
+        std::_Exit(9);
+    }
+
+    obj->release();             // safe, and returns while the call is still inside
+    obj->getMethods();          // <- reported by EntryGuard, aborts in debug
+
+    caller.detach();
+    std::fprintf(stderr, "a call entering after release() was not reported\n");
     std::fflush(stderr);
     std::_Exit(7);
 }
@@ -318,14 +530,137 @@ protected:
     void SetUp() override { ensureApp(); }
 };
 
-// ── 1. the misuse is caught ─────────────────────────────────────────────────
+// ── 1. the race is survived, through the real stack ─────────────────────────
 //
-// A death test because the detector's whole job is to end the process at the
-// offending line. "threadsafe" style, so the child is re-executed rather than
-// forked out of a process that already runs an io thread, a deadline thread and
-// a Qt worker — forking that would inherit locks held by threads that do not
-// exist in the child.
-TEST_F(SyncCallReleaseRaceTest, ReleaseWithASyncCallInFlightIsReportedAndFatal)
+// The reproduction, run in a child process and required to EXIT ZERO. On the
+// pre-fix tree the child dies by signal instead and this reports it as such,
+// which is the same code path gtest uses for a death test that does not die.
+// "threadsafe" style, so the child is re-executed rather than forked out of a
+// process that already runs an io thread, a deadline thread and a Qt worker —
+// forking that would inherit locks held by threads that do not exist in the
+// child.
+TEST_F(SyncCallReleaseRaceTest, AParkedSyncCallSurvivesReleaseFromAnotherThread)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(releaseWhileASyncCallIsParked(),
+                ::testing::ExitedWithCode(0),
+                "PARKED SYNC CALL SURVIVED THE RELEASE");
+}
+
+// ── 2. and the accounting is exact ──────────────────────────────────────────
+//
+// The same race with the double, so every claim is checkable rather than merely
+// survived: release() returns while the call is parked, the object is NOT
+// destroyed at that moment, the parked caller completes its post-wait epilogue
+// (proved by the cancelPending the double counts), and the object is destroyed
+// exactly once, by the caller's thread, on its way out.
+TEST_F(SyncCallReleaseRaceTest, ReleaseDefersDestructionToTheLastCallInFlight)
+{
+    auto conn = std::make_shared<StalledConnection>();
+    std::atomic<int> destroyed{0};
+    auto* obj = new CountedPlainObject("racer", conn, &destroyed);
+
+    logos::CallError err;
+    std::atomic<bool> returned{false};
+    std::thread caller([&] {
+        // 600ms, and the double never answers, so this thread is parked in
+        // `fut.wait_for` for 600ms of wall clock. No provider, no scheduling
+        // assumption.
+        obj->callMethodWithError(kToken, QStringLiteral("block"), {}, 600, &err);
+        returned.store(true);
+    });
+    ASSERT_TRUE(spinUntil([&] { return conn->sent() >= 1; }, 5000))
+        << "the call never reached the connection";
+
+    QElapsedTimer t;
+    t.start();
+    obj->release();
+    const qint64 releaseMs = t.elapsed();
+
+    // Teardown still waits for nothing. If release() had grown a barrier — the
+    // "just block until in-flight calls finish" answer — this would be ~600.
+    EXPECT_LT(releaseMs, 150) << "release() blocked for " << releaseMs
+                              << "ms waiting for the parked call";
+    EXPECT_EQ(destroyed.load(), 0)
+        << "the object was destroyed while a call was still inside it — which is "
+           "the use-after-free this test exists for";
+    EXPECT_FALSE(returned.load()) << "the parked call was not parked";
+
+    caller.join();
+
+    std::cout << "  release() returned in " << releaseMs
+              << "ms with a call parked; destroyed=" << destroyed.load()
+              << " after the call left (code='" << err.code
+              << "', cancelPending calls=" << conn->cancelled() << ")"
+              << std::endl;
+
+    EXPECT_EQ(destroyed.load(), 1)
+        << "the object was destroyed " << destroyed.load()
+        << " times; the last caller out must destroy it exactly once";
+    EXPECT_EQ(err.code, "timeout")
+        << "the parked call did not complete its own error path";
+    EXPECT_GE(conn->cancelled(), 1)
+        << "the parked caller never reached its post-wait member access — the "
+           "very access that used to fault";
+}
+
+// The tight version of the same thing, run enough times to sweep the window.
+//
+// A DIFFERENT PARK: the double answers with a "multi" pending sentinel, so the
+// caller parks in awaitCompletion() on the state block's condition variable, and
+// release() NOTIFIES that wait — so the caller wakes INSIDE the release rather
+// than after a timeout, which is as close as the two threads can be brought
+// together. Under Guard Malloc this is the detector for the use-after-free;
+// without it, for a double delete or a leaked object (the destruction count is
+// checked every round).
+TEST_F(SyncCallReleaseRaceTest, TheReleaseWakeRaceIsSafeEveryTime)
+{
+    constexpr int kRounds = 400;
+    std::atomic<int> destroyed{0};
+    int woken = 0;
+
+    for (int r = 0; r < kRounds; ++r) {
+        auto conn = std::make_shared<StalledConnection>();
+        conn->setDeferring(true);
+        auto* obj = new CountedPlainObject("racer", conn, &destroyed);
+
+        logos::CallError err;
+        std::thread caller([&] {
+            obj->callMethodWithError(kToken, QStringLiteral("defer"), {}, 4000, &err);
+        });
+        ASSERT_TRUE(spinUntil([&] { return conn->sent() >= 1; }, 5000))
+            << "round " << r << ": the call never reached the connection";
+        // Jittered, so the release lands at a different point of the caller's
+        // approach to the condition variable on different rounds.
+        if (r % 4) std::this_thread::sleep_for(std::chrono::microseconds((r % 4) * 25));
+
+        obj->release();
+        caller.join();
+
+        if (err.code == "transport_error") ++woken;
+        ASSERT_EQ(destroyed.load(), r + 1)
+            << "round " << r << ": the object was destroyed "
+            << destroyed.load() << " times in " << (r + 1) << " rounds";
+    }
+
+    std::cout << "  " << kRounds << " release-wake races: destroyed="
+              << destroyed.load() << " (one per round), woken by teardown="
+              << woken << std::endl;
+    EXPECT_EQ(destroyed.load(), kRounds);
+    // Not all rounds have to be woken BY the release — some callers reach the
+    // predicate after `stopping` is already up — but if none were, the race
+    // never happened and this test is decoration.
+    EXPECT_GT(woken, 0) << "no round was woken by teardown; the release never "
+                           "landed inside the wait";
+}
+
+// ── 3. the shapes that remain caller errors ─────────────────────────────────
+//
+// Death tests, because the diagnostic's whole job is to end the process at the
+// offending line. Both were seen to fail before the report existed — with the
+// report removed by hand they run to the "was not reported" exit instead, and on
+// the pre-fix tree the delete case is a plain SIGSEGV in the parked thread.
+TEST_F(SyncCallReleaseRaceTest, DeletingTheHandleWithACallInFlightIsReportedAndFatal)
 {
 #ifdef NDEBUG
     GTEST_SKIP() << "the abort is debug-only by design: turning a shipped app's "
@@ -334,8 +669,20 @@ TEST_F(SyncCallReleaseRaceTest, ReleaseWithASyncCallInFlightIsReportedAndFatal)
                     "is emitted in every build.";
 #else
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH(releaseWhileASyncCallIsParked(),
+    EXPECT_DEATH(deleteTheHandleWithACallInFlight(),
                  "call\\(s\\) from other threads are still inside this object");
+#endif
+}
+
+TEST_F(SyncCallReleaseRaceTest, StartingACallAfterReleaseIsReportedAndFatal)
+{
+#ifdef NDEBUG
+    GTEST_SKIP() << "the abort is debug-only by design; the report itself is "
+                    "emitted in every build.";
+#else
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(enterAfterRelease(),
+                 "was entered on 'racer' AFTER release\\(\\)");
 #endif
 }
 
@@ -487,11 +834,11 @@ TEST_F(SyncCallReleaseRaceTest, ConcurrentCallersThatHaveReturnedAreNotAccused)
 //
 // THE EVENT IS TRIGGERED THROUGH A SECOND HANDLE, for the reason spelled out in
 // test_iofold.cpp: firing through the handle that is about to be released means
-// the io thread destroys it while the main thread is still inside its
-// callMethodAsyncWithError, which is the very contract violation this file
-// documents, and it would make this test's outcome depend on winning a race it
-// is not about. (The detector found that in both tests; with the window widened
-// by hand it reports callMethodAsyncWithError() by name.)
+// the io thread releases it while the main thread is still inside its
+// callMethodAsyncWithError. That shape is now SAFE — it is exactly what the
+// reference count covers — but it would make this test's outcome depend on
+// winning a race it is not about, and it was a genuine use-after-free on every
+// tree before this one.
 TEST_F(SyncCallReleaseRaceTest, ReleaseFromInsideAnEventCallbackIsNotAccused)
 {
     LiveHost host;

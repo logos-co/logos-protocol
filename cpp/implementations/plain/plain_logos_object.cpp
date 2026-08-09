@@ -496,20 +496,28 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
 };
 
 // -----------------------------------------------------------------------------
-// The use-after-free DETECTOR. Two counters and a printf; the reasoning is the
-// part worth reading, and it lives over release().
+// The live-reference count that makes release() safe against a call already
+// running, and the detector beside it for the shapes it cannot save. Two
+// counters, a flag and a printf; the reasoning is the part worth reading, and it
+// lives over release().
 // -----------------------------------------------------------------------------
 
-// This thread's nesting depth inside ANY PlainLogosObject entry point, used to
-// subtract the caller's own frames from the count it reads.
+// This thread's nesting depth inside ANY PlainLogosObject entry point. Two
+// readers, both of them detector-side: it subtracts the caller's own frames from
+// the count reportConcurrentCallers reads, and it tells EntryGuard whether an
+// entry is a FRESH one from outside or a nested internal one, which is what keeps
+// the "entered after release" report off callMethodWithError ->
+// ensureCompletionSub -> onEvent.
 //
-// THE SHAPE THIS EXISTS TO IGNORE: a thread that is inside a public method and,
-// from there, reaches release() on the same object — a callback invoked from
+// THE SHAPE IT EXISTS TO IGNORE: a thread that is inside a public method and,
+// from there, reaches teardown on the same object — a callback invoked from
 // within a call, releasing the handle it was called through. That is a
-// well-defined single-threaded sequence, not the race, and reporting it would
-// be a false alarm. No path in this file does that today (no guarded method
-// invokes user code synchronously), so this is guarding a shape that does not
-// yet exist — which is exactly when it is cheap to guard.
+// well-defined single-threaded sequence, not the race, and it is SAFE under the
+// reference count (the outer call holds a reference, so release() cannot destroy
+// the object underneath it and the guard does it on the way out). Reporting it
+// would be a false alarm. No path in this file invokes user code from inside a
+// guarded method today, so this is guarding a shape that does not yet exist —
+// which is exactly when it is cheap to guard.
 //
 // It counts entries into ANY object rather than into a particular one, because
 // a per-object thread-local is a map lookup on every call and the difference
@@ -520,40 +528,61 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
 // become an exported thread-local in the shared build.
 static thread_local int t_entryDepth = 0;
 
-// THE COUNTER IS THE FIRST AND THE LAST THING EITHER OF THESE TOUCHES, and that
-// ordering is the whole safety argument for the detector itself.
+// THE REFERENCE IS THE FIRST AND THE LAST THING EITHER OF THESE TOUCHES, and
+// that ordering is the whole safety argument.
 //
-// A guard whose bookkeeping outlives its own count is a use-after-free the
-// detector INVENTED. The first cut restored m_lastEntryPoint after the
-// decrement, which opens a window exactly one store wide: the count reaches
-// zero, a release() racing on another thread reads zero, decides nothing is in
-// flight and runs `delete this` — and then that store lands in freed memory.
-// It is not theoretical; it segfaulted a CI run on Linux, in an existing test
-// whose io-thread event callback releases the handle (IoFoldTest
-// .ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge), and it is precisely
-// the class of bug this whole change is about — introduced by the thing meant
-// to detect it.
+// ON THE WAY IN the reference must be taken before any other access to the
+// object, because everything after it is what the reference protects. On the way
+// out it must be dropped after every other access, because dropping it may
+// DESTROY the object — this guard is the thing that performs the final `delete`
+// when it is the last one out, and any bookkeeping after that point would be a
+// store into freed memory. The earlier, detector-only version of this guard
+// learned that the hard way: it restored m_lastEntryPoint after decrementing,
+// which opened a window exactly one store wide for a concurrent release() to
+// `delete this` in, and that segfaulted a Linux CI run in an existing test whose
+// io-thread event callback releases the handle (IoFoldTest
+// .ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge).
 //
-// So: raise the count before any other access, drop it after every other
-// access. Between those two points the object is covered — a concurrent
-// release() sees a non-zero count and REPORTS instead of silently racing.
-// Outside them the guard touches nothing at all. The residual instant is the
-// increment itself, and code that can lose there was already about to fault on
-// m_conn one line later.
+// So: reference first, reference last, everything else in between.
 //
-// The cost is a slightly vaguer message: restoring the name before the
-// decrement means a concurrent reader can see the OUTER frame's name rather
-// than the inner one. That is a diagnostic string; correctness of the count is
-// what matters, and a vaguer string beats a store into freed memory.
+// THE RESIDUAL INSTANT is the increment itself, and it is the boundary of what
+// this mechanism can do. A caller whose increment lands after release() has
+// already dropped the owner's reference and freed the storage is incrementing an
+// integer inside a dead object; nothing can be read out of freed memory to
+// prevent that, which is why entering after release() stays a caller error
+// rather than becoming safe. A call that entered BEFORE release() was called has
+// no such problem: its increment is ordered before release()'s decrement in the
+// modification order of m_liveRefs, so release() sees it, declines to destroy
+// and leaves the destruction to this guard.
+//
+// The cost of handing the diagnostic name back before the decrement is a
+// slightly vaguer message: a concurrent reader can see the OUTER frame's name
+// rather than the inner one. That is a diagnostic string; correctness of the
+// count is what matters.
 PlainLogosObject::EntryGuard::EntryGuard(PlainLogosObject* obj,
                                          const char* entryPoint)
     : m_obj(obj)
     , m_prev(nullptr)
 {
     ++t_entryDepth;                                        // thread-local
-    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);   // FIRST
+    m_obj->m_liveRefs.fetch_add(1, std::memory_order_acq_rel);        // FIRST
+    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);
     m_prev = m_obj->m_lastEntryPoint.exchange(entryPoint,
                                               std::memory_order_relaxed);
+    // A FRESH entry — not a nested one — into an object whose owner has already
+    // released it. Safe only because somebody else's reference is still holding
+    // the storage alive, which is luck and not a contract, so it is named.
+    //
+    // The depth test excludes the internal nested paths (callMethodWithError ->
+    // ensureCompletionSub -> onEvent), whose outer frame entered long before
+    // release() and which are not a second user of the handle. It is DEFENSIVE
+    // rather than load-bearing today: removing it leaves the whole suite green,
+    // because no nested entry currently happens after teardown has started —
+    // ensureCompletionSub runs before the call parks, not after it wakes. It is
+    // kept because that is a property of today's call paths and not of this
+    // check, and a false alarm here aborts a correct program.
+    if (t_entryDepth == 1 && m_obj->m_released.load(std::memory_order_acquire))
+        m_obj->reportEntryAfterRelease(entryPoint);
 }
 
 PlainLogosObject::EntryGuard::~EntryGuard()
@@ -565,7 +594,17 @@ PlainLogosObject::EntryGuard::~EntryGuard()
     // all the message claims.
     m_obj->m_lastEntryPoint.store(m_prev, std::memory_order_relaxed);
     --t_entryDepth;                                        // thread-local
-    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);   // LAST
+    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);
+    // LAST, and it may be a `delete`. Read into a local first: after the
+    // fetch_sub this guard may no longer have an object to name, and after the
+    // delete it must touch nothing at all — which is why this is the final
+    // statement of the final destructor of every entry point. EntryGuard is
+    // declared FIRST in each of them, so it is destroyed last, after every other
+    // local and after the return value has been constructed in the caller's
+    // storage.
+    PlainLogosObject* obj = m_obj;
+    if (obj->m_liveRefs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete obj;                    // the last one out turns the lights off
 }
 
 void PlainLogosObject::reportConcurrentCallers(const char* where) const
@@ -587,10 +626,11 @@ void PlainLogosObject::reportConcurrentCallers(const char* where) const
         "\nLOGOS FATAL: PlainLogosObject::%s on '%s' ran while %d call(s) from "
         "other threads are still inside this object (most recent entry: "
         "PlainLogosObject::%s).\n"
-        "  release() ends in `delete this`, so those calls are now using freed "
-        "memory. A LogosObject handle is safe to use from several threads at "
-        "once; it is NOT safe to use concurrently with its own release(). The "
-        "caller must order the two.\n"
+        "  This path destroys the object NOW, so those calls are about to use "
+        "freed memory. release() would have been safe — it drops the owner's "
+        "reference and lets the LAST call in flight do the destroying — but a "
+        "direct `delete` has nobody to hand the destruction to. Use release(), "
+        "or wait for the calls.\n"
         "  This is a diagnostic, not a rescue: the object is destroyed either "
         "way. See the note over PlainLogosObject::release().\n",
         where, m_objectName.c_str(), others,
@@ -608,6 +648,32 @@ void PlainLogosObject::reportConcurrentCallers(const char* where) const
 #endif
 }
 
+// The other half of the diagnostic: not "teardown found a caller inside", but "a
+// caller came in after teardown". Reachable only while somebody else's reference
+// is still holding the storage alive — if it were not, this function would be
+// running on freed memory and there would be nothing to report with. That is
+// exactly why the message says the program is out of contract even though it did
+// not crash this time.
+void PlainLogosObject::reportEntryAfterRelease(const char* entryPoint) const
+{
+    std::fprintf(stderr,
+        "\nLOGOS FATAL: PlainLogosObject::%s was entered on '%s' AFTER "
+        "release() was called on the same handle.\n"
+        "  release() means the handle is finished: it is only still readable "
+        "because another call in flight is holding the object alive, and with "
+        "that call gone this would have been a use-after-free instead of a "
+        "message. A LogosObject handle is safe to use from several threads at "
+        "once, and calls already inside it are safe against release() — but "
+        "STARTING a call after release() is never safe.\n"
+        "  See the note over PlainLogosObject::release().\n",
+        entryPoint, m_objectName.c_str());
+    std::fflush(stderr);
+
+#ifndef NDEBUG
+    std::abort();
+#endif
+}
+
 PlainLogosObject::PlainLogosObject(std::string objectName,
                                    std::shared_ptr<RpcConnectionBase> conn)
     : m_objectName(std::move(objectName))
@@ -617,11 +683,24 @@ PlainLogosObject::PlainLogosObject(std::string objectName,
 
 PlainLogosObject::~PlainLogosObject()
 {
-    // BEFORE anything is torn down: the handle may also be deleted directly
-    // (`delete obj`) rather than through release(), and that path has exactly
-    // the same hazard.
+    // BEFORE anything is torn down, and it still has a job to do even now that
+    // release() is safe. Two ways to get here:
+    //
+    //   * through the reference count — release() dropped the owner's reference,
+    //     or the last call in flight dropped its own. Then no call is inside the
+    //     object by construction, the count is zero, and this returns silently.
+    //   * through `delete obj` on a handle somebody kept a second pointer to,
+    //     which bypasses the reference count entirely and destroys the object
+    //     while those calls are still running. Nothing here can defer THAT — the
+    //     caller has already demanded the storage back — so it is reported, and
+    //     aborts in a debug build, which is the whole reason this call survived
+    //     the change that made release() safe.
     reportConcurrentCallers("~PlainLogosObject()");
-    disconnectEvents();
+    // Impl, not the guarded entry point: taking an EntryGuard here would raise
+    // the reference count from zero and drop it again, and a drop to zero
+    // destroys the object — recursing into `delete this` from inside the
+    // destructor. Same reason in release().
+    disconnectEventsImpl();
     stopAndCancelCalls();
 }
 
@@ -1070,6 +1149,13 @@ void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 void PlainLogosObject::disconnectEvents()
 {
     EntryGuard guard(this, "disconnectEvents()");
+    disconnectEventsImpl();
+}
+
+// The body, without the guard. See the declaration: release() and the destructor
+// must not take a reference to an object they are in the middle of destroying.
+void PlainLogosObject::disconnectEventsImpl()
+{
     std::vector<std::pair<QString, EventCallback>> subs;
     {
         std::lock_guard<std::mutex> g(m_mu);
@@ -1137,70 +1223,84 @@ void PlainLogosObject::release()
     // documents — which a "post a no-op onto the strand and wait for it" barrier
     // could not have been: it would have deadlocked against itself.
     //
-    // ── AND THE ONE THING IT IS STILL NOT SAFE AGAINST ──────────────────────
+    // ── AND A CALL RUNNING ON ANOTHER THREAD RIGHT NOW ──────────────────────
     //
-    // A CALL RUNNING ON ANOTHER THREAD RIGHT NOW. `delete this` below frees the
-    // object while that thread is inside it, and every member it goes on to
-    // touch — m_conn, m_objectName, m_state — is freed memory. Reproduced
-    // deterministically: a synchronous callMethod parked in its future wait,
-    // released from another thread, faults on the very next line it executes
-    // (`m_conn->cancelPending(...)`), with and without Guard Malloc, on master
-    // and on both pending PRs. It is not the fold's doing and the fold does not
-    // help it.
+    // That used to be a use-after-free, and it is now safe. The defect was
+    // reproduced deterministically on master and on both pending PRs: a
+    // synchronous callMethod parked in its future wait, released from a second
+    // thread, faults on the very next line it executes
+    // (`m_conn->cancelPending(...)`), with and without Guard Malloc, because
+    // release() ended in an unconditional `delete this`.
     //
-    // THIS IS A CALLER CONTRACT, AND THAT IS NOT AN EXCUSE — it is the only
-    // thing it can be, and the argument is short enough to check. Any mechanism
-    // that could make the racing call safe has to be REACHED THROUGH `this`:
-    // a reference count, a flag, a lock, an epoch — all of them are members,
-    // and the racing thread's first act would be to load one out of the object
-    // whose storage has just been freed. There is no synchronisation with a
-    // destruction you can only learn about by reading the destroyed object. The
-    // only designs that work put the state OUTSIDE the object, and the ABI
-    // forbids every one of them: requestObject hands out a raw LogosObject*
-    // (logos_object.h explains why that vtable cannot move), callers dispatch
-    // virtuals straight through it, and release() is defined as deleting it.
+    // WHAT MAKES IT SAFE. The object carries a live-reference count (m_liveRefs,
+    // see EntryGuard above): 1 for the owner, plus one per caller currently
+    // inside a public entry point. release() does the teardown and then drops
+    // THE OWNER'S reference instead of deleting; whoever drops the count to zero
+    // does the delete. With a call in flight that is the call's own thread, on
+    // its way out, after its last access to the object.
     //
-    // THE THREE ALTERNATIVES, and why each was rejected rather than shipped:
+    // AND THE ARGUMENT THAT SAID THIS WAS IMPOSSIBLE, because it is instructive
+    // and it was wrong. It ran: any mechanism that could save the racing call has
+    // to be reached THROUGH `this`, so the racing thread's first act would be to
+    // read a freed object. True — for a call that ENTERS after destruction. It
+    // conflates that with a call ALREADY INSIDE the object, which is the defect
+    // actually reproduced: that call's reference was taken while the object was
+    // provably alive (it is what its own thread did on the way in, before
+    // release() was ever called), so its increment is ordered before release()'s
+    // decrement in the modification order of m_liveRefs, and release() therefore
+    // SEES it. Nothing is read through a dangling pointer anywhere in that
+    // sequence. The counter is a member, and that is fine, because the thread
+    // that has to trust the member is the thread that already published to it.
     //
-    //   * AN ATOMIC "alive" FLAG checked on entry. The check is a load through
-    //     `this`, so it reads freed memory to decide whether the memory is
-    //     freed, and even a true answer is stale the instant after it is read.
-    //     It converts a reliable crash into an unreliable one, which is a worse
-    //     bug than the one it replaces.
-    //   * release() BLOCKS UNTIL IN-FLIGHT CALLS FINISH. Breaks the guarantee
-    //     the two preceding changes exist to establish — teardown waits for
-    //     nothing — by making it wait for up to a caller's full timeout, and
-    //     deadlocks outright in the shipped reentrant shape above, where the
-    //     releasing thread IS the thread that would have to finish the call.
-    //     And it does not even close the race: a call ENTERING after the check
-    //     is unaffected.
-    //   * AN IMMORTAL FORWARDING HANDLE — hand out a small stable object that
-    //     holds a shared_ptr to the implementation, and have release() drop the
-    //     implementation instead of freeing the handle. This one genuinely
-    //     works, and it is rejected on cost rather than on correctness: the
-    //     handle can never be freed (freeing it reintroduces the identical
-    //     race), so it becomes permanent retention proportional to the number
-    //     of requestObject calls on a connection that lives as long as the
-    //     process — in a transport whose two preceding changes were spent
-    //     proving retention does not grow with call count. It would also fix
-    //     ONE of four transports: qt_remote, qt_local and mock all end release()
-    //     in `delete this` too, so the contract has to exist and be documented
-    //     regardless, and a transport-local trick mainly makes the contract
-    //     LOOK satisfied on whichever transport the caller happened to test on.
+    // WHAT IS STILL NOT SAFE, exactly:
     //
-    // So: the contract is stated (here, in plain_logos_object.h, and in
-    // logos_object.h where every transport's callers will read it), and what
-    // this class adds is a DETECTOR that makes breaking it loud. It reports
-    // from the only side that is provably alive at the moment it looks — this
-    // one — and in a debug build it aborts, so the misuse is a named diagnostic
-    // at the line that committed it instead of a SIGSEGV somewhere else a
-    // moment later. It does not, and cannot, save the racing call.
-    reportConcurrentCallers("release()");
+    //   * A CALL THAT ENTERS AT OR AFTER release(). Its very first act is to
+    //     increment a counter that may already be freed. This is the shape the
+    //     old argument describes correctly, it is what "the handle must not be
+    //     used after release()" has always meant, and it stays a caller error.
+    //     EntryGuard reports it (reportEntryAfterRelease) in the cases where the
+    //     object is still alive to notice — i.e. when another call in flight is
+    //     holding it — and in the cases where it is not, there is nothing left to
+    //     look at.
+    //   * `delete obj` INSTEAD OF release() with calls in flight. The caller has
+    //     demanded the storage back now, so there is no destruction left to
+    //     defer. The destructor reports it (reportConcurrentCallers) and aborts
+    //     in debug builds.
+    //   * TWO release()es ON THE SAME HANDLE. The second one is a call entering
+    //     after destruction, by the definition above.
+    //
+    // THE COSTS, since deferring a destruction is not free:
+    //
+    //   * release() still returns immediately, and still waits for nothing — the
+    //     property the two preceding changes exist to establish is untouched, and
+    //     the reentrant release()-from-an-io-thread-event-callback shape still
+    //     cannot deadlock, because nothing here blocks.
+    //   * The OBJECT, and with it its share of the connection, now lives until
+    //     the last call in flight leaves — bounded by that call's own timeout,
+    //     which the caller chose. A handle released while a 30-second call is
+    //     parked keeps ~200 bytes and one shared_ptr count alive for the rest of
+    //     that call. stopAndCancelCalls() has already cancelled everything it can
+    //     wake, so the only thing that can still take the full time is a
+    //     synchronous call parked in the connection's future, which nothing in
+    //     this transport can interrupt.
+    //   * m_conn IS NOT RESET HERE any more, and that is a correctness
+    //     requirement rather than a simplification: the parked caller's next act
+    //     is `m_conn->cancelPending(...)`, and resetting a shared_ptr while
+    //     another thread reads it is a data race on the shared_ptr itself. The
+    //     member is released by the destructor, which now runs when nobody is
+    //     inside the object.
+    m_released.store(true, std::memory_order_release);
 
-    disconnectEvents();
+    // Impl, not the guarded entry point: an EntryGuard here would take a
+    // reference and drop it again, and it would ALSO trip the "entered after
+    // release" report it just armed. Same reason in the destructor.
+    disconnectEventsImpl();
     stopAndCancelCalls();
-    m_conn.reset();
-    delete this;
+    // THE LAST THING THIS FUNCTION TOUCHES, exactly as in EntryGuard: after the
+    // decrement this object may belong to another thread, and if the decrement
+    // reached zero it does not exist. Nothing below it, ever.
+    if (m_liveRefs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete this;
 }
 
 quintptr PlainLogosObject::id() const

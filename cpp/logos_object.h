@@ -23,24 +23,33 @@
  *   * CALLS are safe to make from several threads at once. The transports
  *     serialize what has to be serialized internally.
  *
- *   * release() IS NOT SAFE AGAINST A CONCURRENT CALL, and cannot be made so.
- *     release() destroys the object (every transport ends it in `delete this`),
- *     so a call still executing on another thread is left dereferencing freed
- *     memory. It is the caller's job to order the two: every call on a handle
- *     must have RETURNED before release() is entered.
+ *   * release() IS NOT SAFE AGAINST A CONCURRENT CALL AT THIS LEVEL. release()
+ *     destroys the object, so a call still executing on another thread is left
+ *     dereferencing freed memory. Write callers as if that is always true: every
+ *     call on a handle must have RETURNED before release() is entered. The
+ *     common shape that trips it is a handle shared with a worker thread and
+ *     released on teardown without waiting for the worker. Wait for it.
  *
- *     This is not a gap waiting to be closed. Anything that could make the
- *     racing call safe would have to be reached THROUGH the handle pointer, and
- *     reading through a pointer to a destroyed object is exactly the
- *     use-after-free it would be there to prevent; the only designs that work
- *     keep the state outside the object, which the raw-pointer ABI documented
- *     below rules out. The plain transport carries a debug-build detector that
- *     turns the misuse into a named abort at the offending release() instead of
- *     a SIGSEGV somewhere else (see plain_logos_object.cpp); the other
- *     transports have the same rule and no detector yet.
+ *     WHAT EACH TRANSPORT ACTUALLY DOES, because the answer is no longer uniform
+ *     and the difference is not something a caller should rely on:
  *
- *     The common shape that trips this is a handle shared with a worker thread
- *     and released on teardown without waiting for the worker. Wait for it.
+ *       - PLAIN: safe. The object counts the callers inside it, release() drops
+ *         the owner's reference rather than deleting, and the LAST call to leave
+ *         destroys the object. A call that had entered before release() was
+ *         called therefore runs to completion against a live object. release()
+ *         itself still returns immediately and waits for nothing. Two shapes
+ *         remain caller errors even there — STARTING a call at or after
+ *         release() (its first act is to touch storage that may already be
+ *         freed), and `delete obj` in place of release() with a call in flight —
+ *         and both are reported, aborting in debug builds, whenever the object
+ *         still exists to notice. See plain_logos_object.cpp.
+ *       - QT REMOTE / QT LOCAL / MOCK: not safe. release() ends in `delete
+ *         this`, with no counting and no detector.
+ *
+ *     So the INTERFACE contract is the strict one above. A transport may be
+ *     kinder than the contract; code written against the contract is correct on
+ *     all of them, and code written against the plain transport's behaviour
+ *     breaks the day it is handed a QtRO handle.
  */
 class LogosObject {
 public:
@@ -153,10 +162,20 @@ public:
      * Implementations that own the underlying resource (e.g. a
      * QRemoteObjectReplica) will delete it here.
      *
-     * "Must not be used again" includes USES THAT ARE ALREADY RUNNING on other
-     * threads — see the thread-safety note on this class. release() must be
-     * ordered after every call on this handle has returned, not merely after
-     * the caller stopped starting new ones.
+     * "Must not be used again" is about STARTING something new, and it is
+     * absolute: no call, no event subscription, no second release(), on any
+     * thread, ever.
+     *
+     * Calls that are ALREADY RUNNING when release() is entered are a separate
+     * question, and the answer is per-transport — see the thread-safety note on
+     * this class. Write callers to the strict rule (order release() after every
+     * call has returned); the plain transport happens to survive the race and
+     * the Qt ones do not.
+     *
+     * release() does not wait. On every transport it returns without blocking on
+     * in-flight work; on the plain transport that means the underlying object can
+     * outlive the release() call by as long as the slowest call still inside it
+     * takes to finish, which is bounded by that call's own timeout.
      */
     virtual void release() = 0;
 
