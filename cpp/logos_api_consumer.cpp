@@ -217,6 +217,26 @@ private:
     // makes that structural instead of a comment someone has to remember.
     bool beginAcquire(const QString& objectName)
     {
+        // Arm NOW if the transport can hand over a handle for free. Not an
+        // optimisation — a correctness case the deferred path cannot cover.
+        //
+        // The common consumer shape is a successful CALL immediately followed
+        // by a subscription in the same function (wallet-ui's backend calls
+        // get_chains(), then subscribes on the next line). Before deferral, the
+        // generated Qt wrapper acquired synchronously, so the subscription was
+        // live before on() returned. Deferring it to the next event-loop turn
+        // silently drops anything emitted in between, which is the same
+        // event-loss this class exists to remove, just moved to a narrower
+        // window. tryAcquireNow() never blocks and answers nullptr whenever it
+        // would have to wait, so the deferred path below still owns every case
+        // where the module is not already there.
+        if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport)) {
+            if (LogosObject* now = async->tryAcquireNow(objectName)) {
+                armAgainst(objectName, now);
+                return true;
+            }
+        }
+
         if (startAcquire(objectName) != AcquireKind::Unsupported)
             return false;
         LogosObject* obj = m_transport->requestObject(objectName, 0);

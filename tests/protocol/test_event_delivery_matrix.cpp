@@ -159,6 +159,17 @@ bool defersWhenModuleAbsent(TransportKind t) { return t != TransportKind::Plain;
 // event-loop turn because delivering inline would run user code on QtRO's read
 // stack, which is a documented crash in this codebase, not a style preference.
 bool armsSynchronouslyWhenPresent(TransportKind t) { return t != TransportKind::QtRemote; }
+
+// Is a subscription live the instant it is made, on a module that is already
+// reachable? Only where registering it is LOCAL to this process:
+//   qt_remote  attaches a callback to a replica this node already holds
+//   qt_local   connects to the provider's Qt signal, in-process
+//   plain      NO -- onSubscribe travels to the host as a wire frame, so an
+//              event emitted before that frame lands reaches nobody. That is
+//              inherent to a network transport and predates deferral: the old
+//              path sent the identical frame. Delivery must still HAPPEN, just
+//              not instantly, which is what the plain leg below asserts.
+bool subscriptionIsLocallyRegistered(TransportKind t) { return t != TransportKind::Plain; }
 const char* nameOf(TransportKind t) {
     switch (t) {
     case TransportKind::QtRemote: return "qt_remote";
@@ -701,6 +712,69 @@ TEST_P(EventDeliveryMatrix, ReconnectWhileModuleIsDown_StillReArmsWhenItReturns)
         << "a subscription that was pending across a reconnect never armed again";
 }
 
+// ── the call-then-subscribe shape ────────────────────────────────────────────
+//
+// The most common real consumer: talk to a module, then subscribe to it in the
+// same function. wallet-ui's backend calls get_chains() and subscribes on the
+// next line; the tutorial's C++ UI backend does the same.
+//
+// Before deferral the generated Qt wrapper acquired synchronously, so the
+// subscription was live before on() returned and an event emitted immediately
+// after was delivered. Deferring to the next event-loop turn silently drops it
+// -- the same event loss this area exists to remove, in a narrower window. The
+// event is fired ONCE, synchronously, with no pumping in between, because
+// re-firing would hide exactly the gap under test.
+TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
+{
+    Module mod = makeModule("aftercall");
+    ASSERT_TRUE(mod.hostReady());
+    mod.bringUp();
+
+    auto client = makeClient(mod);
+
+    // A real call first: that is what leaves the consumer already talking to
+    // the module, which is the state the regression needs (on qt_remote it is
+    // what drives the node's replica for this object to Valid).
+    //
+    // ASYNC deliberately. A synchronous call would deadlock on the plain
+    // transport in this harness: PlainTransportHost::onCall dispatches to the
+    // ModuleProxy's thread, which here is the calling thread, so the call would
+    // sit until its timeout waiting for an event loop it is itself blocking.
+    // That is a property of the fixture, not of the product — the plain suite's
+    // own LiveHost puts the proxy on a worker thread for the same reason.
+    std::atomic<int> called{0};
+    client->invokeRemoteMethodAsync(mod.name(), QStringLiteral("echo"), QVariantList() << 5,
+        LogosAPIClient::AsyncResultCallback([&](QVariant) { called.fetch_add(1); }));
+    ASSERT_TRUE(pumpUntil([&] { return called.load() > 0; }, 15000))
+        << "control: the preceding call never completed, so the consumer was never "
+           "'already talking to the module' and the case below tests nothing";
+    ASSERT_TRUE(pumpUntil([&] { return mod.canEmit(); }, 10000))
+        << "control: the provider never came up, so nothing below means anything";
+
+    std::atomic<int> got{0};
+    const quint64 id = client->onEventWhenAvailable(mod.name(), QStringLiteral("ev"),
+        [&](const QString&, const QVariantList&) { got.fetch_add(1); });
+    ASSERT_NE(id, 0u);
+
+    if (subscriptionIsLocallyRegistered(GetParam().transport)) {
+        // Fire ONCE, right now, without returning to the event loop first.
+        // Re-firing would hide exactly the gap under test.
+        mod.emitEvent(QStringLiteral("ev"), 1);
+        pump(500);
+        EXPECT_GE(got.load(), 1)
+            << "an event emitted immediately after subscribing to an ALREADY-REACHABLE "
+               "module was dropped: the subscription had not armed yet. A consumer that "
+               "calls a module and then subscribes is the common shape, and it used to "
+               "arm synchronously.";
+    } else {
+        // plain: the subscribe frame has to reach the host first, so instant
+        // delivery was never on offer. What must hold is that it arms shortly
+        // and delivers -- i.e. the deferral did not break it.
+        EXPECT_TRUE(fireUntilDelivered(mod, QStringLiteral("ev"), 1, got, 10000))
+            << "subscribing right after a call never armed at all on this transport";
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     AllTransportsAndProviders, EventDeliveryMatrix,
     ::testing::Values(
@@ -791,7 +865,10 @@ TEST(EventDeliveryNonBlocking, SubscribingToAnAbsentModuleReturnsImmediately)
         worstGapMs = qMax(worstGapMs, beat.elapsed() - last);
         last = beat.elapsed();
     }
-    EXPECT_GT(beats, 50) << "the event loop was starved while a subscription was pending";
+    // Deliberately a floor, not a rate. This counts pump(20) iterations inside a
+    // fixed wall-clock window, so on a loaded machine it measures the machine.
+    // The assertion that means something is the GAP below.
+    EXPECT_GT(beats, 5) << "the event loop did not run at all while a subscription was pending";
     EXPECT_LT(worstGapMs, 400) << "worst event-loop gap " << worstGapMs
                                << " ms -- something on the retry path is blocking";
     EXPECT_EQ(RemoteTransportConnection::acquireCount(), 0)

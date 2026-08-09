@@ -831,6 +831,31 @@ bool RemoteTransportConnection::requestObjectWhenAvailable(const QString& object
     return true;
 }
 
+LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
+{
+    if (objectName.isEmpty() || !m_node) return nullptr;
+    // Raw latch, same reasoning as requestObjectWhenAvailable: the question is
+    // whether this node is wired to the endpoint, not whether the peer is up.
+    if (!m_connected) return nullptr;
+
+    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    if (!replica) return nullptr;
+
+    // The ONLY case worth answering. A replica that is not already Valid would
+    // have to be waited on, and waiting is exactly what this must not do —
+    // requestObjectWhenAvailable owns that. Note QtRO shares one replica
+    // implementation per object name on a node, so when the caller already has
+    // a live handle for this module (it just made a call through it) this is
+    // Valid on the spot and costs no round trip.
+    if (replica->state() != QRemoteObjectReplica::Valid) {
+        delete replica;
+        return nullptr;
+    }
+
+    g_acquireCount.fetch_add(1, std::memory_order_relaxed);
+    return new RemoteLogosObject(replica, objectName);
+}
+
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }
 void RemoteTransportConnection::resetAcquireCount() { g_acquireCount.store(0, std::memory_order_relaxed); }
 

@@ -38,6 +38,8 @@ public:
     bool requestObjectWhenAvailable(const QString& objectName,
                                     AcquireCallback onReady) override;
 
+    LogosObject* tryAcquireNow(const QString& objectName) override;
+
     // Test hook: how many times requestObject() acquired a fresh replica
     // (process-wide). Lets a test assert the consumer's handle cache reuses one
     // replica instead of re-acquiring per call.

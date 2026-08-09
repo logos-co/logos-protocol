@@ -176,6 +176,29 @@ public:
      */
     virtual bool requestObjectWhenAvailable(const QString& objectName,
                                             AcquireCallback onReady) = 0;
+
+    /**
+     * @brief Acquire `objectName` RIGHT NOW if that costs nothing, else give up.
+     *
+     * Returns a handle the caller owns (release() when done) only when the
+     * transport already has everything it needs — for qt_remote, a replica
+     * that is already Valid. Returns nullptr otherwise. It must NEVER block,
+     * never spin a nested event loop, and never wait on a peer: "not
+     * immediately available" is an answer, not a failure, and the caller is
+     * expected to fall back to requestObjectWhenAvailable().
+     *
+     * This exists because deferral is not free at the moment of subscribing.
+     * A subscriber that is already talking to a module — the common shape is a
+     * successful call followed by a subscription in the same function — used to
+     * get a live subscription before its call returned, because the old path
+     * acquired synchronously. Deferring that to the next event-loop turn drops
+     * anything emitted in between. Delivering here is safe precisely because it
+     * happens on the SUBSCRIBER's stack rather than inside the transport's read
+     * stack, which is what the never-synchronous rule on the callback protects.
+     *
+     * Default: nullptr — a transport that cannot answer cheaply says so.
+     */
+    virtual LogosObject* tryAcquireNow(const QString& /*objectName*/) { return nullptr; }
 };
 
 #endif // LOGOS_TRANSPORT_H
