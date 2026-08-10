@@ -49,7 +49,7 @@
         }
       );
 
-      checks = forAllSystems ({ pkgs }:
+      checks = forAllSystems ({ pkgs, ... }:
         let
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
@@ -60,7 +60,7 @@
         }
       );
 
-      devShells = forAllSystems ({ pkgs }: {
+      devShells = forAllSystems ({ pkgs, ... }: {
         default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.cmake
