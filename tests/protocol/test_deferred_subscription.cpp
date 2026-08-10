@@ -276,3 +276,94 @@ TEST_F(DeferredSubscriptionTest, LpSubscribe_AfterPublish_Control)
     lp_unsubscribe(sub);
     lp_client_destroy(client);
 }
+
+// ── The probe must not free a replica QtRO is still holding ──────────────────
+//
+// Regression for the use-after-free introduced by e9f82ac and fixed by 09f684f.
+//
+// tryAcquireNow() used to acquire a dynamic replica and, when it was not
+// already Valid, DELETE it. QtRO shares one replica IMPLEMENTATION per object
+// name per node, and while that implementation is still waiting for the
+// source's metaobject it records every facade built on it as a RAW pointer in
+// QConnectedReplicaImplementation::m_parentsNeedingConnect.
+// ~QRemoteObjectReplica is an empty body, so destroying a facade never
+// deregisters it -- and the implementation dereferences the whole list when the
+// class definition arrives.
+//
+// WHY IT TAKES MORE THAN ONE SUBSCRIPTION. The first probe owns the only
+// implementation and takes it down with itself, so a single subscription is
+// harmless. It needs a second whose implementation is pinned by an in-flight
+// PendingAcquire before a freed facade can outlive the implementation holding a
+// pointer to it. A consumer that subscribes once sees nothing wrong; a view
+// that registers every event it cares about up front dies. That asymmetry is
+// why this went unnoticed, and it is why the control below matters as much as
+// the case.
+//
+// WHERE IT CRASHES. Not at the subscribe call -- in the event loop, one turn
+// later, when the handshake lands and QtRO walks the list. So the failure mode
+// of this test is the BINARY DYING (SIGBUS / BUS_ADRALN on arm64, SIGSEGV
+// elsewhere), not a failed assertion. A green run is the whole signal.
+//
+// The pumping at the end is therefore not incidental: without an event-loop
+// turn after the subscriptions, the pre-fix code passes this test.
+TEST_F(DeferredSubscriptionTest, ManySubscriptionsBeforeArm_DoNotFreeAReplicaQtRoStillHolds)
+{
+    const QString mod = QStringLiteral("probe_churn_module");
+
+    // Published FIRST and never pumped before subscribing: the host exists, so
+    // an acquire can pin an implementation, but the replica cannot have reached
+    // Valid yet -- which is exactly the window every probe lands in.
+    Publisher pub(mod);
+
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+
+    // 24 is comfortably past the ~14 at which the original crash reproduced,
+    // and far enough past 1 that the "one probe is harmless" case cannot mask it.
+    constexpr int kSubscriptions = 24;
+    std::atomic<int> received{0};
+    for (int i = 0; i < kSubscriptions; ++i) {
+        const quint64 id = client->onEventWhenAvailable(
+            mod, QStringLiteral("ev%1").arg(i),
+            [&](const QString&, const QVariantList&) { received.fetch_add(1); });
+        ASSERT_NE(id, 0u) << "subscription " << i << " was refused";
+    }
+
+    // The turn that used to kill the process.
+    for (int i = 0; i < 200 && received.load() == 0; ++i) {
+        if (pub.echo.emitFn) pub.echo.emitFn(QStringLiteral("ev0"), QVariantList{ 1 });
+        pump(50);
+    }
+
+    // Surviving to here is the regression assertion. Delivery is asserted too,
+    // so that a build which somehow armed nothing at all cannot pass by being
+    // quietly inert.
+    EXPECT_GE(received.load(), 1) << "no subscription ever armed";
+    EXPECT_TRUE(client->pendingEventSubscriptions().isEmpty())
+        << "still reporting pending after arming";
+}
+
+// Control: ONE subscription in the same window. Green both before and after the
+// fix -- it is here to pin that the case above needs the churn, not merely a
+// deferred subscribe, so a future reader cannot conclude the whole path was
+// broken.
+TEST_F(DeferredSubscriptionTest, OneSubscriptionBeforeArm_Control)
+{
+    const QString mod = QStringLiteral("probe_single_module");
+    Publisher pub(mod);
+
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+
+    std::atomic<int> received{0};
+    ASSERT_NE(client->onEventWhenAvailable(mod, QStringLiteral("ev0"),
+        [&](const QString&, const QVariantList&) { received.fetch_add(1); }), 0u);
+
+    for (int i = 0; i < 200 && received.load() == 0; ++i) {
+        if (pub.echo.emitFn) pub.echo.emitFn(QStringLiteral("ev0"), QVariantList{ 1 });
+        pump(50);
+    }
+    EXPECT_GE(received.load(), 1);
+}
