@@ -837,51 +837,15 @@ bool RemoteTransportConnection::requestObjectWhenAvailable(const QString& object
 LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
 {
     if (objectName.isEmpty() || !m_node) return nullptr;
-    // Raw latch, same reasoning as requestObjectWhenAvailable: the question is
-    // whether this node is wired to the endpoint, not whether the peer is up.
     if (!m_connected) return nullptr;
 
-    // PARK the probe; never free it while it is unconfigured. QtRO shares one
-    // replica implementation per object name on a node, and while that
-    // implementation is still waiting for the source's metaobject it records
-    // every facade built on it as a RAW pointer in m_parentsNeedingConnect.
-    // ~QRemoteObjectReplica is an empty body, so destroying a facade does not
-    // deregister it — and the implementation dereferences the whole list when
-    // the class definition finally arrives.
-    //
-    // The earlier acquire-then-delete form was therefore a use-after-free that
-    // left one dangling pointer per probe. It survived a single subscription
-    // (the probe owned the only implementation and took it down with itself)
-    // and crashed once a second subscription shared an implementation pinned by
-    // an in-flight PendingAcquire: SIGBUS with BUS_ADRALN, in the consumer's
-    // event loop rather than at the call site.
-    //
-    // Parking costs one idle replica per name until it goes Valid or the
-    // connection dies. Parented to m_pendingAcquires, which both ~RemoteTransportConnection
-    // and reconnect() destroy BEFORE the node — the ordering is what makes
-    // freeing them safe, since the implementations die in the same breath.
-    QPointer<QRemoteObjectReplica>& probe = m_probes[objectName];
-    if (!probe) {
-        QRemoteObjectReplica* fresh = m_node->acquireDynamic(objectName);
-        if (!fresh) {
-            m_probes.remove(objectName);
-            return nullptr;
-        }
-        if (m_pendingAcquires) fresh->setParent(m_pendingAcquires);
-        probe = fresh;
-    }
-
-    // Not Valid means "would have to be waited on", and waiting is exactly what
-    // this must not do — requestObjectWhenAvailable owns that. Leave the probe
-    // parked and answer no.
-    if (probe->state() != QRemoteObjectReplica::Valid)
+    // PRE-FIX BEHAVIOUR, restored deliberately to prove the test detects it.
+    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    if (!replica) return nullptr;
+    if (replica->state() != QRemoteObjectReplica::Valid) {
+        delete replica;
         return nullptr;
-
-    // Valid: the implementation is configured, so it is no longer holding this
-    // facade in m_parentsNeedingConnect and handing ownership over is safe.
-    QRemoteObjectReplica* replica = probe;
-    m_probes.remove(objectName);
-    replica->setParent(nullptr);
+    }
 
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);

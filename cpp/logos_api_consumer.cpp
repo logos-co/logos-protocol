@@ -244,8 +244,7 @@ private:
         // once, so probing again buys nothing and only churns replicas. tick()
         // already applies this filter; this was the one caller that did not,
         // which is what turned one probe per module into one per subscription.
-        if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport);
-            async && !m_acquiring.contains(objectName)) {
+        if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport)) {
             if (LogosObject* now = async->tryAcquireNow(objectName)) {
                 armAgainst(objectName, now);
                 return true;
