@@ -3,10 +3,13 @@
 
 #include "../../logos_transport.h"
 #include "../../logos_object.h"
+#include <QHash>
+#include <QPointer>
 #include <QString>
 
 class QRemoteObjectRegistryHost;
 class QRemoteObjectNode;
+class QRemoteObjectReplica;
 
 class RemoteTransportHost : public LogosTransportHost {
 public:
@@ -54,6 +57,19 @@ private:
     // it cancels them; it is reset explicitly at the TOP of the destructor so
     // pending replicas die before the node they belong to.
     QObject* m_pendingAcquires;
+    // Parked probes for tryAcquireNow(), one per object name, each parented to
+    // m_pendingAcquires so they die with it — BEFORE the node, in both the
+    // destructor and reconnect().
+    //
+    // They are parked rather than freed because destroying a dynamic replica
+    // whose shared implementation has not yet received the source's metaobject
+    // leaves a DANGLING RAW POINTER inside that implementation: QtRO records
+    // each such facade in QConnectedReplicaImplementation::m_parentsNeedingConnect
+    // and ~QRemoteObjectReplica is an empty body that never deregisters. The
+    // implementation then dereferences every entry when the class definition
+    // arrives. Probing repeatedly and freeing each probe is therefore a
+    // use-after-free with one dangling pointer per probe.
+    QHash<QString, QPointer<QRemoteObjectReplica>> m_probes;
     // Does the registry endpoint currently have a listener?
     //
     // Separate from m_connected because connectToNode() cannot answer it: it
