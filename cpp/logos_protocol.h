@@ -59,15 +59,22 @@
  * =========================================================================== */
 
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
+// 0.3: the trust-root surface — lp_grant_host_services() plus the two functions
+// it gates (lp_token_keys, lp_inform_module_token_to), and the module-impl
+// export that carries the grant across the cdylib boundary
+// (logos_module_grant_host_services, logos_module_impl.h). Additive: no
+// existing symbol changes behaviour, and an image that is never granted sees
+// exactly the pre-0.3 surface — the gates are closed by default — so a host
+// that knows nothing about the grant keeps working unmodified.
 // 0.2: per-module concurrent dispatch ("multi"). Additive/back-compatible — a
 // multi module returns a deferred-completion sentinel from callMethod and pushes
 // the result as a __logos_call_complete__ event (see logos_async_dispatch.h);
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 2
+#define LOGOS_PROTOCOL_VERSION_MINOR 3
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.2.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.3.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -317,12 +324,77 @@ LP_API char* lp_token_get(const char* module_name);
 /** Store a token for `module_name`. */
 LP_API int lp_token_save(const char* module_name, const char* token);
 
+/** The module names this image's token store holds, as a JSON array. Caller
+ *  frees via lp_string_free.
+ *
+ *  Requires the "token_registry" host service (lp_grant_host_services): an
+ *  ungranted image gets NULL. NULL is therefore "refused", never "empty" — a
+ *  granted call with nothing stored returns "[]". Order is unspecified.
+ *
+ *  This is the known-caller gate a trust-root module needs: it answers "have I
+ *  ever been handed a token for this module?" without exposing any token
+ *  value. */
+LP_API char* lp_token_keys(void);
+
 /** Deliver a module token to the client's target (the consumer-side
- *  `informModuleToken`). Returns LP_OK when the target accepted it. */
+ *  `informModuleToken`). Returns LP_OK when the target accepted it.
+ *
+ *  Note the fixed destination: this reaches `capability_module`, whatever the
+ *  client's target is. It is the CONSUMER half of the exchange — "core, here is
+ *  a token" — not a way to push a token at an arbitrary module. For that, see
+ *  lp_inform_module_token_to below. */
 LP_API int lp_inform_module_token(lp_client* client,
                            const char* auth_token,
                            const char* module_name,
                            const char* token);
+
+/** Deliver the token for `module_name` TO `origin_module` — the provider half
+ *  of the exchange, the direction capability_module pushes.
+ *
+ *  Prefers `origin_module`'s handshake surface so a target still running its
+ *  initializer is reachable, and falls back to its business object for modules
+ *  built before that surface existed. `timeout_ms <= 0` selects the default
+ *  (20s), which bounds the fallback acquire and the call together.
+ *
+ *  Requires the "token_delivery" host service (lp_grant_host_services): an
+ *  ungranted image gets LP_ERR_UNSUPPORTED. Returns LP_ERR_INTERNAL when the
+ *  target refused or could not be reached. */
+LP_API int lp_inform_module_token_to(lp_client* client,
+                              const char* auth_token,
+                              const char* origin_module,
+                              const char* module_name,
+                              const char* token,
+                              int timeout_ms);
+
+/* ---------------------------------------------------------------------------
+ * Host services — the privileged surface a trust-root module is granted
+ *
+ * Two functions above are closed by default and opened only by an explicit
+ * grant: lp_token_keys ("token_registry") and lp_inform_module_token_to
+ * ("token_delivery"). They are what a capability/trust-root module needs and
+ * what an ordinary module must not have.
+ *
+ * The grant is per-IMAGE, and that is the whole point rather than an
+ * implementation detail. A host binary and a module cdylib each link their own
+ * copy of this library, so each has its own process-global state — a grant
+ * recorded in the host is invisible to a cdylib calling lp_token_keys. The
+ * grant therefore has to cross the module-impl C ABI exactly as the auth token
+ * already does (logos_module_grant_host_services in logos_module_impl.h), and
+ * a gate "simplified" into the host would silently never fire.
+ * ------------------------------------------------------------------------- */
+
+/** Grant this image the named host services. `services_json` is a JSON array
+ *  drawn from the closed set {"token_registry", "token_delivery"}.
+ *
+ *  REPLACES the current grant rather than adding to it. NULL, the empty string
+ *  or `[]` clears it, closing both gates again — clearing is the fail-closed
+ *  direction, so the lenient input handling costs nothing.
+ *
+ *  Returns LP_ERR_INVALID_ARG for malformed JSON, a non-array, a non-string
+ *  element, or ANY unrecognised service name; the existing grant is left
+ *  untouched in that case. An unknown name is a caller that believes it holds a
+ *  privilege it does not, which must not be absorbed silently. */
+LP_API int lp_grant_host_services(const char* services_json);
 
 /* ---------------------------------------------------------------------------
  * Provider (GROUNDWORK — defined and compiled in this version, fully

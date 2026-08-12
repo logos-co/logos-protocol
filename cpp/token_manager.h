@@ -8,6 +8,7 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <string>
+#include <vector>
 
 #include "logos_shared_api.h"
 
@@ -141,6 +142,16 @@ public:
      * @return QList<QString> List of all token keys
      */
     QList<QString> getTokenKeys() const;
+
+    /**
+     * @brief Get all token keys (std::string flavour)
+     *
+     * Named rather than overloaded because C++ cannot overload on return type
+     * alone. Exists for the Qt-free callers — lp_token_keys() and, through it,
+     * any language SDK — so the conversion lives here next to the store rather
+     * than being retyped at each boundary.
+     */
+    std::vector<std::string> getTokenKeysStd() const;
 
     /**
      * @brief Get the number of stored tokens

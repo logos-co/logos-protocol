@@ -86,6 +86,24 @@ LOGOS_MODULE_IMPL_EXPORT void logos_module_set_emit_callback(
 LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
                                                        const char* token);
 
+/* Grant the module the privileged host services named in `services_json` (a
+ * JSON array from the closed set lp_grant_host_services documents). Returns 0
+ * on acceptance; the generated implementation simply forwards to
+ * lp_grant_host_services.
+ *
+ * Called by the host AFTER it has verified the module's identity, and only for
+ * the modules its policy designates as a trust root — nothing about this ABI
+ * decides who deserves the grant.
+ *
+ * It has to travel this way, and that is the subtle part: the host binary and
+ * the module cdylib each link their own copy of logos-protocol, so each has its
+ * own process-global grant state, exactly as each has its own TokenManager. A
+ * grant the host records for itself is invisible to the gate the cdylib checks.
+ * Pushing it in over this ABI — the same route the auth token above already
+ * takes — is what puts the grant in the image whose gates it must open. */
+LOGOS_MODULE_IMPL_EXPORT int logos_module_grant_host_services(
+    const char* services_json);
+
 /* The logos-protocol semver this module was compiled against. Static
  * string — do NOT free. */
 LOGOS_MODULE_IMPL_EXPORT const char* logos_module_get_protocol_version(void);

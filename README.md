@@ -12,7 +12,8 @@ versioned boundary instead of re-wrapping the C++/Qt SDK.
 
 - **Public C ABI** — `cpp/logos_protocol.h`: consumer surface
   (`lp_client_*`, `lp_invoke[_async]`, `lp_subscribe`, tokens,
-  `lp_get_methods`), provider groundwork (`lp_provider_*`), and the
+  `lp_get_methods`), provider groundwork (`lp_provider_*`), the trust-root
+  surface (`lp_grant_host_services` and the two functions it gates), and the
   **protocol version** (`LOGOS_PROTOCOL_VERSION_*`, `lp_protocol_version()`,
   `lp_protocol_abi_major()`). JSON-in-strings data model; bytes cross the
   boundary as `{"_bytes":"<base64url>"}` (lossless, NUL-safe).

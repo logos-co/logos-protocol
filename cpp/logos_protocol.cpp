@@ -84,6 +84,39 @@ Timeout lpTimeout(int timeout_ms)
     return timeout_ms > 0 ? Timeout(timeout_ms) : Timeout();
 }
 
+// ── the host-services grant (lp_grant_host_services) ────────────────────────
+//
+// Process-global, and deliberately per-IMAGE rather than per-process: a host
+// binary and a module cdylib each link their own copy of this library, so each
+// has its own copy of this variable — exactly as each has its own
+// TokenManager::instance(). That is why the grant is pushed across the
+// module-impl C ABI (logos_module_grant_host_services) the same way the auth
+// token already is, instead of being recorded once by the host: a gate checked
+// here can only ever see a grant made in the SAME image as its caller, so a
+// grant recorded in the host binary would leave a cdylib's gates shut forever.
+//
+// Fail-closed: zero until someone grants, and cleared back to zero on revoke.
+enum HostService : unsigned {
+    ServiceTokenRegistry = 1u << 0,  // "token_registry" — lp_token_keys
+    ServiceTokenDelivery = 1u << 1,  // "token_delivery" — lp_inform_module_token_to
+};
+
+std::mutex g_hostServicesMutex;
+unsigned g_hostServices = 0;
+
+bool hostServiceBit(const std::string& name, unsigned& bit)
+{
+    if (name == "token_registry") { bit = ServiceTokenRegistry; return true; }
+    if (name == "token_delivery") { bit = ServiceTokenDelivery; return true; }
+    return false;
+}
+
+bool hostServiceGranted(unsigned service)
+{
+    std::lock_guard<std::mutex> lock(g_hostServicesMutex);
+    return (g_hostServices & service) != 0;
+}
+
 // Parse args_json (NULL → empty array) into a QVariantList.
 // Returns false (+fills error) when args_json is not a JSON array.
 bool parseArgs(const char* args_json, const QString& origin,
@@ -552,6 +585,18 @@ int lp_token_save(const char* module_name, const char* token)
     return LP_OK;
 }
 
+char* lp_token_keys(void)
+{
+    // Gate first, before any argument would be looked at: an image without the
+    // grant gets one answer regardless of what it asks.
+    if (!hostServiceGranted(ServiceTokenRegistry)) return nullptr;
+
+    nlohmann::json out = nlohmann::json::array();
+    for (const std::string& key : TokenManager::instance().getTokenKeysStd())
+        out.push_back(key);
+    return lpStrdup(out.dump());
+}
+
 int lp_inform_module_token(lp_client* client,
                            const char* auth_token,
                            const char* module_name,
@@ -563,6 +608,54 @@ int lp_inform_module_token(lp_client* client,
         QString::fromUtf8(auth_token), QString::fromUtf8(module_name),
         QString::fromUtf8(token));
     return ok ? LP_OK : LP_ERR_INTERNAL;
+}
+
+int lp_inform_module_token_to(lp_client* client,
+                              const char* auth_token,
+                              const char* origin_module,
+                              const char* module_name,
+                              const char* token,
+                              int timeout_ms)
+{
+    if (!hostServiceGranted(ServiceTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    if (!client || !client->client || !auth_token || !origin_module
+        || !*origin_module || !module_name || !token)
+        return LP_ERR_INVALID_ARG;
+    // The FIVE-argument consumer method, not the three-argument twin above it:
+    // that one hardcodes capability_module as the destination, which is the
+    // opposite direction from the one a trust root needs.
+    const bool ok = client->client->informModuleToken_module(
+        QString::fromUtf8(auth_token), QString::fromUtf8(origin_module),
+        QString::fromUtf8(module_name), QString::fromUtf8(token), timeout_ms);
+    return ok ? LP_OK : LP_ERR_INTERNAL;
+}
+
+/* --------------------------------------------------------- host services */
+
+int lp_grant_host_services(const char* services_json)
+{
+    unsigned granted = 0;
+    if (services_json && *services_json) {
+        nlohmann::json parsed = nlohmann::json::parse(services_json, nullptr,
+                                                      /*allow_exceptions=*/false);
+        if (parsed.is_discarded() || !parsed.is_array()) return LP_ERR_INVALID_ARG;
+        for (const nlohmann::json& entry : parsed) {
+            unsigned bit = 0;
+            if (!entry.is_string() || !hostServiceBit(entry.get<std::string>(), bit)) {
+                // Rejected wholesale, with the current grant untouched. An
+                // unrecognised name means the caller believes it holds a
+                // privilege that does not exist; granting it the rest of the
+                // list would leave it running with a mistaken idea of what it
+                // can do, and the failure would surface later as an unexplained
+                // LP_ERR_UNSUPPORTED.
+                return LP_ERR_INVALID_ARG;
+            }
+            granted |= bit;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_hostServicesMutex);
+    g_hostServices = granted;
+    return LP_OK;
 }
 
 /* -------------------------------------------------- provider (groundwork) */

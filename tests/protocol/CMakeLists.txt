@@ -285,6 +285,12 @@ add_executable(protocol_tests
     # The token-only handshake surface published before a module's initializer.
     test_handshake_surface.cpp
     test_handshake_surface_transport.cpp
+    # The trust-root grant and the two host services it gates. The grant has to
+    # be recorded in the SAME image as the gate that reads it (a host binary and
+    # a module cdylib each link their own copy of this library), which is the
+    # property a "simplification" would quietly break; these cases fail loudly
+    # if the gates stop being closed by default.
+    test_host_services_grant.cpp
     # The in-band pending-call sentinel's shape check. Detection used to be a
     # bare contains(), so any user map carrying the key hung the call for the
     # full timeout. Includes what the guard does NOT close.

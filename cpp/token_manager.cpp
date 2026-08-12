@@ -79,6 +79,16 @@ QList<QString> TokenManager::getTokenKeys() const
     return m_tokens.keys();
 }
 
+std::vector<std::string> TokenManager::getTokenKeysStd() const
+{
+    QMutexLocker locker(&m_mutex);
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<size_t>(m_tokens.size()));
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+        keys.push_back(it.key().toStdString());
+    return keys;
+}
+
 int TokenManager::tokenCount() const
 {
     QMutexLocker locker(&m_mutex);
