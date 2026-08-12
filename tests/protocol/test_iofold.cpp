@@ -149,6 +149,118 @@ int liveThreads()
 #endif
 }
 
+// ── the provider's own worker threads, and why they are counted ──────────────
+//
+// A "multi" provider answers with a pending sentinel and completes the call
+// LATER, from a worker of its own — that is the whole point of `defer` below,
+// and it is what makes the completion arrive on the consumer's io thread instead
+// of inline in the reply. The worker calls the EventCallback ModuleProxy handed
+// the provider in setEventListener(), and that listener captures `this` RAW
+// (module_proxy.cpp): its first act is
+// QMetaObject::invokeMethod(this, …, Qt::QueuedConnection), which dereferences
+// the QObject.
+//
+// This fixture DELETES that proxy. The worker was spawned detached, so nothing
+// proved it had finished, and `delete m_proxy` followed the last spawn by a
+// couple of milliseconds — the fixture drains the CALLER's side of each round
+// (pumpUntilTotal) but a release()d call is answered by teardown, so the round
+// can be over before the provider has even run, leaving a backlog of `defer`
+// calls that the proxy's thread is still working through while ~LiveHost runs.
+//
+// Reproduced on Linux (aarch64, Qt 6.9.2, gcc 14.3), `nix build .#tests`
+// artifact, `--gtest_filter=IoFoldTest.*`, five concurrent copies — 6 of 50 runs
+// on the tree this provider arrived on, 10 of 50 once the fixtures started
+// destroying their host on the proxy's thread (which lets the backlog RUN instead
+// of discarding it with QThread::quit(), so it widens this window rather than
+// opening it). Every one of them with two to five worker threads standing in the
+// same frame:
+//
+//     Thread "QThread" received signal SIGSEGV
+//     QObject::thread() const
+//     QMetaObject::invokeMethodImpl(QObject*, …)
+//     ModuleProxy::ModuleProxy(...)::<lambda(const QString&, const QVariantList&)>
+//                                                          module_proxy.cpp:37
+//     std::function<void(const QString&, const QList<QVariant>&)>::operator()
+//     OmniProvider::callMethod(...)::<lambda()>              this file, in defer
+//     std::thread::_State_impl<…>::_M_run()
+//
+// The corpse is left by the test that spawned the worker and lands in whichever
+// test runs NEXT, so it only appears in the WHOLE-BINARY run — the CI step that
+// runs ./result/bin/protocol_tests. Under ctest every test is its own process, so
+// the worker dies with the process that owned the proxy and there is nothing left
+// to fault; `nix build .#tests` is green on the same tree, which is exactly how
+// this hid.
+//
+// A COUNT, NOT A JOIN, deliberately. Making the workers joinable would hold their
+// 8MB stacks until something reaped them — 400 outstanding in
+// NormalAndDeferredCompletionsDeliverExactlyOnceAtVolume — and reaping from the
+// dispatch thread would block the very thread `defer` exists to free. So they
+// stay detached and the provider counts them; ~LiveHost waits for the count to
+// reach zero at the one point where it is final.
+//
+// The same shape exists in test_plain_completion_sub_order.cpp
+// (InstantMultiModule) and test_concurrent_dispatch.cpp, which additionally read
+// the callback member through a captured `this`. Neither has been observed to
+// fault and neither is touched here.
+class EmitterGate {
+public:
+    // Raised on the DISPATCH thread, BEFORE the worker is spawned. Raising it
+    // inside the worker instead would leave drain() free to pass through the gap
+    // between the spawn and the worker's first instruction.
+    void enter()
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        ++m_live;
+    }
+
+    // The worker's LAST act. notify_all() runs with m_mu HELD, and that is the
+    // whole of the guarantee: a drain() woken by it has to re-acquire m_mu, which
+    // it cannot do until this thread has released it. So once drain() returns, no
+    // worker touches this gate — or the provider that holds it, or the proxy —
+    // ever again.
+    void leave()
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        if (--m_live == 0) m_cv.notify_all();
+    }
+
+    // Unbounded on purpose: the caller is a fixture already sitting on
+    // QThread::wait() with no timeout one line above, and a bounded wait here
+    // would hand back exactly the "probably finished" that the bare detach had.
+    void drain()
+    {
+        std::unique_lock<std::mutex> lk(m_mu);
+        m_cv.wait(lk, [this] { return m_live == 0; });
+    }
+
+private:
+    std::mutex              m_mu;
+    std::condition_variable m_cv;
+    int                     m_live = 0;
+};
+
+// enter() then spawn, so the count is up before the worker exists; leave() from a
+// scope guard, so an emitter that throws cannot strand the count and wedge
+// drain() forever. `gate` is captured by reference because it is a member of the
+// provider, and the drain is precisely what keeps that alive long enough.
+template <typename Fn>
+void spawnGatedEmitter(EmitterGate& gate, Fn fn)
+{
+    gate.enter();
+    try {
+        std::thread([&gate, fn = std::move(fn)]() mutable {
+            struct Leave {
+                EmitterGate* g;
+                ~Leave() { g->leave(); }
+            } leave{&gate};
+            fn();
+        }).detach();
+    } catch (...) {
+        gate.leave();
+        throw;
+    }
+}
+
 // One provider covering every outcome the fold has to preserve:
 //   ping     — answers immediately (normal completion)
 //   block    — parks until letGo() (in-flight; timeout; cancellation)
@@ -194,12 +306,18 @@ public:
             // The completion is pushed from a worker, which is what a real
             // "multi" provider does and what makes the event arrive on the
             // consumer's io thread rather than inline in the reply.
-            std::thread([cb, callId, delayUs]() {
+            //
+            // GATED rather than plain-detached, because `cb` reaches the
+            // ModuleProxy through a raw `this` and this fixture deletes that
+            // proxy: the gate is what lets ~LiveHost prove no worker is left
+            // before it does. Reproduced SIGSEGV and full reasoning at
+            // EmitterGate above.
+            spawnGatedEmitter(m_emitters, [cb, callId, delayUs]() {
                 if (delayUs > 0)
                     std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
                 if (cb) cb(logos::callCompleteEvent(),
                            QVariantList{ callId, QVariant(7) });
-            }).detach();
+            });
             QVariantMap pending;
             pending[logos::pendingCallKey()] = callId;
             return pending;
@@ -216,6 +334,20 @@ public:
         m_cv.notify_all();
     }
 
+    // Wait out every worker `defer` has spawned. ~LiveHost calls this once the
+    // proxy's event loop has stopped — the point after which no further
+    // callMethod can be dispatched, so the set of workers is final — and before
+    // the proxy those workers emit into is deleted.
+    void drainEmitters() { m_emitters.drain(); }
+
+    // The same wait, as this provider's OWN invariant: a worker's last act is
+    // EmitterGate::leave() on a member of this object, so none may outlive it.
+    // The destructor BODY runs before any member is destroyed, so m_emitters is
+    // still alive here. This does NOT cover the proxy — by the time a provider is
+    // destroyed its owner has usually deleted that already — which is why
+    // ~LiveHost has to drain too, and earlier.
+    ~OmniProvider() override { m_emitters.drain(); }
+
     QJsonArray getMethods() override { return QJsonArray{}; }
     bool informModuleToken(const QString&, const QString&) override { return true; }
     void setEventListener(EventCallback cb) override { m_eventCb = std::move(cb); }
@@ -229,6 +361,7 @@ private:
     bool                       m_released = false;
     EventCallback              m_eventCb;
     std::atomic<std::uint64_t> m_counter{0};
+    EmitterGate                m_emitters;
 };
 
 QCoreApplication* ensureApp()
@@ -270,6 +403,11 @@ public:
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
         m_thread->quit();
         m_thread->wait();
+        // The proxy's event loop has stopped, so no queued call can reach the
+        // provider any more and the set of `defer` workers is now FINAL. Wait
+        // them out before deleting the proxy they emit into — one of them
+        // outliving this line is the SIGSEGV recorded at EmitterGate above.
+        m_provider.drainEmitters();
         delete m_proxy;
         delete m_thread;
     }
