@@ -494,7 +494,14 @@ LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
                                    QObject *parent)
     : QObject(parent)
     , m_registryUrl(LogosInstance::id(module_to_talk_to))
-    , m_token_manager(token_manager)
+    // Same NULL-means-the-origin's-store rule as LogosAPIClient, so a consumer
+    // built directly (rather than through a client) carries the identity's store
+    // too. m_token_manager is currently never READ at this layer — the store is
+    // consulted only by LogosAPIClient — but it is a public constructor
+    // parameter, so leaving it as the one place a null slips through would be a
+    // trap for whoever does start reading it.
+    , m_token_manager(token_manager ? token_manager
+                                    : &TokenManager::forIdentity(origin_module))
 {
     // Single transport-resolution path: the factory combines LogosMode
     // + LogosTransportConfig (mode wins for Mock/Local; transport

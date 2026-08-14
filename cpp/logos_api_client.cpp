@@ -18,6 +18,26 @@
 using logos::qvariantToNlohmann;
 using logos::nlohmannArgsToQVariantList;
 
+namespace {
+
+// The store this client presents tokens from.
+//
+// An explicit store always wins — that is how every host constructs a client
+// today, and how a host opts an identity in (by passing
+// &TokenManager::forIdentity(origin) rather than &TokenManager::instance()).
+//
+// A NULL store resolves to the origin's store instead of being a guaranteed
+// crash on the first getToken(). This is the one construction path that cannot
+// be given an explicit store by its caller — see lp_client_create's frozen
+// signature — so "no store named" has to mean something, and the only defensible
+// meaning is "the store for the identity I said I am".
+TokenManager* storeFor(TokenManager* explicit_store, const QString& origin_module)
+{
+    return explicit_store ? explicit_store : &TokenManager::forIdentity(origin_module);
+}
+
+} // namespace
+
 LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
                                const QString& origin_module,
                                TokenManager* token_manager,
@@ -26,8 +46,9 @@ LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
                                QObject *parent)
     : QObject(parent)
     , m_consumer(new LogosAPIConsumer(module_to_talk_to, origin_module,
-                                      token_manager, target_transport, this))
-    , m_token_manager(token_manager)
+                                      storeFor(token_manager, origin_module),
+                                      target_transport, this))
+    , m_token_manager(storeFor(token_manager, origin_module))
     , m_origin_module(origin_module)
     // Pre-build the capability_module consumer once. We skip it for
     // the capability_module client itself — the auto-`requestModule`
@@ -39,7 +60,8 @@ LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
     , m_capability_consumer(module_to_talk_to == QStringLiteral("capability_module")
         ? nullptr
         : new LogosAPIConsumer(QStringLiteral("capability_module"),
-                                origin_module, token_manager,
+                                origin_module,
+                                storeFor(token_manager, origin_module),
                                 capability_transport, this))
 {
 }

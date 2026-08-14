@@ -268,9 +268,14 @@ lp_client* lp_client_create(const char* target_module,
     // main thread's back.
     const bool qtAffine = LogosTransportFactory::needsQtEventLoop(targetCfg)
                        || LogosTransportFactory::needsQtEventLoop(capabilityCfg);
+    // forIdentity(origin), not instance(). This is the whole answer to the
+    // frozen lp_client_create signature: the store cannot be HANDED to this
+    // function, so the origin the caller already declares has to select it.
+    // Identical to instance() — the same object — unless the host isolated this
+    // origin, so no existing binding changes behaviour.
     auto construct = [&]() -> LogosAPIClient* {
         return new LogosAPIClient(handle->target, handle->origin,
-                                  &TokenManager::instance(),
+                                  &TokenManager::forIdentity(handle->origin),
                                   targetCfg, capabilityCfg);
     };
     if (qtAffine && !QCoreApplication::instance()) {
@@ -595,6 +600,52 @@ char* lp_token_keys(void)
     for (const std::string& key : TokenManager::instance().getTokenKeysStd())
         out.push_back(key);
     return lpStrdup(out.dump());
+}
+
+/* ------------------------------------------- per-identity token stores */
+
+int lp_token_isolate_identity(const char* identity)
+{
+    if (!identity || !*identity) return LP_ERR_INVALID_ARG;
+    return TokenManager::isolateIdentity(QString::fromUtf8(identity))
+        ? LP_OK
+        : LP_ERR_UNSUPPORTED;   // a shared store was already vended for this name
+}
+
+int lp_token_identity_is_isolated(const char* identity)
+{
+    if (!identity) return LP_ERR_INVALID_ARG;
+    return TokenManager::isIsolated(QString::fromUtf8(identity)) ? 1 : 0;
+}
+
+char* lp_token_get_for(const char* identity, const char* module_name)
+{
+    if (!identity || !module_name) return nullptr;
+    const QString token = TokenManager::forIdentity(QString::fromUtf8(identity))
+                              .getToken(QString::fromUtf8(module_name));
+    if (token.isEmpty()) return nullptr;
+    return lpStrdup(token.toStdString());
+}
+
+int lp_token_save_for(const char* identity, const char* module_name,
+                      const char* token)
+{
+    if (!identity || !module_name || !token) return LP_ERR_INVALID_ARG;
+    TokenManager::forIdentity(QString::fromUtf8(identity))
+        .saveToken(QString::fromUtf8(module_name), QString::fromUtf8(token));
+    return LP_OK;
+}
+
+int lp_token_reset_identity(const char* identity)
+{
+    if (!identity || !*identity) return LP_ERR_INVALID_ARG;
+    // LP_ERR_UNSUPPORTED rather than LP_OK for a non-isolated identity: the
+    // caller asked for a clear that deliberately did not happen (clearing the
+    // ambient ring would take every other identity's tokens with it), and a
+    // silent success would read as "the store is empty now".
+    return TokenManager::resetIdentity(QString::fromUtf8(identity))
+        ? LP_OK
+        : LP_ERR_UNSUPPORTED;
 }
 
 int lp_inform_module_token(lp_client* client,

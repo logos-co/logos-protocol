@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QHash>
 #include <QMutex>
 #include <QByteArray>
@@ -58,6 +59,124 @@ public:
      * @return TokenManager& Reference to the singleton instance
      */
     static TokenManager& instance();
+
+    /* ── per-identity token stores ──────────────────────────────────────────
+     *
+     * WHAT THIS EXISTS TO CLOSE. instance() is the IMAGE's store, and in a host
+     * that loads plugins in-process it is also an ambient ring: the host writes
+     * `name -> that module's root auth token` for EVERY loaded module. On the
+     * hot path a client asserts no identity at all — LogosAPIClient::
+     * invokeRemoteMethod reads the store first and only mints on a miss — so
+     * whichever plugin asks for target X finds X's own root token sitting there
+     * and presents it. The provider accepts any token in its image's store, so
+     * the call authorizes and no `requestModule` is ever logged. Every plugin in
+     * that image therefore holds every other module's authority, and giving a
+     * plugin its own ORIGIN STRING does not change that by one byte, because
+     * origin is never consulted on the path taken.
+     *
+     * The fix is to make origin SELECT THE STORE rather than merely label the
+     * caller. forIdentity(x) is "the store to present tokens from when I am x".
+     *
+     * ADDITIVE BY CONSTRUCTION, and that is not a promise but the shape of the
+     * code: forIdentity() returns instance() — the same object, pointer-identical
+     * — for every identity until someone calls isolateIdentity() on that exact
+     * name. A host that knows nothing about any of this sees no change at all.
+     * These are static member FUNCTIONS: no data member, no virtual, nothing moc
+     * sees, so the layout every statically-linked plugin was compiled against is
+     * untouched.
+     *
+     * PER-IMAGE IS NOT PER-CLIENT, and both are needed. A module cdylib links
+     * its own copy of this library and therefore has its own instance(); that
+     * per-image store is correct and stays. This adds a second axis INSIDE one
+     * image, for the case the per-image split cannot reach: several identities
+     * hosted by one process.
+     */
+
+    /**
+     * @brief The token store for calling-identity `identity`.
+     *
+     * Returns instance() unless `identity` has been isolated, in which case it
+     * returns that identity's private store. The address is stable for the
+     * lifetime of the image, so a client may hold it by raw pointer (which
+     * LogosAPIClient does, and dereferences from async continuations that can
+     * outlive their caller).
+     *
+     * Calling this for a name that is NOT isolated records that a shared store
+     * was handed out under it — see isolateIdentity().
+     */
+    static TokenManager& forIdentity(const QString& identity);
+
+    /**
+     * @brief Declare `identity` to have a PRIVATE, initially bootstrap-only store.
+     *
+     * Idempotent: isolating an already-isolated identity returns true and
+     * changes nothing.
+     *
+     * Returns FALSE — and changes nothing — if forIdentity() already handed the
+     * SHARED store out under this name. Callers must treat that as fatal for the
+     * identity rather than continuing. The refusal is not defensive padding:
+     * LogosAPIClient captures its store as a raw pointer at construction and
+     * dereferences it on the hot path, so isolating after a client for the name
+     * exists leaves one client on the ambient ring and another on the private
+     * store — the precise "looks fixed, isn't" outcome this whole change exists
+     * to avoid. Isolate before constructing anything for the identity.
+     *
+     * Returns false for an empty identity: "" is the not-an-identity value that
+     * every un-named caller passes, and isolating it would isolate all of them
+     * into one shared pseudo-store, which is worse than leaving them ambient.
+     */
+    static bool isolateIdentity(const QString& identity);
+
+    /** @brief Whether `identity` has a private store. */
+    static bool isIsolated(const QString& identity);
+
+    /** @brief Every isolated identity. Diagnostics only. */
+    static QStringList isolatedIdentities();
+
+    /**
+     * @brief The keys a private store is seeded with: the trust-root bootstrap.
+     *
+     * A private store starts empty of everything a caller could escalate with,
+     * but NOT empty: a module's first call to an unknown target runs
+     * `capability_module.requestModule`, and that call is itself authenticated
+     * with the token stored under "capability_module" (and "core" for the
+     * host-side channel). Withhold those and the very first exchange fails, so
+     * an isolated identity could never obtain any token at all.
+     *
+     * These two keys, and only these two, are copied from instance() into a
+     * private store when it is created. Every other module's root token — the
+     * thing that made the ambient ring an escalation — is not.
+     */
+    static QStringList bootstrapKeys();
+
+    /**
+     * @brief Copy the bootstrap tokens from instance() into `identity`'s private
+     *        store, for keys it does not already hold.
+     *
+     * Runs automatically when a private store is created, which is the ordering
+     * a host already satisfies (bootstrap tokens are seeded before any module
+     * loads). Exposed for the host that learns a bootstrap token later.
+     *
+     * @return the number of keys copied; 0 for a non-isolated identity.
+     */
+    static int seedBootstrapTokens(const QString& identity);
+
+    /**
+     * @brief Clear an isolated identity's private store and re-seed the
+     *        bootstrap, e.g. when the plugin behind it is unloaded.
+     *
+     * The store OBJECT is immortal — a client mid-flight must never dereference
+     * freed memory — so what has a lifetime is its CONTENTS. After a reload the
+     * identity would otherwise present per-target tokens minted for its previous
+     * incarnation; the provider rejects them and the existing rejection-driven
+     * re-exchange heals it in one retry, so skipping this costs latency and log
+     * noise rather than correctness. Do it anyway.
+     *
+     * Deliberately a no-op returning false for a NON-isolated identity: that
+     * store is the shared ring, and clearing it would take every other
+     * identity's tokens — including the host's — with it.
+     */
+    static bool resetIdentity(const QString& identity);
 
     /**
      * @brief Save a token with the given key
@@ -181,11 +300,27 @@ private:
     /**
      * @brief Private constructor for singleton pattern
      * @param parent Parent QObject
+     *
+     * Still private with per-identity stores in the picture, and that is what
+     * forces forIdentity()/isolateIdentity() to be static MEMBERS rather than
+     * free functions or a helper struct: only a member can construct one. A
+     * public constructor would also defeat the purpose — nothing would make two
+     * callers naming the same identity find the SAME store, and lp_client_create's
+     * frozen signature has no way to be handed one.
      */
     explicit TokenManager(QObject *parent = nullptr);
 
     /**
      * @brief Private destructor
+     *
+     * Private, so a per-identity store cannot be deleted from outside — which is
+     * exactly the intended lifetime. Private stores are heap-allocated and never
+     * destroyed: LogosAPIClient holds its store by raw pointer and touches it
+     * from async continuations that can fire after their caller returned, and
+     * lp_client_destroy already defers client teardown to the owner thread and
+     * documents that the client simply leaks if that loop never runs again. A
+     * refcounted store would put destruction order on that path for a security
+     * object. One QHash per isolated identity is not a cost worth that.
      */
     ~TokenManager();
 

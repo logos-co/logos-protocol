@@ -324,6 +324,19 @@ add_executable(protocol_tests
     # (a legit empty return must NOT re-exchange), bounded retry (no loop), and
     # the async path.
     test_token_reexchange.cpp
+    # Per-identity token stores. The escalation being closed is that a host
+    # loading plugins in-process gives all of them ONE store holding every
+    # module's root token, and a client presents a cached token before it ever
+    # mints one — so a plugin reaches an undeclared backend with no handshake at
+    # all, and per-plugin origin STRINGS change nothing because origin was never
+    # consulted. Half the file pins that forIdentity() returns the SAME OBJECT
+    # instance() does until a name is explicitly isolated (the whole
+    # back-compatibility argument); the other half pins that isolated identities
+    # cannot see each other's or the ring's tokens. Every escalation case carries
+    # an ambient CONTROL asserting the token IS reachable without isolation —
+    # without that control the isolated assertions would pass on a store that
+    # never held the token in the first place.
+    test_token_store_identity.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

@@ -59,6 +59,13 @@
  * =========================================================================== */
 
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
+// 0.4: per-identity token stores — lp_token_isolate_identity() and the four
+// functions around it (lp_token_identity_is_isolated, lp_token_get_for,
+// lp_token_save_for, lp_token_reset_identity), plus lp_client_create resolving
+// its store through the origin instead of the image singleton. Additive: with
+// nothing isolated, forIdentity() returns the same object instance() does, so
+// every pre-0.4 host and binding runs on exactly the store it ran on before —
+// the new symbols are the only way to get any other behaviour.
 // 0.3: the trust-root surface — lp_grant_host_services() plus the two functions
 // it gates (lp_token_keys, lp_inform_module_token_to), and the module-impl
 // export that carries the grant across the cdylib boundary
@@ -72,9 +79,9 @@
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 3
+#define LOGOS_PROTOCOL_VERSION_MINOR 4
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.3.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.4.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -318,11 +325,64 @@ LP_API char* lp_get_methods(lp_client* client);
  * ------------------------------------------------------------------------- */
 
 /** Get the stored token for `module_name`. Returns NULL when absent;
- *  caller frees via lp_string_free. */
+ *  caller frees via lp_string_free.
+ *
+ *  Reads this IMAGE's store — the one lp_client_create uses for every origin
+ *  that has not been isolated. For an isolated origin, see lp_token_get_for. */
 LP_API char* lp_token_get(const char* module_name);
 
-/** Store a token for `module_name`. */
+/** Store a token for `module_name` in this image's store. */
 LP_API int lp_token_save(const char* module_name, const char* token);
+
+/* --- per-identity token stores ---------------------------------------------
+ *
+ * A host that loads several modules IN ONE IMAGE gives all of them the same
+ * token store, and that store holds every loaded module's own auth token. Since
+ * a client presents a cached token before it ever mints one, each module in such
+ * a host can reach every other one with authority it was never granted, and no
+ * `requestModule` is logged. These four functions let a host give a named
+ * identity a store of its own, so origin SELECTS the tokens a caller can present
+ * instead of merely labelling it.
+ *
+ * Additive and inert by default: with nothing isolated, every function above
+ * and every lp_client_create behaves exactly as before, on the same store.
+ * ------------------------------------------------------------------------- */
+
+/** Give `identity` a private token store, seeded with the trust-root bootstrap
+ *  ("core" and "capability_module", copied from this image's store) so its first
+ *  call can still run the `requestModule` handshake.
+ *
+ *  Idempotent. Returns LP_ERR_UNSUPPORTED — changing nothing — if a client for
+ *  this identity was already created against the shared store; isolating then
+ *  would leave some callers on the shared store and some on the private one.
+ *  Call this BEFORE creating any client for the identity, and treat the refusal
+ *  as fatal for that identity rather than continuing. */
+LP_API int lp_token_isolate_identity(const char* identity);
+
+/** 1 if `identity` has a private store, 0 if it shares this image's store,
+ *  LP_ERR_INVALID_ARG for NULL. */
+LP_API int lp_token_identity_is_isolated(const char* identity);
+
+/** Get the token `identity` would present to `module_name`. NULL when absent;
+ *  caller frees via lp_string_free. Reads this image's shared store for an
+ *  identity that has not been isolated — and, like every use of an identity's
+ *  store, that counts as vending the shared store: isolate FIRST, then read. */
+LP_API char* lp_token_get_for(const char* identity, const char* module_name);
+
+/** Store a token in `identity`'s store — how a host seeds an isolated identity
+ *  with the tokens it is actually entitled to. Writes this image's shared store
+ *  for an identity that has not been isolated, which is almost certainly not
+ *  what the caller meant: the token becomes visible to every other non-isolated
+ *  caller, and lp_token_isolate_identity then refuses the name rather than
+ *  stranding this write outside the private store. Isolate first. */
+LP_API int lp_token_save_for(const char* identity, const char* module_name,
+                             const char* token);
+
+/** Clear an isolated identity's store and re-seed the bootstrap — the unload
+ *  hook, so a reloaded module does not present tokens minted for its previous
+ *  incarnation. Returns LP_ERR_UNSUPPORTED for a non-isolated identity, whose
+ *  store is shared and must not be cleared out from under everyone else. */
+LP_API int lp_token_reset_identity(const char* identity);
 
 /** The module names this image's token store holds, as a JSON array. Caller
  *  frees via lp_string_free.
