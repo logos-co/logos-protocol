@@ -84,6 +84,35 @@ inline std::string joinPath(const std::string& path, const std::string& step)
 
 } // namespace detail
 
+// ── untyped containers: shape is declared even when the element type is not ──
+//
+// `[any]` and `{tstr:any}` both spell `nlohmann::json` in C++ (LogosList /
+// LogosMap are aliases of it), so there is no distinct type for fromJson<T> to
+// dispatch on and no codec specialization can carry the rule. The SHAPE is
+// still declared, though — array-ness and object-ness — and it is the whole of
+// the declared type at this layer.
+//
+// The value is handed on UNCHANGED rather than rebuilt from JSON: rebuilding
+// would retype nested elements for no validation gain, which is the same
+// reasoning logos_qt_arg_decode.h gives for the Qt surface.
+//
+// Returning by reference is safe in the one shape that calls this — a generated
+// dispatch passing the result straight into the impl call, so the referent
+// outlives the full expression.
+inline const nlohmann::json& jsonRequireArray(const nlohmann::json& j,
+                                              const std::string& path)
+{
+    if (!j.is_array()) detail::typeError(path, "array", j);
+    return j;
+}
+
+inline const nlohmann::json& jsonRequireObject(const nlohmann::json& j,
+                                               const std::string& path)
+{
+    if (!j.is_object()) detail::typeError(path, "object", j);
+    return j;
+}
+
 // ── base64url, unpadded ────────────────────────────────────────────────────
 
 inline std::string b64UrlEncode(const std::vector<uint8_t>& bytes)
