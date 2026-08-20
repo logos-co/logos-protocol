@@ -121,7 +121,28 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // (mnemonics, passwords, tokens, key material). Log only the method name and
     // the argument count, matching the other transport call sites.
     qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
-    return m_provider->callMethod(methodName, args);
+    const QVariant result = m_provider->callMethod(methodName, args);
+
+    // Module identity, for a provider whose own dispatch does not answer it.
+    //
+    // A module built through the LIDL frontend has name()/version() generated
+    // into its dispatch, so it never reaches here. A legacy module derives no
+    // contract and has neither — yet every provider already knows both, via the
+    // providerName()/providerVersion() vtable slots the interface has always
+    // had. Answering from those makes identity uniform across every module in
+    // the fleet without touching a single one of them.
+    //
+    // Placed AFTER dispatch, deliberately: an invalid QVariant is this slot's
+    // "unknown method" answer, so a provider that DOES implement name() keeps
+    // its own result and nothing existing changes behaviour. Gated on an empty
+    // argument list so a same-named method taking arguments is untouched.
+    if (!result.isValid() && args.isEmpty()) {
+        if (methodName == QLatin1String("name"))
+            return QVariant(m_provider->providerName());
+        if (methodName == QLatin1String("version"))
+            return QVariant(m_provider->providerVersion());
+    }
+    return result;
 }
 
 namespace {
@@ -237,7 +258,44 @@ QJsonArray ModuleProxy::getPluginInterface()
     if (!m_provider) return QJsonArray();
 
     qDebug() << "[LogosProviderObject] ModuleProxy: calling LogosProviderObject::getMethods()";
-    return m_provider->getMethods();
+    QJsonArray iface = m_provider->getMethods();
+
+    // Advertise module identity for a provider that does not list it itself.
+    //
+    // The dispatch fallback in callRemoteMethod answers name()/version() for
+    // every module; without this, a legacy module would ANSWER them while `lm`
+    // and every untyped caller reported it had no such method — present to
+    // whoever already knew to ask, invisible to everyone else. The two have to
+    // agree, so they are derived from the same providerName()/providerVersion().
+    //
+    // Additive only: an entry the provider already lists wins, so a module with
+    // a generated (or hand-written) name() keeps its own description, signature
+    // and parameters.
+    auto lists = [&iface](QLatin1String name) {
+        for (const QJsonValue& v : iface)
+            if (v.isObject() && v.toObject().value("name").toString() == name)
+                return true;
+        return false;
+    };
+    // Signatures only -- this listing describes the interface, it does not
+    // carry values. The VALUES come from the same two provider accessors in
+    // callRemoteMethod, which is what keeps the listing and the answer in step.
+    const struct { QLatin1String name; const char* desc; } identity[] = {
+        { QLatin1String("name"),    "The module's name, as declared in its metadata." },
+        { QLatin1String("version"), "The module's version, as declared in its metadata." },
+    };
+    for (const auto& id : identity) {
+        if (lists(id.name)) continue;
+        QJsonObject entry;
+        entry["name"] = QString(id.name);
+        entry["type"] = QStringLiteral("method");
+        entry["signature"] = QString(id.name) + QStringLiteral("()");
+        entry["returnType"] = QStringLiteral("QString");
+        entry["isInvokable"] = true;
+        entry["description"] = QString::fromLatin1(id.desc);
+        iface.append(entry);
+    }
+    return iface;
 }
 
 QJsonArray ModuleProxy::getPluginMethods()

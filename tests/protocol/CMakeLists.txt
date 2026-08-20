@@ -337,6 +337,13 @@ add_executable(protocol_tests
     # without that control the isolated assertions would pass on a store that
     # never held the token in the first place.
     test_token_store_identity.cpp
+    # Module identity: name()/version() answered by the proxy from
+    # providerName()/providerVersion() for a provider whose own dispatch does
+    # not, so a legacy module gains them with no edit. Pins the two properties
+    # the design rests on -- the fallback runs only after dispatch returned
+    # "unknown method" (no silent shadowing), and the listing agrees with what
+    # is callable -- plus the auth gate, which introspection deliberately lacks.
+    test_module_identity.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).
