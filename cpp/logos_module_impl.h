@@ -104,6 +104,30 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
 LOGOS_MODULE_IMPL_EXPORT int logos_module_grant_host_services(
     const char* services_json);
 
+/* Teardown completion callback, installed by the glue before it asks the module
+ * to unload. May be invoked from any module thread. */
+typedef void (*logos_module_unload_done_cb)(void* user_data);
+
+/* Install the teardown-completion callback. Called before
+ * logos_module_about_to_unload(); a NULL cb clears it. */
+LOGOS_MODULE_IMPL_EXPORT void logos_module_set_unload_done_callback(
+    logos_module_unload_done_cb cb, void* user_data);
+
+/* Ask the module to prepare for teardown. Returns 0 when it is already
+ * quiescent, 1 when it has work to finish and will invoke the callback
+ * installed above exactly once when done.
+ *
+ * The wait is BOUNDED by the host: returning 1 buys a grace period, not a veto.
+ * A module that never signals delays every teardown by that period and is torn
+ * down anyway, so the deadline is real rather than a courtesy.
+ *
+ * OPTIONAL, and that is load-bearing for compatibility. A module built before
+ * this existed exports neither symbol; the glue is generated alongside the
+ * module, so it simply does not emit the calls. An older module keeps the
+ * behaviour it always had — teardown straight through its destructors — with
+ * no version negotiation and no new failure mode. */
+LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
+
 /* The logos-protocol semver this module was compiled against. Static
  * string — do NOT free. */
 LOGOS_MODULE_IMPL_EXPORT const char* logos_module_get_protocol_version(void);
