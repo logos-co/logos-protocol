@@ -59,6 +59,15 @@
  * =========================================================================== */
 
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
+// 0.5: the module teardown pair — logos_module_about_to_unload() and
+// logos_module_set_unload_done_callback() (logos_module_impl.h), which let a
+// module finish work before it is torn down. Additive: both are OPTIONAL
+// exports, and the glue that calls them is generated alongside the module, so a
+// cdylib built before 0.5 exports neither and its glue emits no calls — an
+// older module keeps exactly the teardown it always had. The MINOR is what
+// makes that detectable: a generator emitting the calls guards them on
+// LOGOS_PROTOCOL_VERSION_MINOR >= 5, the same way 0.3's grant surface is
+// guarded, so new codegen still compiles against an older protocol header.
 // 0.4: per-identity token stores — lp_token_isolate_identity() and the four
 // functions around it (lp_token_identity_is_isolated, lp_token_get_for,
 // lp_token_save_for, lp_token_reset_identity), plus lp_client_create resolving
@@ -79,9 +88,9 @@
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 4
+#define LOGOS_PROTOCOL_VERSION_MINOR 5
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.4.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.5.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.
