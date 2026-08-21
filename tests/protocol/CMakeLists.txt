@@ -344,6 +344,18 @@ add_executable(protocol_tests
     # "unknown method" (no silent shadowing), and the listing agrees with what
     # is callable -- plus the auth gate, which introspection deliberately lacks.
     test_module_identity.cpp
+    # The INBOUND token store. ModuleProxy::m_tokens is the only caller-keyed,
+    # inbound-only record here, and it had ZERO production writers: every real
+    # authorization decision came out of TokenManager, which is direction-mixed
+    # (outbound tokens keyed by callee sit in the same flat map as inbound ones
+    # keyed by caller). Two detectors, one per mechanism —
+    # AnInformedTokenLandsInTheProxysOwnStore fails when informModuleToken does
+    # not record, AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy fails when
+    # isAuthorized scans TokenManager::instance() instead of the proxy's own
+    # store — plus the composed production shape and four pins. All three
+    # detectors were run RED against the unfixed tree; the runs are recorded in
+    # the file.
+    test_inbound_token_store.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

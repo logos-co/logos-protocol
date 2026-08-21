@@ -8,9 +8,11 @@
 #include <QJsonValue>
 #include <algorithm>
 
-ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent)
+ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent,
+                         TokenManager* token_store)
     : QObject(parent)
     , m_provider(provider)
+    , m_store(token_store ? token_store : &TokenManager::instance())
 {
     if (m_provider) {
         m_provider->setEventListener([this](const QString& eventName, const QVariantList& data) {
@@ -174,8 +176,18 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
         return false;
     }
 
-    const QString coreToken = TokenManager::instance().getToken(QStringLiteral("core"));
-    const QString capToken  = TokenManager::instance().getToken(QStringLiteral("capability_module"));
+    // The anchor comes from THIS PROXY'S store, not the ambient ring — the same
+    // store isAuthorized scans, so the proxy has exactly one notion of who it
+    // trusts. Identical objects until a host isolates the provider's identity.
+    //
+    // A HOST THAT PASSES AN ISOLATED STORE MUST SEED THE ANCHOR INTO IT.
+    // logos-plugin-qt's LogosAPIProvider::seedHandshakeTrustAnchor writes "core"
+    // and "capability_module" into TokenManager::instance() by name; against an
+    // isolated store that seeding would be invisible here and every token push
+    // would be refused during the handshake window. Moving that write to the
+    // same store is part of wiring this parameter up, not a separate cleanup.
+    const QString coreToken = m_store->getToken(QStringLiteral("core"));
+    const QString capToken  = m_store->getToken(QStringLiteral("capability_module"));
     const bool callerIsTrusted =
         (!coreToken.isEmpty() && constantTimeEquals(authToken, coreToken)) ||
         (!capToken.isEmpty()  && constantTimeEquals(authToken, capToken));
@@ -194,7 +206,39 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
         return false;
     }
 
-    return m_provider->informModuleToken(moduleName, token);
+    // Forward FIRST, record only what the provider accepted.
+    //
+    // Recording before the forward was the other candidate, on the theory that a
+    // module might call back into us from inside the push and be rejected with a
+    // token we had already decided to accept. That window does not exist: the
+    // push reaches module code only as far as a store write
+    // (lp_module_accept_token -> TokenManager::saveToken, logos_protocol.cpp),
+    // which calls nothing back. Absent a real window, mirroring the provider's
+    // verdict is the smaller claim, so it is the one to make.
+    if (!m_provider->informModuleToken(moduleName, token)) {
+        return false;
+    }
+
+    // WHY THE PROXY KEEPS ITS OWN COPY of something the provider just stored.
+    // isAuthorized also scans m_store, and in the default out-of-process
+    // topology LogosProviderBase's write lands there — so on the happy path this
+    // is redundant. It is not redundant where it counts. m_store is
+    // direction-MIXED (LogosAPIClient writes the token it will PRESENT to a
+    // callee under the CALLEE's name, logos_api_client.cpp:176), so it can never
+    // say WHOSE a token is; m_tokens is keyed by the caller by construction and
+    // can, which is what a caller-identity oracle has to be built on. And
+    // m_store's contents have a lifetime this proxy does not control —
+    // TokenManager::resetIdentity() empties an isolated store on plugin reload —
+    // while a token this proxy was told about is good until the proxy dies with
+    // the module it fronts.
+    //
+    // NOT a claim that a refused push leaves the token unusable. The generated
+    // Qt glue saves to the host stack BEFORE it forwards across the C ABI and
+    // returns hostOk && implOk, so a cdylib-side failure returns false with the
+    // host store already holding the token. All this ordering guarantees is that
+    // the proxy adds no grant of its own to a push the provider rejected.
+    saveToken(moduleName, token);
+    return true;
 }
 
 bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transportProtocol) const
@@ -207,19 +251,30 @@ bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transpor
 
     // A token is valid only if THIS module actually issued it to some caller.
     // Two stores hold issued tokens:
-    //   * m_tokens          — legacy per-proxy store (LogosAPIProvider::saveToken)
-    //   * TokenManager      — the capability-flow store that informModuleToken
-    //                         writes when capability_module mints a token for a
-    //                         (caller, target) pair.
+    //   * m_tokens          — the proxy's own INBOUND record, keyed by caller
+    //                         (saveToken / informModuleToken). Direction-pure.
+    //   * m_store           — this provider identity's TokenManager: the host
+    //                         anchors, the bootstrap seed, and whatever else the
+    //                         host put there. Direction-MIXED, so it authorizes
+    //                         but must never be reverse-looked-up to NAME anyone.
     // We scan every issued token with a constant-time compare and never early
     // out, so neither a match position nor the number of issued tokens leaks
     // through timing.
+    //
+    // m_store, NOT TokenManager::instance(): the store that authorizes has to be
+    // the store the inbound writes go to. LogosProviderBase::informModuleToken
+    // writes to LogosAPI::getTokenManager() == TokenManager::forIdentity(<own
+    // name>), and hardcoding instance() here broke both ways the moment a host
+    // isolated a provider identity — privately seeded tokens invisible (inbound
+    // calls rejected with no diagnostic) AND every ambient token still accepted
+    // (the escalation isolation exists to close). Identical objects for a name
+    // nobody isolated, which is why neither half had ever been observed.
     bool authorized = false;
     for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it) {
         authorized |= constantTimeEquals(authToken, it.value());
     }
-    for (const QString& key : TokenManager::instance().getTokenKeys()) {
-        authorized |= constantTimeEquals(authToken, TokenManager::instance().getToken(key));
+    for (const QString& key : m_store->getTokenKeys()) {
+        authorized |= constantTimeEquals(authToken, m_store->getToken(key));
     }
     if (authorized) {
         return true;
