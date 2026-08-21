@@ -12,6 +12,8 @@
 #include <functional>
 #include <utility>
 
+#include "token_manager.h"
+
 class LogosProviderObject;
 
 namespace logos {
@@ -59,7 +61,22 @@ public:
     using TokenValidator = std::function<bool(const QString& token,
                                               const QString& transportProtocol)>;
 
-    explicit ModuleProxy(LogosProviderObject* provider, QObject* parent = nullptr);
+    // `token_store` is the store this proxy AUTHORIZES AGAINST — the host
+    // anchors plus whatever else the host seeded for this provider's identity.
+    // It must be the same store the provider's own informModuleToken writes to,
+    // which for the Qt stack is LogosAPI::getTokenManager() ==
+    // TokenManager::forIdentity(<this module's name>), NOT the ambient
+    // instance(). Those are the same object until a host isolates the identity;
+    // after that they diverge and hardcoding instance() means two different
+    // failures at once — every token the host seeded privately is invisible
+    // (inbound calls rejected with no diagnostic), and every token in the
+    // ambient ring is still accepted (the escalation isolation exists to close).
+    //
+    // Defaulted to &TokenManager::instance() so every existing two-argument
+    // construction keeps scanning exactly what it scanned before. A null
+    // pointer means the same thing.
+    explicit ModuleProxy(LogosProviderObject* provider, QObject* parent = nullptr,
+                         TokenManager* token_store = nullptr);
     ~ModuleProxy();
 
     void setTokenValidator(TokenValidator validator);
@@ -89,15 +106,35 @@ signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
 
 private:
-    // Returns true when authToken matches a token THIS module has issued (via
-    // saveToken / informModuleToken) OR the host-installed validator accepts it
-    // for `transportProtocol`. Empty/unknown tokens are rejected. The built-in
-    // comparison is constant-time and never early-outs, so neither a correct
-    // prefix nor the number of issued tokens leaks through timing.
+    // Returns true when authToken matches a token THIS module has been told about
+    // (via saveToken / informModuleToken), or one held in this proxy's token
+    // store, OR the host-installed validator accepts it for `transportProtocol`.
+    // Empty/unknown tokens are rejected. The built-in comparison is constant-time
+    // and never early-outs, so neither a correct prefix nor the number of issued
+    // tokens leaks through timing.
     bool isAuthorized(const QString& authToken, const QString& transportProtocol) const;
 
     LogosProviderObject* m_provider;
+    // THE INBOUND STORE: caller name -> the token that caller may present to us.
+    // Direction-pure by construction — the only writers are saveToken() and
+    // informModuleToken(), both of which key by the CALLER — which is what makes
+    // it the only store here that can honestly NAME a caller.
+    //
+    // Do not reverse-look-up m_store for that. TokenManager is direction-MIXED:
+    // LogosAPIClient writes the token we will PRESENT to a callee under the
+    // CALLEE's name (logos_api_client.cpp:176), while inbound tokens are written
+    // under the CALLER's name. A hit there may name a module we CALL as the
+    // module CALLING us, which is affirmatively wrong and worse than unknown.
     QHash<QString, QString> m_tokens;
+    // Never null after construction; see the constructor comment.
+    //
+    // A new data member here is safe in a way one in LogosAPI is not (see the
+    // warning at logos_api.h:329). Nothing hands a ModuleProxy across an image
+    // boundary: it is constructed by the Qt host (LogosAPIProvider) and reached
+    // only through QMetaObject dispatch or, from a module cdylib, not at all —
+    // the type that crosses is the LogosProviderObject vtable, which is
+    // untouched.
+    TokenManager* m_store;
     TokenValidator m_validator;
 };
 

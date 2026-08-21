@@ -329,7 +329,29 @@ private:
     TokenManager& operator=(const TokenManager&) = delete;
 
     /**
-     * @brief Hash map storing tokens by key
+     * @brief Hash map storing tokens by key.
+     *
+     * DIRECTION-MIXED, AND THEREFORE NEVER A CALLER ORACLE. One flat map with no
+     * direction tag, written from both sides of every relationship:
+     *
+     *   * OUTBOUND — LogosAPIClient stores the token it will PRESENT to a callee
+     *     under the CALLEE's name (logos_api_client.cpp:176, async twin :332).
+     *   * INBOUND — a token RECEIVED from a caller is stored under the CALLER's
+     *     name (lp_module_accept_token -> logos_protocol.cpp:635, and
+     *     LogosProviderBase::informModuleToken in logos-plugin-qt).
+     *
+     * Same key namespace, last write wins. So a reverse lookup here — "which key
+     * holds this token, therefore who is calling me" — can name a module we CALL
+     * as the module CALLING us. That is affirmatively wrong, and worse than
+     * declining to answer. ModuleProxy::m_tokens is the caller-keyed,
+     * inbound-only record; anything that needs to NAME a caller uses that.
+     *
+     * The two directions do not currently collide in the DEFAULT topology, but
+     * only by accident of linkage: a module cdylib links its own copy of this
+     * library, so its outbound writes land in the cdylib image's instance()
+     * while the host image's store takes the inbound ones. Any single-image
+     * configuration — an in-process plugin host, the shared-runtime migration,
+     * this test suite — puts both in one map again.
      */
     QHash<QString, QString> m_tokens;
 
