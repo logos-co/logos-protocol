@@ -168,9 +168,23 @@ install(TARGETS logos_protocol
 # purely for OUT-OF-PLUGIN callers that bind lp_* at runtime via dlopen/FFI
 # (e.g. logos-js-sdk's koffi.load, logos-rust-sdk's callerBuildSupport) —
 # the role liblogos_module_client previously filled. In-plugin code keeps
-# linking the STATIC `logos_protocol` archive through the EXPORT set below,
-# so this target is intentionally NOT exported and NOT installed into the
-# CMake package; `find_package(logos-protocol)` is unaffected.
+# linking the STATIC `logos_protocol` archive through the EXPORT set below.
+#
+# This target is EXPORTED as of this commit, where it was previously installed
+# but deliberately kept out of the CMake package. The reason it now has to be is
+# a second class of consumer: IN-PROCESS C++ images that link it as the single
+# provider of the runtime types which must exist exactly once per process
+# (TokenManager, LogosAPIClient, the per-identity StoreRegistry). Linking one
+# shared library is what replaces the whole-archive + generated-.def scheme, in
+# which liblogos_core absorbed both static archives and re-exported them. A
+# consumer cannot link what find_package() does not hand it.
+#
+# OUT-OF-PROCESS consumers keep linking the STATIC archive, and that is not a
+# transitional state: module plugins and ui_qml backends run in their own
+# processes, so their own copy of TokenManager is the CORRECT per-process
+# singleton. Staying static also keeps a .lgx self-contained -- a .lgx records
+# an empty nix closure, so a shared library would not travel with it -- and
+# keeps those plugins immune to ABI skew against a separately-updated .so.
 add_library(logos_protocol_shared SHARED ${PROTOCOL_SOURCES})
 
 target_link_libraries(logos_protocol_shared PUBLIC
@@ -188,12 +202,21 @@ target_link_libraries(logos_protocol_shared PUBLIC
 # leaves LP_API empty so consumers linking it need no import library.
 target_compile_definitions(logos_protocol_shared PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
 
+# The INSTALL_INTERFACE half mirrors the static target exactly. Without it an
+# exported target carries no include directories at all, and the failure is a
+# confusing one: the target imports fine and the link succeeds, then the
+# consumer fails to COMPILE on `#include "token_manager.h"`.
 target_include_directories(logos_protocol_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_local>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/mock>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
+    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include/implementations/qt_local>
+    $<INSTALL_INTERFACE:include/implementations/qt_remote>
+    $<INSTALL_INTERFACE:include/implementations/mock>
+    $<INSTALL_INTERFACE:include/implementations/plain>
 )
 
 # Same basename as the archive (liblogos_protocol.{so,dylib}); the LIBRARY
@@ -203,9 +226,61 @@ set_target_properties(logos_protocol_shared PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
 
+# ARCHIVE DESTINATION is NOT redundant here. On Windows a shared library's
+# import library (.dll.a) is the ARCHIVE artifact and the DLL itself is RUNTIME,
+# so without an ARCHIVE destination the import library is never installed and a
+# consumer that find_package()s this target gets an imported SHARED target whose
+# IMPORTED_IMPLIB does not exist. It links fine on ELF and Mach-O, where there is
+# no import library at all, and fails only on Windows.
+# PE export table for the shared library, generated from the objects.
+#
+# Not needed off Windows: ELF and Mach-O export a shared library's non-hidden
+# symbols by default, which is exactly why the shortfall this replaces was
+# invisible until a Windows link.
+if(WIN32)
+    # CMAKE_NM is normally set by the toolchain file; fall back to the
+    # cross-prefixed binary so a plain `cmake -DCMAKE_TOOLCHAIN_FILE=...` still
+    # generates. A missing nm must fail HERE, loudly, rather than silently
+    # emitting an empty .def -- an empty export table links clean and fails in a
+    # downstream repo as an undefined reference.
+    set(_lp_nm "${CMAKE_NM}")
+    if(NOT _lp_nm)
+        find_program(_lp_nm NAMES "${CMAKE_CXX_COMPILER_TARGET}-nm" x86_64-w64-mingw32-nm nm)
+    endif()
+    if(NOT _lp_nm)
+        message(FATAL_ERROR
+            "nm not found, so liblogos_protocol.dll cannot be given an export "
+            "list. Windows requires one: PE exports nothing that is not named, "
+            "and a consumer linking the empty stand-in archive would then fail "
+            "with undefined references to the entire C++ runtime.")
+    endif()
+
+    # Generated from the STATIC archive, which is built from the same sources.
+    # "*" means every member: ld chooses archive members for reasons unrelated to
+    # our symbols, so a partial set is a downstream undefined reference.
+    set(_lp_def "${CMAKE_CURRENT_BINARY_DIR}/logos_protocol_shared_exports.def")
+    add_custom_command(
+        OUTPUT "${_lp_def}"
+        COMMAND ${CMAKE_COMMAND} -E env sh
+                "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
+                "${_lp_nm}" "${_lp_def}"
+                "$<TARGET_FILE:logos_protocol>" "*"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh" logos_protocol
+        COMMENT "Generating liblogos_protocol export definition"
+        VERBATIM
+    )
+    add_custom_target(logos_protocol_shared_exports DEPENDS "${_lp_def}")
+    add_dependencies(logos_protocol_shared logos_protocol_shared_exports)
+    target_link_options(logos_protocol_shared PRIVATE "${_lp_def}")
+    set_property(TARGET logos_protocol_shared APPEND PROPERTY LINK_DEPENDS "${_lp_def}")
+endif()
+
 install(TARGETS logos_protocol_shared
+    EXPORT logos-protocolTargets
+    ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
+    INCLUDES DESTINATION include
 )
 
 install(EXPORT logos-protocolTargets
