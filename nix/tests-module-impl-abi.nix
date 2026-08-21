@@ -24,12 +24,24 @@ pkgs.runCommand "logos-protocol-module-impl-abi-tests"
   ok()   { echo "  PASS  $1"; }
   bad()  { echo "  FAIL  $1"; fails=$((fails + 1)); }
 
-  # Runs $1, expects a NON-zero exit. The whole file is about proving these
-  # paths reject, so "it exited 0" is the interesting failure.
+  # Expect a DELIBERATE refusal — exit 1, and specifically not 126/127.
+  #
+  # "Any non-zero exit counts as a refusal" is how a suite like this goes
+  # vacuous: a script that cannot be executed at all exits 126 or 127, and every
+  # negative case then reports PASS while proving nothing. This file caught
+  # exactly that in its own first version — the helper's `#!/usr/bin/env bash`
+  # did not resolve inside the Linux sandbox, so all five refusal cases "passed"
+  # and only the two positive cases exposed it.
   expect_fail() { local what="$1"; shift
-    if "$@" >/dev/null 2>&1; then bad "$what (exited 0; it must refuse)"; else ok "$what"; fi; }
+    local rc=0; "$@" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0)       bad "$what (exited 0; it must refuse)" ;;
+      126|127) bad "$what (exit $rc — could not execute; this is NOT a refusal)" ;;
+      *)       ok "$what" ;;
+    esac; }
   expect_pass() { local what="$1"; shift
-    if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what (exited non-zero)"; fi; }
+    local rc=0; "$@" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then ok "$what"; else bad "$what (exit $rc)"; fi; }
 
   echo "-- the extractor agrees with the published manifest --"
   bash "$X" "$H" > got.txt

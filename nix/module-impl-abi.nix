@@ -50,6 +50,13 @@ pkgs.runCommand "logos-module-impl-abi"
 
   install -m555 ${src}/nix/module-impl-abi/diff-exports.sh \
                 $out/bin/logos-module-impl-diff
+  # Absolute interpreter rather than `#!/usr/bin/env bash`. Consumers execute
+  # this from inside their own nix builds, whose PATH is whatever THEIR
+  # nativeBuildInputs happen to provide — an env lookup that resolves on one
+  # platform and not another turns into a check that silently stops running.
+  # That is not hypothetical: the first version of this failed exactly that way
+  # on Linux while passing on macOS.
+  patchShebangs $out/bin
 
   echo "module-impl C ABI $(cat $out/version): $(wc -l < $out/exports.txt) declared exports"
   sed 's/^/  /' $out/exports.txt
