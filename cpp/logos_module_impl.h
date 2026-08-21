@@ -121,11 +121,26 @@ LOGOS_MODULE_IMPL_EXPORT void logos_module_set_unload_done_callback(
  * A module that never signals delays every teardown by that period and is torn
  * down anyway, so the deadline is real rather than a courtesy.
  *
- * OPTIONAL, and that is load-bearing for compatibility. A module built before
- * this existed exports neither symbol; the glue is generated alongside the
- * module, so it simply does not emit the calls. An older module keeps the
- * behaviour it always had — teardown straight through its destructors — with
- * no version negotiation and no new failure mode. */
+ * CONDITIONAL on the protocol version, which is not the same as optional at
+ * load time. The glue emits a DIRECT call — no dlsym, no null check — so a
+ * module generated for >= 0.5 whose backend omits the definition links cleanly
+ * and then fails at dlopen(), on ELF, with "undefined symbol". The pair is
+ * skippable only where the CALLER was generated below 0.5 and emitted no call.
+ *
+ * An earlier version of this comment argued the arrangement was safe because
+ * "the glue is generated alongside the module". That does not follow, and the
+ * ABI has now been broken twice on the strength of it. Being generated in the
+ * same build makes the two agree on the protocol VERSION; it says nothing about
+ * which SYMBOLS a given language backend's emitter writes for that version,
+ * because each backend implements this ABI independently. Both breakages —
+ * grant_host_services at 0.3 and this pair at 0.5 — happened at perfect version
+ * agreement, and both were invisible on macOS (plugins link
+ * -undefined dynamic_lookup) and fatal on Linux (nixpkgs' -Wl,-z,now binds
+ * eagerly).
+ *
+ * So every backend owes a build-time check that its generated scaffold defines
+ * everything declared here. nix/module-impl-abi.nix publishes this file's
+ * export list as data for exactly that purpose. */
 LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
 
 /* The logos-protocol semver this module was compiled against. Static
