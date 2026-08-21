@@ -27,6 +27,10 @@
           include = import ./nix/include.nix { inherit pkgs common src; };
           tests = import ./nix/tests.nix { inherit pkgs common src; };
 
+          # The module-impl C ABI as data, for the language backends to check
+          # themselves against. See nix/module-impl-abi.nix.
+          module-impl-abi = import ./nix/module-impl-abi.nix { inherit pkgs common src; };
+
           # Combined package: static lib + cmake config + source-export
           # headers. propagatedBuildInputs re-declared on the join because
           # symlinkJoin doesn't forward propagation from `paths`. Qt is
@@ -42,7 +46,7 @@
         {
           logos-protocol-lib = lib;
           logos-protocol-include = include;
-          inherit tests;
+          inherit tests module-impl-abi;
 
           logos-protocol = protocol;
           default = protocol;
@@ -54,9 +58,15 @@
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
           tests = import ./nix/tests.nix { inherit pkgs common src; };
+          module-impl-abi = import ./nix/module-impl-abi.nix { inherit pkgs common src; };
         in
         {
           inherit tests;
+          # Proves the ABI manifest every backend checks itself against can
+          # still fail. See nix/tests-module-impl-abi.nix.
+          module-impl-abi-tests = import ./nix/tests-module-impl-abi.nix {
+            inherit pkgs common src module-impl-abi;
+          };
         }
       );
 
