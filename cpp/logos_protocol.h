@@ -58,16 +58,45 @@
  * additive/back-compatible; PATCH never affects compatibility.
  * =========================================================================== */
 
+// HOW TO GUARD A CONDITIONAL SURFACE, and it is not what it looks like.
+//
+// Every entry below is additive at a MINOR, so codegen guards the surface on
+// the version it appeared at. The obvious spelling is wrong:
+//
+//     #if LOGOS_PROTOCOL_VERSION_MINOR >= 5          // WRONG
+//
+// because at 1.0.0 the MINOR resets to 0 and every such guard silently goes
+// false. Nothing fails to build and nothing fails to load — the definitions and
+// the calls disappear together — so the symptom is modules quietly losing
+// teardown and grantability, with no diagnostic anywhere. Compare the pair:
+//
+//     #if defined(LOGOS_PROTOCOL_VERSION_MINOR) &&     // RIGHT
+//         (LOGOS_PROTOCOL_VERSION_MAJOR > 0 ||
+//          (LOGOS_PROTOCOL_VERSION_MAJOR == 0 &&
+//           LOGOS_PROTOCOL_VERSION_MINOR >= 5))
+//
+// Emit the arithmetic expanded rather than behind a function-like macro: the
+// generated sources are resolved by `unifdef` in the backends' ABI checks, and
+// unifdef handles nested integer arithmetic but silently no-ops on what it
+// cannot evaluate. logos-rust-sdk already gets this right by comparing the
+// tuple (major, minor).
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
 // 0.5: the module teardown pair — logos_module_about_to_unload() and
 // logos_module_set_unload_done_callback() (logos_module_impl.h), which let a
-// module finish work before it is torn down. Additive: both are OPTIONAL
-// exports, and the glue that calls them is generated alongside the module, so a
-// cdylib built before 0.5 exports neither and its glue emits no calls — an
-// older module keeps exactly the teardown it always had. The MINOR is what
-// makes that detectable: a generator emitting the calls guards them on
-// LOGOS_PROTOCOL_VERSION_MINOR >= 5, the same way 0.3's grant surface is
-// guarded, so new codegen still compiles against an older protocol header.
+// module finish work before it is torn down. Additive at the ABI level: a
+// cdylib generated below 0.5 exports neither, and the glue generated alongside
+// it emits no calls, so an older module keeps the teardown it always had.
+//
+// An earlier version of this note went further and called that arrangement
+// safe. It is not, and the ABI has been broken twice on the strength of it —
+// grant_host_services at 0.3 and this pair at 0.5. Being generated in the same
+// build makes the glue and the module agree on the VERSION; it says nothing
+// about which SYMBOLS a given language backend's emitter writes for that
+// version, because each backend implements this ABI independently. Both
+// breakages happened at perfect version agreement, and both were invisible on
+// macOS and fatal on Linux. See the note above logos_module_about_to_unload in
+// logos_module_impl.h, and nix/module-impl-abi.nix, which publishes this
+// header's export list so every backend can check itself against it.
 // 0.4: per-identity token stores — lp_token_isolate_identity() and the four
 // functions around it (lp_token_identity_is_isolated, lp_token_get_for,
 // lp_token_save_for, lp_token_reset_identity), plus lp_client_create resolving
