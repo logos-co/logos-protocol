@@ -33,33 +33,76 @@
  *   - ELF    flat namespace, first definition wins process-wide. This one
  *            genuinely does collapse duplicates.
  *
- * The consumers empty their static archives on every platform anyway
- * (logos-basecamp/cmake/LogosSharedFromDll.cmake), so the invariant is ONE rule
- * everywhere rather than three — and nix/symbol-gate.nix can assert it
- * uniformly instead of encoding a per-platform exception.
+ * WHERE THE DEFINITIONS LIVE NOW. Each type is owned by ONE shared library, and
+ * every in-process image imports it:
  *
- * The obvious fixes are both wrong, and the wrongness is not obvious, so:
+ *     liblogos_protocol   TokenManager, LogosAPIClient, the StoreRegistry
+ *     liblogos_qt_host    LogosAPI
  *
- *   - Exporting everything from liblogos_core (-Wl,--export-all-symbols) makes
- *     its import library a second definition of symbols that the static
- *     archives also define, and the link dies with "multiple definition of
- *     `LogosAPI::LogosAPI'". See the note in logos-liblogos/src/CMakeLists.txt.
- *   - Exporting nothing (a C-API-only narrowing) links, and silently gives
- *     every image its own statics. That is the bug above.
+ * liblogos_core is NOT the provider. It used to be: it absorbed both static
+ * archives with --whole-archive and re-published their symbols through a
+ * generated .def, so that one image could stand in for types it did not own.
+ * That scheme is gone (logos-protocol#65, logos-plugin-qt#22,
+ * logos-liblogos#182) and liblogos_core imports the runtime like every other
+ * consumer. Measured after the migration: liblogos_core defines ZERO runtime
+ * symbols, liblogos_protocol 78, liblogos_qt_host 23.
  *
- * The resolution is ONE PROVIDER, and the macro below is how a symbol is
- * assigned to one. On Windows the in-process consumers additionally compile
- * with LOGOS_SHARED_USE_DLL so their references become __declspec(dllimport).
+ * The two fixes that look obvious are both wrong, and were both tried:
  *
- * The dllimport is the load-bearing half, not the export. It rewrites the
+ *   - Exporting everything from one image (-Wl,--export-all-symbols) makes its
+ *     import library a second definition of symbols the static archives also
+ *     define, and the link dies with "multiple definition of
+ *     `LogosAPI::LogosAPI'".
+ *   - Hand-marking a class list with __declspec(dllexport) is not a smaller
+ *     version of the right answer, it is a moving target: it exported 116
+ *     symbols and the Qt host runtime still failed to link with ELEVEN
+ *     undefined references across five classes, plus free functions nobody had
+ *     thought to mark. A curated list is correct only until the next consumer
+ *     touches a symbol nobody marked, and the failure lands in a downstream
+ *     repo, far from the cause.
+ *
+ * So on Windows the export table is GENERATED from the objects
+ * (cmake/gen-shared-exports.sh) rather than curated, and this header resolves
+ * its "building the shared library" branch to nothing there, so the two
+ * mechanisms never compete. Off Windows a shared library exports its non-hidden
+ * symbols by default and there is nothing to generate.
+ *
+ * The dllimport half is the load-bearing one for consumers. It rewrites the
  * reference to go through `__imp_`, so the plain symbol is never undefined and
- * GNU ld never pulls the archive member that would have redefined it —
- * regardless of where the static archive sits on the link line. Without it the
- * link still succeeds and binds to the archive, with no diagnostic at all.
+ * GNU ld never pulls an archive member that would redefine it — regardless of
+ * where a static archive sits on the link line. Without it the link still
+ * succeeds and binds to the archive, with no diagnostic at all.
  *
- * Note that logos_host, ui-host and the module plugins do NOT opt in. They are
- * separate processes that do not load the provider, so they keep their own —
- * correct, per-process — statics.
+ * IN-PROCESS vs OUT-OF-PROCESS, which is the distinction that decides who links
+ * what, and the one most likely to be "simplified" away by someone tidying up:
+ *
+ *   IN-PROCESS  the app executable, liblogos_core, and anything QPluginLoader
+ *               pulls into the app (view replica factories, legacy widget
+ *               plugins, logos-standalone-app's third-party plugins). These
+ *               link the SHARED libraries. A second copy here is the
+ *               split-brain.
+ *
+ *   OUT-OF-PROCESS  logos_host, ui-host, module plugins and ui_qml backends.
+ *               These keep linking the STATIC archive, and that is CORRECT, not
+ *               a leftover. Each runs in its own process, so its own copy of
+ *               TokenManager IS the right per-process singleton — measured,
+ *               logos_host and ui-host define ~100 runtime symbols each and are
+ *               deliberately exempt from the symbol gates. Staying static also
+ *               keeps a .lgx self-contained: a .lgx records an EMPTY nix
+ *               closure, so a shared library would not travel with it, and it
+ *               keeps those plugins immune to ABI skew against a separately
+ *               updated .so.
+ *
+ * Do not "unify" the two by moving modules onto the shared libraries. It would
+ * couple every .lgx to the exact runtime build it was packaged against, to fix
+ * a duplication that is not a bug in a separate process.
+ *
+ * WHAT ASSERTS ANY OF THIS. Nothing did, for a long time, which is how nine
+ * images came to define the same singleton. There are now symbol gates in
+ * logos-basecamp, logos-logoscore-cli and logos-standalone-app
+ * (nix/symbol-gate.nix) asserting that each type has exactly one definer across
+ * the in-process image set, each shipped with a negative control that plants a
+ * real duplicate and requires the gate to reject it.
  */
 
 /* The primitives. Kept separate so the per-library macros below read as a
