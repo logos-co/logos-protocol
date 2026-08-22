@@ -81,6 +81,30 @@
 // cannot evaluate. logos-rust-sdk already gets this right by comparing the
 // tuple (major, minor).
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
+// 0.6: the caller of a dispatch — logos_module_set_call_caller()
+// (logos_module_impl.h), which carries WHO is calling into the module image for
+// the duration of one dispatch, plus the host half that produces the document
+// (logos::CallerScope / logos::currentInboundCallerJson, logos_caller_scope.h,
+// resolved by ModuleProxy::authorize as a by-product of the authorization scan
+// it was already performing).
+//
+// Additive at the ABI level and at the INTERFACE level, which are two separate
+// claims and both matter here. At the ABI: a cdylib generated below 0.6 exports
+// no such symbol and the glue generated alongside it emits no call. At the
+// interface: the caller is NOT a declared parameter and never appears in a
+// .lidl — it is an ambient accessor — so no module's signature changes, nothing
+// opts in per method, and a module that never asks is unaffected.
+//
+// WHY A MINOR AND NOT A PATCH, since the surface is only reachable through a
+// generated call: a new REQUIRED module-impl export is exactly the thing the
+// two prior ABI breaks were. Both (grant_host_services at 0.3, the teardown
+// pair at 0.5) shipped with caller and module in perfect agreement about the
+// version and still failed at dlopen on Linux only, because version agreement
+// says nothing about which SYMBOLS a backend's emitter writes. The MINOR is
+// what the guards are keyed to — the generator guard that emits the call, the
+// backend guard that emits the definition, and the exports.txt every backend
+// diffs itself against — so a surface with no MINOR of its own has no way to be
+// guarded and no way to be checked.
 // 0.5: the module teardown pair — logos_module_about_to_unload() and
 // logos_module_set_unload_done_callback() (logos_module_impl.h), which let a
 // module finish work before it is torn down. Additive at the ABI level: a
@@ -117,9 +141,9 @@
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 5
+#define LOGOS_PROTOCOL_VERSION_MINOR 6
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.5.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.6.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.

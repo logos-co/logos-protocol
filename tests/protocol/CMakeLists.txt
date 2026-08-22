@@ -356,6 +356,14 @@ add_executable(protocol_tests
     # detectors were run RED against the unfixed tree; the runs are recorded in
     # the file.
     test_inbound_token_store.cpp
+    # WHO is calling, resolved out of that same inbound record as a
+    # by-product of the authorization scan. Production of the caller
+    # DOCUMENT and its lifetime on the dispatching thread only — nothing
+    # in this repo delivers it into a module cdylib yet. Most of the file
+    # is about the three cases that must REFUSE to name anyone; the
+    # direction-mixed-store case is the one an obvious simplification
+    # would delete.
+    test_call_caller.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

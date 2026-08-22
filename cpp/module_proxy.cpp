@@ -1,4 +1,5 @@
 #include "module_proxy.h"
+#include "logos_caller_scope.h"
 #include "logos_provider_interface.h"
 #include "token_manager.h"
 #include "logos_rpc_status.h"
@@ -6,7 +7,10 @@
 #include <QByteArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QStringList>
 #include <algorithm>
+#include <atomic>
+#include <string>
 
 ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent,
                          TokenManager* token_store)
@@ -108,7 +112,8 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // capability_module token exchange. Everything past this point is a real
     // business-method dispatch and MUST be authorized.
 
-    if (!isAuthorized(authToken, transportProtocol)) {
+    std::string callerJson;
+    if (!authorize(authToken, transportProtocol, &callerJson)) {
         qWarning() << "ModuleProxy: rejecting unauthorized call to" << methodName
                    << "- auth token not recognized";
         // Structured rejection instead of a bare QVariant() so a NEW consumer can
@@ -123,6 +128,29 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // (mnemonics, passwords, tokens, key material). Log only the method name and
     // the argument count, matching the other transport call sites.
     qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
+
+    // WHO IS CALLING, for the duration of this dispatch and no longer.
+    //
+    // Opened here — after authorization, immediately before the vtable hop into
+    // the provider — because authorization is the only place that ever knows the
+    // answer, and the dispatch is the only frame the answer is true for. The
+    // scope closes on every path out of this function, including an exception
+    // thrown from a handler.
+    //
+    // ON THIS THREAD ONLY. The value lives in a thread-local, so a provider that
+    // hands the call to a worker (concurrency:"multi") carries it across itself:
+    // the generated glue pulls the document HERE, on this thread, before it
+    // captures anything into the worker. There is nothing process-global to
+    // clobber, which is the entire reason this is not a dynamic property on a
+    // host QObject — two overlapping "multi" calls from different callers would
+    // share one slot and the second would silently rename the first.
+    //
+    // The value does NOT reach the module image by itself. The glue pulls it
+    // back out by name (LogosAPI::currentCallerJson, logos-plugin-qt) and pushes
+    // it across the module-impl C ABI; see logos_caller_scope.h for why a single
+    // thread-local cannot span the two images.
+    logos::CallerScope callerScope(std::move(callerJson));
+
     const QVariant result = m_provider->callMethod(methodName, args);
 
     // Module identity, for a provider whose own dispatch does not answer it.
@@ -148,6 +176,12 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
 }
 
 namespace {
+
+// See logos::tokenComparisonCount() in module_proxy.h for what this is and is
+// not. Relaxed: the tests that read it do so after the scans they measure have
+// returned on the same thread, so there is nothing to order against.
+std::atomic<unsigned long long> g_tokenComparisons{0};
+
 // note: this is to ensure comparison is constant time to prevent timing attacks
 // Length-independent constant-time comparison of two tokens. Returns true only
 // when both byte sequences are identical. We compare over the longer of the two
@@ -155,6 +189,7 @@ namespace {
 // does not reveal a correct prefix or the secret's length.
 bool constantTimeEquals(const QString& a, const QString& b)
 {
+    g_tokenComparisons.fetch_add(1, std::memory_order_relaxed);
     const QByteArray ba = a.toUtf8();
     const QByteArray bb = b.toUtf8();
     const int n = std::max(ba.size(), bb.size());
@@ -167,7 +202,57 @@ bool constantTimeEquals(const QString& a, const QString& b)
     }
     return diff == 0;
 }
+
+// ── recovering the matched key WITHOUT reintroducing a data-dependent branch ─
+//
+// 64 is not a limit on module names. It is the width at which recovering one
+// stops being free. A key longer than this still AUTHORIZES exactly as before —
+// that is isAuthorized's business and it is untouched — it simply cannot be
+// NAMED, and Unknown is both the fail-closed answer and the honest one.
+constexpr int kCallerKeyMax = 64;
+
+struct CallerFold {
+    unsigned char key[kCallerKeyMax] = {0};
+    unsigned char keyLen = 0;
+
+    // Merge one candidate NAME. `match` is 1 iff the presented token equalled
+    // this entry's token.
+    //
+    // NOTHING BELOW IS CONDITIONAL ON `match`: the mask selects, so the work
+    // done is a function of the STORE SIZE only — never of where the match is,
+    // nor of whether there was one. An `if (match) { copy; return; }` here would
+    // undo, in three lines, the property constantTimeEquals spends a full
+    // length-independent scan to provide, and it would look like an
+    // optimisation while doing it.
+    void offer(int match, const QByteArray& candKey)
+    {
+        const unsigned char m = static_cast<unsigned char>(-(match & 1)); // 0x00 | 0xFF
+        // candKey.size() is the length of a STORE KEY — a module name, public —
+        // not of a secret, so branching on it leaks nothing. Hoisted out of the
+        // loop so the fold itself stays branch-free.
+        const int n = (candKey.size() <= kCallerKeyMax) ? static_cast<int>(candKey.size()) : 0;
+        for (int i = 0; i < kCallerKeyMax; ++i) {
+            const unsigned char c = (i < n) ? static_cast<unsigned char>(candKey[i]) : 0;
+            key[i] = static_cast<unsigned char>((key[i] & ~m) | (c & m));
+        }
+        keyLen = static_cast<unsigned char>((keyLen & ~m) |
+                                            (static_cast<unsigned char>(n) & m));
+    }
+
+    std::string name() const
+    {
+        return std::string(reinterpret_cast<const char*>(key), keyLen);
+    }
+};
+
 } // namespace
+
+namespace logos {
+unsigned long long tokenComparisonCount()
+{
+    return g_tokenComparisons.load(std::memory_order_relaxed);
+}
+} // namespace logos
 
 bool ModuleProxy::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
@@ -243,6 +328,17 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
 
 bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transportProtocol) const
 {
+    return authorize(authToken, transportProtocol, /*callerJson=*/nullptr);
+}
+
+bool ModuleProxy::authorize(const QString& authToken, const QString& transportProtocol,
+                            std::string* callerJson) const
+{
+    // Unknown is SPELLED before anything else can go wrong, so every early
+    // return below leaves a valid document behind rather than an empty string
+    // that a reader would have to interpret.
+    if (callerJson) *callerJson = logos::callerUnknownJson();
+
     // Fail closed: an empty token is never valid, even if some empty value
     // somehow ended up in a token store.
     if (authToken.isEmpty()) {
@@ -269,15 +365,49 @@ bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transpor
     // calls rejected with no diagnostic) AND every ambient token still accepted
     // (the escalation isolation exists to close). Identical objects for a name
     // nobody isolated, which is why neither half had ever been observed.
+    //
+    // ── WHAT THE FOLD ADDS TO THIS SCAN, AND WHAT IT DOES NOT ────────────────
+    // The two loops below are the same two loops, over the same two stores, in
+    // the same order, calling constantTimeEquals exactly as many times as
+    // before: once per entry, with no early exit on either. Everything the
+    // caller-identity work adds is bookkeeping AFTER each comparison has already
+    // happened — a mask-select into a fixed-width buffer and two counter
+    // increments — so the comparison count, and with it the property the
+    // constant-time compare exists to provide, is unchanged by construction
+    // rather than by inspection. logos::tokenComparisonCount() lets a test say
+    // so out loud.
     bool authorized = false;
+    CallerFold fold;
+    unsigned moduleHits = 0;   // matches in the caller-keyed INBOUND record
+    unsigned anchorHits = 0;   // matches on m_store's bootstrap anchor keys
+
+    // (1) m_tokens — the proxy's INBOUND record, keyed by CALLER by
+    // construction (saveToken / informModuleToken are its only writers). The one
+    // store here that can honestly NAME anyone.
     for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it) {
-        authorized |= constantTimeEquals(authToken, it.value());
+        const int match = constantTimeEquals(authToken, it.value()) ? 1 : 0;
+        authorized |= (match != 0);
+        fold.offer(match, it.key().toUtf8());
+        moduleHits += static_cast<unsigned>(match);
     }
+
+    // (2) m_store — direction-MIXED: LogosAPIClient writes the token we will
+    // PRESENT to a callee under the CALLEE's name (logos_api_client.cpp:176), so
+    // a hit here may name a module we CALL as the module CALLING us. It
+    // therefore contributes NO name — note there is no fold.offer() below, and
+    // that absence is the whole of rule (1) in the m_tokens comment above.
+    //
+    // The single thing this store can say honestly is "this is the host
+    // bootstrap token", because those keys have exactly one writer (the host
+    // initializer / seedHandshakeTrustAnchor) and exactly one meaning.
+    // `isAnchor` compares a public KEY, not a token, so branching on it leaks
+    // nothing; it is computed before the comparison so the fold stays uniform.
+    const QStringList anchorKeys = TokenManager::bootstrapKeys();
     for (const QString& key : m_store->getTokenKeys()) {
-        authorized |= constantTimeEquals(authToken, m_store->getToken(key));
-    }
-    if (authorized) {
-        return true;
+        const int isAnchor = anchorKeys.contains(key) ? 1 : 0;
+        const int match = constantTimeEquals(authToken, m_store->getToken(key)) ? 1 : 0;
+        authorized |= (match != 0);
+        anchorHits += static_cast<unsigned>(match & isAnchor);
     }
 
     // Not one of our own issued tokens — give a host-installed validator the
@@ -285,10 +415,41 @@ bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transpor
     // tokens (validated against the daemon's TokenStore, with expiry and
     // local_only enforced by `transportProtocol`) authorize a call without
     // being pre-registered in the in-process stores above.
-    if (m_validator) {
-        return m_validator(authToken, transportProtocol);
+    //
+    // Such a call stays UNKNOWN. TokenValidator returns bool and nothing else,
+    // so there is no name to be had; widening it to yield one is a
+    // logos-logoscore-cli change and deliberately not part of this.
+    if (!authorized && m_validator) {
+        authorized = m_validator(authToken, transportProtocol);
     }
-    return false;
+    if (!authorized) {
+        return false;
+    }
+
+    // Decided AFTER the scan, on counters, in O(1).
+    //
+    // This part DOES branch on secret-derived values, and that is fine: it
+    // reveals nothing the answer does not already carry, and the answer is
+    // handed to the handler in a moment anyway.
+    if (callerJson) {
+        if (anchorHits > 0) {
+            // The anchor wins a tie. A value that is both the host anchor and
+            // some caller's inbound token is the host's; naming the module would
+            // assert an identity the anchor's own ambiguity ("core" and
+            // "capability_module" share one value) already forbids.
+            *callerJson = logos::callerHostAnchorJson();
+        } else if (moduleHits == 1 && fold.keyLen > 0) {
+            *callerJson = logos::callerModuleJson(fold.name());
+        }
+        // Everything else stays Unknown, and each case is a real one:
+        //   * zero name matches — a validator-accepted operator token, or a hit
+        //     on a non-anchor key of the direction-mixed store.
+        //   * two or more — two callers were issued the same token value.
+        //     Impossible with UUIDs, but if it ever happens we do not get to
+        //     pick one.
+        //   * keyLen == 0 — the matched key is longer than kCallerKeyMax.
+    }
+    return true;
 }
 
 namespace {

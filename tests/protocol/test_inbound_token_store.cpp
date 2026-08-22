@@ -398,3 +398,96 @@ TEST(InboundTokenStore, TheTrustAnchorIsReadFromTheProxysOwnStore)
                                         QStringLiteral("tok-from-private-anchor")));
     EXPECT_EQ(provider.informs, 1);
 }
+
+// ── 9. the scan's shape does not depend on the answer ────────────────────────
+//
+// WHAT THIS ASSERTS, exactly: the number of times constantTimeEquals runs for
+// one inbound call is a function of the STORE SIZES only — never of where the
+// matching token sits in the iteration, nor of whether anything matched at all.
+// logos::tokenComparisonCount() is instrumentation for that and nothing else.
+//
+// WHAT IT DOES NOT ASSERT, and this matters more than what it does: it makes NO
+// claim about wall-clock time, and it is not a constant-time proof. A timing
+// test here would be theatre. constantTimeEquals opens with two
+// QString::toUtf8() heap allocations and the loop is preceded by a QHash walk,
+// both orders of magnitude noisier than the byte fold being defended; -O2 is
+// free to lower the fold's mask-merge to a conditional select OR to a branch and
+// nothing in a runCommand can see which it chose; separating the signal needs
+// dudect-scale sampling on a shared, frequency-scaled CI runner. And the threat
+// would be recovering a 122-bit random UUID by timing, which is not the threat
+// this code has.
+//
+// The invocation-count invariant, by contrast, is deterministic, portable, and
+// is precisely what an accidental `break` or early `return` destroys — which is
+// the realistic regression, especially now that the loop body does more than
+// OR a bool. That is the property worth pinning, so it is the one pinned.
+//
+// RED BEFORE: with `if (authorized) break;` added at the end of the m_tokens
+// loop — the natural "we already know the answer" optimisation — the cost
+// becomes the match's POSITION in the iteration. Measured:
+//
+//   n=1   0 of 1 measurements differ.  Undetectable, and that is the reason the
+//         sweep exists: with one token the break fires after the only
+//         comparison, so the cost is identical to a miss.
+//   n=2   1 of 2 differ — 4 against a miss cost of 5.
+//   n=50  49 of 50 differ, ranging 52..100 against a miss cost of 101. The one
+//         that agrees is whichever token QHash happens to iterate last.
+//
+// Removing the early exit again returns every one of the 53 measurements to its
+// store-size cost. The n=50 spread is also the leak stated plainly: the number
+// of comparisons is the presented token's position among the issued ones.
+TEST(InboundTokenStore, TheComparisonCountDependsOnStoreSizeOnly)
+{
+    ensureInboundApp();
+
+    unsigned long long previousTotal = 0;
+
+    for (const int n : { 1, 2, 50 }) {
+        const QString identity =
+            QStringLiteral("inbound_store_ct_scan_%1").arg(n);
+        ASSERT_TRUE(TokenManager::isolateIdentity(identity));
+        TokenManager& store = TokenManager::forIdentity(identity);
+        ASSERT_NE(&store, &TokenManager::instance());
+
+        // The anchor goes straight into this proxy's own store: a private store
+        // copies the bootstrap keys when it is CREATED, so seeding instance()
+        // afterwards would never reach it.
+        const QString anchor = QStringLiteral("ct-scan-anchor-%1").arg(n);
+        store.saveToken(QStringLiteral("core"), anchor);
+
+        RecordingProvider provider(&store);
+        ModuleProxy proxy(&provider, /*parent=*/nullptr, &store);
+
+        QStringList issued;
+        for (int i = 0; i < n; ++i) {
+            const QString token = QStringLiteral("ct-scan-token-%1-%2").arg(n).arg(i);
+            ASSERT_TRUE(proxy.informModuleToken(
+                anchor, QStringLiteral("ct_caller_%1").arg(i), token));
+            issued << token;
+        }
+
+        // The reference: a token that matches NOTHING, so the scan runs to the
+        // end of both stores with no early exit available to it.
+        const unsigned long long beforeMiss = logos::tokenComparisonCount();
+        EXPECT_FALSE(callSucceeds(proxy, QStringLiteral("ct-scan-no-such-token")));
+        const unsigned long long missCost =
+            logos::tokenComparisonCount() - beforeMiss;
+
+        // EVERY issued token, not a sampled first and last. QHash iteration
+        // order is unspecified, so "the match at index 0" is not something a
+        // test can arrange — measuring all n makes the claim order-independent
+        // and covers whichever position each token actually lands in.
+        for (const QString& token : issued) {
+            const unsigned long long before = logos::tokenComparisonCount();
+            EXPECT_TRUE(callSucceeds(proxy, token));
+            EXPECT_EQ(logos::tokenComparisonCount() - before, missCost)
+                << "n=" << n << " token=" << token.toStdString();
+        }
+
+        // Anti-vacuity, both directions. A counter stuck at zero, or one the
+        // scan stopped feeding, would satisfy every equality above.
+        EXPECT_GE(missCost, static_cast<unsigned long long>(n));
+        EXPECT_GT(missCost, previousTotal);
+        previousTotal = missCost;
+    }
+}
