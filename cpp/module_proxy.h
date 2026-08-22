@@ -10,6 +10,7 @@
 #include <QPointer>
 
 #include <functional>
+#include <string>
 #include <utility>
 
 #include "token_manager.h"
@@ -17,6 +18,28 @@
 class LogosProviderObject;
 
 namespace logos {
+
+/**
+ * @brief How many constant-time token comparisons this image has performed.
+ *
+ * INSTRUMENTATION, not a knob and not a diagnostic anyone should act on. It
+ * exists so a test can assert the one timing property that is deterministic
+ * enough to be worth asserting: the number of comparisons ModuleProxy performs
+ * for an inbound call is a function of the STORE SIZES only — never of where
+ * the matching token sits, nor of whether there was a match at all. An
+ * accidental `break` or early `return` in either scan loop is exactly what that
+ * catches, and is exactly what the constant-time compare exists to prevent.
+ *
+ * It asserts nothing about wall-clock time and no test here should claim it
+ * does; see the note in tests/protocol/test_inbound_token_store.cpp.
+ *
+ * Always on rather than behind a build flag: a relaxed atomic increment is
+ * unmeasurable next to the two heap allocations QString::toUtf8() already makes
+ * on every one of these comparisons, and a check that only exists in a test
+ * build is a check that stops matching the shipped code.
+ */
+unsigned long long tokenComparisonCount();
+
 // The name a module's handshake surface is published under.
 //
 // A module's initializer is synchronous and routinely calls out — including
@@ -112,7 +135,29 @@ private:
     // Empty/unknown tokens are rejected. The built-in comparison is constant-time
     // and never early-outs, so neither a correct prefix nor the number of issued
     // tokens leaks through timing.
+    //
+    // Kept as the two-argument spelling every existing call site and comment in
+    // the fleet names; it forwards to authorize() below with no caller-out.
     bool isAuthorized(const QString& authToken, const QString& transportProtocol) const;
+
+    // The same decision, PLUS who made it.
+    //
+    // Fused into one scan rather than added as a second pass, for two reasons
+    // and the second is the important one. It costs zero extra comparisons:
+    // deciding whether a presented token matches an issued one is already a walk
+    // over every issued token, and the key is right there. And it keeps the
+    // constant-time property in ONE place — a separate "now find the name" loop
+    // is a second scan whose early-out looks obviously harmless and would
+    // reintroduce, in three lines, exactly the leak constantTimeEquals exists to
+    // close.
+    //
+    // On `true`, *callerJson (when non-null) receives the caller document
+    // described in logos_caller_scope.h — always a valid document, never empty,
+    // Unknown where the caller cannot be named honestly. Untouched on `false`
+    // beyond the Unknown it is initialised to: an unauthorized call has no
+    // caller because it has no dispatch.
+    bool authorize(const QString& authToken, const QString& transportProtocol,
+                   std::string* callerJson) const;
 
     LogosProviderObject* m_provider;
     // THE INBOUND STORE: caller name -> the token that caller may present to us.

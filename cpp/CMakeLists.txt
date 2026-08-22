@@ -46,6 +46,11 @@ set(PROTOCOL_SOURCES
     logos_subscription_state.h
     module_proxy.cpp
     module_proxy.h
+    # WHO is calling the dispatch on this thread. Produced by
+    # ModuleProxy::authorize, consumed by the host-side invokable the
+    # generated glue reaches by name.
+    logos_caller_scope.cpp
+    logos_caller_scope.h
     token_manager.cpp
     token_manager.h
     logos_mode.h
@@ -328,6 +333,9 @@ install(FILES
     # forward-declares the consumer, so the enum cannot live in the consumer header.
     logos_subscription_state.h
     module_proxy.h
+    # Included by logos-plugin-qt's logos_api.cpp to answer
+    # LogosAPI::currentCallerJson(), so it has to ship with the headers.
+    logos_caller_scope.h
     token_manager.h
     logos_mode.h
     logos_instance.h
