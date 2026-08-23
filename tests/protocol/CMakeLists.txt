@@ -364,6 +364,11 @@ add_executable(protocol_tests
     # direction-mixed-store case is the one an obvious simplification
     # would delete.
     test_call_caller.cpp
+    # An isolated identity's OWN credential: the store is born empty, the host
+    # mints/registers/adopts, and both halves — no host anchor, and no lockout —
+    # are asserted against real ModuleProxy authorization. See the file header
+    # for the two neutered builds that make each half a detector.
+    test_consumer_credential.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

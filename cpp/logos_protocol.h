@@ -141,9 +141,28 @@
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 6
+// 0.7: an isolated identity's OWN credential — lp_token_adopt_credential(),
+// and the behaviour change that makes it necessary: a private token store is
+// created EMPTY instead of inheriting this image's "core"/"capability_module"
+// tokens. That inheritance handed every isolated identity the HOST's credential,
+// which authorized as the host at any callee (the caller document came back
+// {"kind":"host"}) and satisfied ModuleProxy::informModuleToken's
+// trusted-channel gate — a write into another module's token map, reachable
+// with three public calls and no generated glue.
+//
+// ADDITIVE AT THE ABI, BREAKING FOR ISOLATED IDENTITIES, and the two halves have
+// to be said separately. No symbol changes signature, no module-impl export is
+// added, and a host that never calls lp_token_isolate_identity /
+// TokenManager::isolateIdentity is bit-for-bit unaffected: forIdentity() still
+// returns instance() pointer-identically for every un-isolated name. A host that
+// DOES isolate and does not adopt is broken loudly and immediately — its first
+// outbound call dies at ModuleProxy::authorize's empty-token check with
+// "auth token not recognized" — which is the intended failure mode for a change
+// that removes a credential nobody was entitled to. Ship protocol, then
+// logos-plugin-qt, then the hosts, with matching flake.locks.
+#define LOGOS_PROTOCOL_VERSION_MINOR 7
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.6.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.7.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -410,9 +429,12 @@ LP_API int lp_token_save(const char* module_name, const char* token);
  * and every lp_client_create behaves exactly as before, on the same store.
  * ------------------------------------------------------------------------- */
 
-/** Give `identity` a private token store, seeded with the trust-root bootstrap
- *  ("core" and "capability_module", copied from this image's store) so its first
- *  call can still run the `requestModule` handshake.
+/** Give `identity` a private token store. The store is created EMPTY — it does
+ *  NOT inherit this image's "core" / "capability_module" tokens, which are the
+ *  HOST's credential and would let the identity authorize as the host. The host
+ *  must give the identity its OWN credential with lp_token_adopt_credential
+ *  before it can call anything; until then every call it makes is refused.
+ *
  *
  *  Idempotent. Returns LP_ERR_UNSUPPORTED — changing nothing — if a client for
  *  this identity was already created against the shared store; isolating then
@@ -432,7 +454,10 @@ LP_API int lp_token_identity_is_isolated(const char* identity);
 LP_API char* lp_token_get_for(const char* identity, const char* module_name);
 
 /** Store a token in `identity`'s store — how a host seeds an isolated identity
- *  with the tokens it is actually entitled to. Writes this image's shared store
+ *  with the tokens it is actually entitled to. For the identity's OWN
+ *  credential, use lp_token_adopt_credential instead: it owns the bootstrap key
+ *  set, so a binding never has to spell "core"/"capability_module" itself.
+ *  Writes this image's shared store
  *  for an identity that has not been isolated, which is almost certainly not
  *  what the caller meant: the token becomes visible to every other non-isolated
  *  caller, and lp_token_isolate_identity then refuses the name rather than
@@ -440,11 +465,32 @@ LP_API char* lp_token_get_for(const char* identity, const char* module_name);
 LP_API int lp_token_save_for(const char* identity, const char* module_name,
                              const char* token);
 
-/** Clear an isolated identity's store and re-seed the bootstrap — the unload
- *  hook, so a reloaded module does not present tokens minted for its previous
- *  incarnation. Returns LP_ERR_UNSUPPORTED for a non-isolated identity, whose
- *  store is shared and must not be cleared out from under everyone else. */
+/** Clear an isolated identity's store — the unload hook, so a reloaded module
+ *  does not present tokens minted for its previous incarnation. The identity's
+ *  CREDENTIAL goes with it: a reload re-mints and re-registers, which
+ *  invalidates the old credential at the target, so the caller must follow this
+ *  with lp_token_adopt_credential for the new one. Returns LP_ERR_UNSUPPORTED
+ *  for a non-isolated identity, whose store is shared and must not be cleared
+ *  out from under everyone else. */
 LP_API int lp_token_reset_identity(const char* identity);
+
+/** Install `credential` as `identity`'s OWN credential in its private store:
+ *  its value under every bootstrap key ("core", "capability_module"). This is
+ *  what makes an isolated identity able to speak at all — it is the token
+ *  presented to `capability_module.requestModule`, and the token
+ *  capability_module pushes back with.
+ *
+ *  The host mints `credential`, registers it with capability_module
+ *  (lp_inform_module_token / informModuleToken over the trusted channel) and
+ *  only THEN calls this. Register-before-adopt, so at no instant does the
+ *  identity hold a credential capability_module has not yet accepted.
+ *
+ *  Returns LP_ERR_INVALID_ARG for a NULL/empty argument, and LP_ERR_UNSUPPORTED
+ *  — writing nothing — when `identity` is not isolated (the store would be the
+ *  shared one, handing the credential to every un-isolated caller) or when
+ *  `credential` is this image's own host anchor (adopting the host's credential
+ *  as your own is the elevation this whole surface exists to prevent). */
+LP_API int lp_token_adopt_credential(const char* identity, const char* credential);
 
 /** The module names this image's token store holds, as a JSON array. Caller
  *  frees via lp_string_free.

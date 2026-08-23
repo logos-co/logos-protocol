@@ -162,6 +162,31 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
 {
     qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
     const QString capabilityToken = getToken(QStringLiteral("capability_module"));
+
+    // A NAMED DIAGNOSTIC for the one way this whole path fails silently.
+    //
+    // A private token store is created empty; the host is what puts the
+    // identity's own credential in it. A host that isolates an identity and
+    // never adopts a credential for it produces an empty capability token here,
+    // which ModuleProxy::authorize refuses at its empty-token check — so
+    // requestModule returns "", the real call goes out with no token, the one
+    // re-exchange fails identically, and the caller sees an empty QVariant. That
+    // reads as "the target returned nothing", which is the wrong bug to chase.
+    //
+    // Warned once per client rather than per call: the failure repeats on every
+    // call and the message is about the host's wiring, not about this call.
+    // Only for an ISOLATED store — the ambient ring legitimately starts without
+    // a capability token in plenty of tests and single-module processes.
+    if (capabilityToken.isEmpty() && m_token_manager
+        && m_token_manager != &TokenManager::instance() && !m_warnedNoCredential) {
+        m_warnedNoCredential = true;
+        qWarning() << "LogosAPIClient: identity" << m_origin_module
+                   << "has an isolated token store with no credential, so its"
+                      " requestModule handshake for" << objectName
+                   << "will be refused. The host must admit this identity"
+                      " (logos::admitConsumer / TokenManager::adoptCredentialFor)"
+                      " before it can call anything.";
+    }
     const QString token = QString::fromStdString(
         m_capability_consumer->requestModule(capabilityToken.toStdString(),
                                              m_origin_module.toStdString(),

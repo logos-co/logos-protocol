@@ -410,6 +410,12 @@ private:
     // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
     // lock. Appended last per the ABI note above; defaults to empty.
     QMap<QString, std::vector<std::function<void(const QString&)>>> m_pendingHandshakes;
+
+    // One-shot latch for the "isolated store with no credential" warning in
+    // mintAndCacheToken(). The condition repeats on every call and the message
+    // is about the HOST's wiring, so it is worth saying once and not N times.
+    // Appended last per the ABI note above; defaults to false.
+    bool m_warnedNoCredential = false;
 };
 
 #endif // LOGOS_API_CLIENT_H

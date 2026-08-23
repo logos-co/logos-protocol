@@ -113,8 +113,15 @@ std::string callerUnknownJson();
  *
  * CARRIES NO NAME, and must not gain one. "core" and "capability_module" hold
  * the same token VALUE under two keys by construction (TokenManager::
- * bootstrapKeys() is seeded from one host secret), so a name on this arm would
- * be a coin flip presented as a fact. */
+ * adoptCredential writes ONE credential under every bootstrapKeys() key), so a
+ * name on this arm would be a coin flip presented as a fact.
+ *
+ * AND IT IS THE HOST'S OWN CREDENTIAL, not any identity's. An isolated identity
+ * carries its own credential under those keys, which the callee's proxy finds
+ * in its caller-keyed inbound record and answers with the module arm below.
+ * Until logos-protocol 0.7 a private store was born holding a COPY of the
+ * host's, so an in-process view resolved HERE — the host arm — which is the
+ * elevation adoptCredentialFor exists to close. */
 std::string callerHostAnchorJson();
 
 /* {"kind":"module","name":"<name>"} — a named module, token-bound.

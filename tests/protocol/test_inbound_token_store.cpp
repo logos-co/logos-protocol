@@ -260,7 +260,7 @@ TEST(InboundTokenStore, AnUntrustedPushGrantsNothing)
 TEST(InboundTokenStore, AnIsolatedProviderIdentityStillAuthorizesInboundCalls)
 {
     ensureInboundApp();
-    const QString anchor = seedTrustAnchor();
+    const QString hostAnchor = seedTrustAnchor();
 
     const QString identity = QStringLiteral("inbound_store_isolated_provider");
     ASSERT_TRUE(TokenManager::isolateIdentity(identity));
@@ -270,15 +270,30 @@ TEST(InboundTokenStore, AnIsolatedProviderIdentityStillAuthorizesInboundCalls)
     RecordingProvider provider(&isolated);
     ModuleProxy proxy(&provider, /*parent=*/nullptr, &isolated);
 
-    // The trust anchor reaches an isolated store through the bootstrap seed
-    // ("core" is one of TokenManager::bootstrapKeys()), which is what lets the
-    // push authorize at all.
-    ASSERT_EQ(isolated.getToken(QStringLiteral("core")), anchor);
+    // WHAT LETS THE PUSH AUTHORIZE, and it is no longer the host's anchor.
+    //
+    // A private store is created EMPTY. The host installs THIS identity's own
+    // credential under the bootstrap keys (TokenManager::adoptCredentialFor),
+    // and capability_module pushes using `tokenManager->getToken(moduleName)`,
+    // which IS that credential — so the trusted-channel gate matches on the
+    // identity's own value. The store used to be seeded with a COPY of
+    // instance()'s anchor, which authorized this push and also let any holder
+    // of the copy authorize as the host at every other module.
+    ASSERT_TRUE(isolated.getToken(QStringLiteral("core")).isEmpty())
+        << "a private store must not inherit the host's credential";
+    const QString credential = QStringLiteral("inbound-own-credential");
+    ASSERT_TRUE(TokenManager::adoptCredentialFor(identity, credential));
+    ASSERT_EQ(isolated.getToken(QStringLiteral("core")), credential);
+    ASSERT_NE(credential, hostAnchor);
 
     const QString granted = QStringLiteral("inbound-token-isolated");
-    ASSERT_TRUE(proxy.informModuleToken(anchor, QStringLiteral("caller_delta"), granted));
-
+    ASSERT_TRUE(proxy.informModuleToken(credential, QStringLiteral("caller_delta"), granted));
     EXPECT_TRUE(callSucceeds(proxy, granted));
+
+    // The other half of the same rule: the HOST's anchor is not a key to this
+    // door. An isolated provider trusts its own credential and nothing else.
+    EXPECT_FALSE(proxy.informModuleToken(hostAnchor, QStringLiteral("caller_impostor"),
+                                         QStringLiteral("inbound-token-impostor")));
 }
 
 // ── 5. the injected store is the one that is scanned ─────────────────────────
@@ -298,8 +313,10 @@ TEST(InboundTokenStore, AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy)
     TokenManager& isolated = TokenManager::forIdentity(identity);
     ASSERT_NE(&isolated, &TokenManager::instance());
 
-    // Planted in the AMBIENT ring only, under a key that is not a bootstrap key
-    // (a bootstrap key would legitimately be copied into the private store).
+    // Planted in the AMBIENT ring only. The key is deliberately not a bootstrap
+    // key: those now hold the identity's OWN credential, which is a different
+    // value from the host's by construction, so a bootstrap key would prove the
+    // same thing less directly.
     const QString ambientOnly = QStringLiteral("inbound-token-ambient-only");
     TokenManager::instance().saveToken(QStringLiteral("some_other_module"), ambientOnly);
     ASSERT_TRUE(isolated.getToken(QStringLiteral("some_other_module")).isEmpty());
@@ -365,10 +382,11 @@ TEST(InboundTokenStore, AnEmptyTokenIsRefusedEvenAgainstAnEmptyStoredValue)
 // is not this proxy's anchor.
 //
 // It also states the precondition the logos-plugin-qt wiring has to satisfy.
-// LogosAPIProvider::seedHandshakeTrustAnchor writes "core"/"capability_module"
-// into TokenManager::instance() by name; hand this proxy an isolated store
-// without moving that write and every push during the handshake window is
-// refused. That is why the parameter is opt-in and defaulted.
+// LogosAPIProvider::seedHandshakeTrustAnchor writes the module image's own
+// host-issued authToken under "core"/"capability_module"; an in-process
+// consumer gets the equivalent from logos::admitConsumer. Hand this proxy an
+// isolated store that nobody credentialed and every push is refused — which is
+// exactly what a private store now looks like until the host admits it.
 TEST(InboundTokenStore, TheTrustAnchorIsReadFromTheProxysOwnStore)
 {
     ensureInboundApp();
@@ -379,7 +397,7 @@ TEST(InboundTokenStore, TheTrustAnchorIsReadFromTheProxysOwnStore)
     TokenManager& isolated = TokenManager::forIdentity(identity);
     ASSERT_NE(&isolated, &TokenManager::instance());
 
-    // Overwrite the seeded copy, so the two stores disagree about "core".
+    // This identity's own credential, so the two stores disagree about "core".
     const QString privateAnchor = QStringLiteral("inbound-test-private-anchor");
     isolated.saveToken(QStringLiteral("core"), privateAnchor);
     ASSERT_NE(isolated.getToken(QStringLiteral("core")),
@@ -449,9 +467,8 @@ TEST(InboundTokenStore, TheComparisonCountDependsOnStoreSizeOnly)
         TokenManager& store = TokenManager::forIdentity(identity);
         ASSERT_NE(&store, &TokenManager::instance());
 
-        // The anchor goes straight into this proxy's own store: a private store
-        // copies the bootstrap keys when it is CREATED, so seeding instance()
-        // afterwards would never reach it.
+        // This identity's own credential, written straight into its store: a
+        // private store is born empty and inherits nothing from instance().
         const QString anchor = QStringLiteral("ct-scan-anchor-%1").arg(n);
         store.saveToken(QStringLiteral("core"), anchor);
 

@@ -648,6 +648,20 @@ int lp_token_reset_identity(const char* identity)
         : LP_ERR_UNSUPPORTED;
 }
 
+int lp_token_adopt_credential(const char* identity, const char* credential)
+{
+    if (!identity || !*identity || !credential || !*credential)
+        return LP_ERR_INVALID_ARG;
+    // LP_ERR_UNSUPPORTED covers both refusals TokenManager makes — a
+    // non-isolated identity and a credential equal to this image's host anchor
+    // — because both mean the same thing to a caller: nothing was written and
+    // retrying with the same arguments will not change that.
+    return TokenManager::adoptCredentialFor(QString::fromUtf8(identity),
+                                            QString::fromUtf8(credential))
+        ? LP_OK
+        : LP_ERR_UNSUPPORTED;
+}
+
 int lp_inform_module_token(lp_client* client,
                            const char* auth_token,
                            const char* module_name,

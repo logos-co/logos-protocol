@@ -265,12 +265,25 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     // store isAuthorized scans, so the proxy has exactly one notion of who it
     // trusts. Identical objects until a host isolates the provider's identity.
     //
-    // A HOST THAT PASSES AN ISOLATED STORE MUST SEED THE ANCHOR INTO IT.
-    // logos-plugin-qt's LogosAPIProvider::seedHandshakeTrustAnchor writes "core"
-    // and "capability_module" into TokenManager::instance() by name; against an
-    // isolated store that seeding would be invisible here and every token push
-    // would be refused during the handshake window. Moving that write to the
-    // same store is part of wiring this parameter up, not a separate cleanup.
+    // A HOST THAT PASSES AN ISOLATED STORE MUST INSTALL THAT IDENTITY'S OWN
+    // CREDENTIAL IN IT (TokenManager::adoptCredentialFor / lp_token_adopt_
+    // credential), because a private store is now created EMPTY. It must NOT be
+    // the host's anchor: capability_module pushes to a provider identity using
+    // getToken(moduleName), which is that identity's own credential, so the gate
+    // below still passes on the identity's own value and no longer requires a
+    // copy of the host's. logos-plugin-qt's LogosAPIProvider::
+    // seedHandshakeTrustAnchor does exactly this for a module IMAGE, writing the
+    // host-issued `authToken` property under both keys; logos::admitConsumer
+    // does it for an in-process consumer.
+    //
+    // ONE GAP SURVIVES, and it is here rather than in either of those:
+    // seedHandshakeTrustAnchor still writes to TokenManager::instance() BY NAME
+    // (logos-plugin-qt cpp/logos_api_provider.cpp:185-190), and is the last
+    // site that spells these two key strings itself. Against an isolated store
+    // it therefore seeds the wrong object — invisibly, because the write
+    // succeeds and only the read comes up empty. It is unreached today: that
+    // function runs in a module IMAGE, whose ring is the process ring. It stops
+    // being unreached the moment a provider identity is isolated in-process.
     const QString coreToken = m_store->getToken(QStringLiteral("core"));
     const QString capToken  = m_store->getToken(QStringLiteral("capability_module"));
     const bool callerIsTrusted =

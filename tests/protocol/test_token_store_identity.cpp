@@ -38,10 +38,9 @@
 // registry, the C ABI — was left intact so only the tests that assert a SEPARATE
 // store can notice.
 //
-// 15 of the 30 cases here go RED on that build; the other 15 are PINS of
-// behaviour that is meant to be identical either way (the image store, the
-// refusals, the diagnostics, the version) and correctly stay green. The three
-// sharpest readings:
+// That measurement was taken before an identity's OWN credential replaced the
+// copied host anchor, so the case NAMES below have moved; the readings have not.
+// Re-do the neutering if you change what these assert. The three sharpest:
 //
 //   AnIsolatedIdentityCannotReachTheAmbientRing
 //       forIdentity("walled").hasToken("target_module") is TRUE on the neutered
@@ -51,6 +50,11 @@
 //       requestModule handshake count is 0 instead of 2: BOTH identities found
 //       the target's ambient token and neither ever asked capability_module for
 //       anything. Not "one handshake shared" — none at all.
+//   APrivateStoreIsBornEmpty / AdoptingWritesTheCredentialUnderEveryBootstrapKey
+//       the store-level statement of the SECOND fix: a private store no longer
+//       inherits the host's "core"/"capability_module" values, and carries the
+//       identity's own credential instead. Measured separately in
+//       test_consumer_credential.cpp, which owns that pair of readings.
 //   TheKnownCallerGateStillSeesEveryHostWrittenName
 //       lp_token_keys() lists "private_target" on the neutered build: the
 //       identity's own minted token went straight into the shared ring, which is
@@ -268,95 +272,145 @@ TEST_F(TokenStoreIdentityTest, IsolatedIdentitiesAreListedForDiagnostics)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bootstrap seeding — the first-call path must survive isolation
+// The identity's OWN credential — the first-call path must survive isolation
+// WITHOUT inheriting the host's authority
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// A caller's first call to an unknown target runs
+// `capability_module.requestModule`, and that call authenticates with the token
+// stored under "capability_module". Withhold ANY value there and the identity
+// can never obtain a token at all — isolation becomes a lockout.
+//
+// The value used to be COPIED from instance(), i.e. the HOST's credential, which
+// made every isolated identity authorize as the host. The value is now the
+// identity's OWN credential, minted and registered by the host and installed
+// here by adoptCredential(). See test_consumer_credential.cpp for the
+// end-to-end statement of both halves; these are the store-level cases.
 
-// A module's first call to an unknown target runs capability_module.requestModule,
-// and that call authenticates with the token stored under "capability_module".
-// Withhold it and an isolated identity could never obtain any token at all.
-TEST_F(TokenStoreIdentityTest, APrivateStoreIsSeededWithTheBootstrapTokens)
+// A private store is BORN EMPTY. Nothing of the host's crosses into it.
+TEST_F(TokenStoreIdentityTest, APrivateStoreIsBornEmpty)
 {
     TokenManager::instance().saveToken("core", "core-tok");
     TokenManager::instance().saveToken("capability_module", "cap-tok");
     TokenManager::instance().saveToken("unrelated_module", "unrelated-root-tok");
 
-    ASSERT_TRUE(TokenManager::isolateIdentity(id("seeded")));
-    TokenManager& store = TokenManager::forIdentity(id("seeded"));
+    ASSERT_TRUE(TokenManager::isolateIdentity(id("born_empty")));
+    TokenManager& store = TokenManager::forIdentity(id("born_empty"));
 
-    EXPECT_EQ(store.getToken("core"), QStringLiteral("core-tok"));
-    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("cap-tok"));
-
-    // ...and NOTHING else. The bootstrap is the trust root, not a copy of the
-    // ring: every other module's root token — the thing that made the ring an
-    // escalation — stays behind.
+    EXPECT_TRUE(store.getToken("core").isEmpty());
+    EXPECT_TRUE(store.getToken("capability_module").isEmpty());
     EXPECT_TRUE(store.getToken("unrelated_module").isEmpty());
-    EXPECT_EQ(store.tokenCount(), 2);
+    EXPECT_EQ(store.tokenCount(), 0);
+
+    // The control: all three are sitting in the ring for the taking, and the
+    // private store took none of them.
+    EXPECT_EQ(TokenManager::instance().tokenCount(), 3);
+}
+
+// Adoption writes the identity's own credential under EVERY bootstrap key, and
+// under nothing else. bootstrapKeys() is the single owner of that key set.
+TEST_F(TokenStoreIdentityTest, AdoptingWritesTheCredentialUnderEveryBootstrapKey)
+{
+    TokenManager::instance().saveToken("core", "host-anchor");
+    TokenManager::instance().saveToken("capability_module", "host-anchor");
+
+    ASSERT_TRUE(TokenManager::isolateIdentity(id("adopted")));
+    ASSERT_TRUE(TokenManager::adoptCredentialFor(id("adopted"), "its-own-credential"));
+
+    TokenManager& store = TokenManager::forIdentity(id("adopted"));
     EXPECT_EQ(TokenManager::bootstrapKeys().size(), 2);
+    for (const QString& key : TokenManager::bootstrapKeys())
+        EXPECT_EQ(store.getToken(key), QStringLiteral("its-own-credential"));
+    EXPECT_EQ(store.tokenCount(), TokenManager::bootstrapKeys().size());
+
+    // ...and it is NOT the host's.
+    EXPECT_NE(store.getToken("capability_module"),
+              TokenManager::instance().getToken("capability_module"));
+    EXPECT_FALSE(TokenManager::identitiesSharingHostAnchor().contains(id("adopted")));
 }
 
-TEST_F(TokenStoreIdentityTest, SeedingCopiesOnlyTheKeysThatExistInTheRing)
+// The sanctioned API is not a way back to the bug.
+TEST_F(TokenStoreIdentityTest, AdoptingTheHostAnchorIsRefusedAndWritesNothing)
 {
-    // Host seeded capability_module but not core: the private store gets what
-    // there is, and no empty placeholder for what there isn't.
-    TokenManager::instance().saveToken("capability_module", "cap-only");
+    TokenManager::instance().saveToken("core", "the-host-anchor");
+    TokenManager::instance().saveToken("capability_module", "the-host-anchor");
 
-    ASSERT_TRUE(TokenManager::isolateIdentity(id("partial")));
-    TokenManager& store = TokenManager::forIdentity(id("partial"));
-    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("cap-only"));
-    EXPECT_FALSE(store.hasToken("core"));
-    EXPECT_EQ(store.tokenCount(), 1);
+    ASSERT_TRUE(TokenManager::isolateIdentity(id("anchor_refused")));
+    EXPECT_FALSE(TokenManager::adoptCredentialFor(id("anchor_refused"), "the-host-anchor"));
+    EXPECT_EQ(TokenManager::forIdentity(id("anchor_refused")).tokenCount(), 0);
+
+    // Refused under EITHER bootstrap key's value, since the host may hold two
+    // different secrets there.
+    TokenManager::instance().saveToken("core", "core-only-anchor");
+    EXPECT_FALSE(TokenManager::adoptCredentialFor(id("anchor_refused"), "core-only-anchor"));
+    EXPECT_EQ(TokenManager::forIdentity(id("anchor_refused")).tokenCount(), 0);
+
+    // An empty credential is a no-op rather than a value that reads as present.
+    EXPECT_FALSE(TokenManager::adoptCredentialFor(id("anchor_refused"), QString()));
+    EXPECT_EQ(TokenManager::forIdentity(id("anchor_refused")).tokenCount(), 0);
 }
 
-// The ordering escape hatch: a host that learns a bootstrap token AFTER the
-// private store already existed can top it up.
-TEST_F(TokenStoreIdentityTest, BootstrapTokensCanBeSeededLate)
+// A host may adopt at any point after isolation — including long after the store
+// object exists, which is the ordering a lazily-built identity produces.
+TEST_F(TokenStoreIdentityTest, ACredentialCanBeAdoptedAfterTheStoreExists)
 {
-    ASSERT_TRUE(TokenManager::isolateIdentity(id("late_seed")));
-    TokenManager& store = TokenManager::forIdentity(id("late_seed"));
+    ASSERT_TRUE(TokenManager::isolateIdentity(id("late_adopt")));
+    TokenManager& store = TokenManager::forIdentity(id("late_adopt"));
     ASSERT_EQ(store.tokenCount(), 0);
 
-    TokenManager::instance().saveToken("capability_module", "cap-late");
-    EXPECT_EQ(TokenManager::seedBootstrapTokens(id("late_seed")), 1);
-    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("cap-late"));
+    EXPECT_TRUE(TokenManager::adoptCredentialFor(id("late_adopt"), "late-credential"));
+    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("late-credential"));
 
-    // Idempotent: a second pass copies nothing and does not clobber a token the
-    // identity has since been given directly.
-    store.saveToken("capability_module", "cap-identity-specific");
-    EXPECT_EQ(TokenManager::seedBootstrapTokens(id("late_seed")), 0);
-    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("cap-identity-specific"));
+    // Rotation overwrites rather than accumulating: one credential at a time.
+    EXPECT_TRUE(TokenManager::adoptCredentialFor(id("late_adopt"), "rotated-credential"));
+    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("rotated-credential"));
+    EXPECT_EQ(store.getToken("core"), QStringLiteral("rotated-credential"));
+    EXPECT_EQ(store.tokenCount(), 2);
 }
 
-// A no-op must not have side effects. seedBootstrapTokens() on a name nobody
-// isolated has to avoid vending the shared store for it, or "seed then isolate"
-// would silently become impossible.
-TEST_F(TokenStoreIdentityTest, SeedingANonIsolatedIdentityDoesNotBlockLaterIsolation)
+// A refusal must not have side effects. adoptCredentialFor() on a name nobody
+// isolated has to avoid vending the shared store for it, or "adopt then
+// isolate" would silently become impossible — and it must never write the
+// credential into the ambient ring, which would hand it to every caller.
+TEST_F(TokenStoreIdentityTest, AdoptingANonIsolatedIdentityIsRefusedAndDoesNotBlockLaterIsolation)
 {
-    TokenManager::instance().saveToken("capability_module", "cap-tok");
-    EXPECT_EQ(TokenManager::seedBootstrapTokens(id("seed_then_iso")), 0);
-    EXPECT_TRUE(TokenManager::isolateIdentity(id("seed_then_iso")));
-    EXPECT_NE(&TokenManager::forIdentity(id("seed_then_iso")), &TokenManager::instance());
+    const int before = TokenManager::instance().tokenCount();
+    EXPECT_FALSE(TokenManager::adoptCredentialFor(id("adopt_then_iso"), "some-credential"));
+    EXPECT_EQ(TokenManager::instance().tokenCount(), before)
+        << "the credential must never land in the ambient ring";
+    EXPECT_TRUE(TokenManager::instance().getToken("capability_module").isEmpty());
+
+    EXPECT_TRUE(TokenManager::isolateIdentity(id("adopt_then_iso")));
+    EXPECT_NE(&TokenManager::forIdentity(id("adopt_then_iso")), &TokenManager::instance());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // resetIdentity — the plugin-unload hook
 // ─────────────────────────────────────────────────────────────────────────────
 
-TEST_F(TokenStoreIdentityTest, ResetClearsIssuedTokensAndKeepsTheBootstrap)
+// The credential goes too, and that is the change from the version of this that
+// re-seeded the bootstrap: a reload re-mints and re-registers, so the previous
+// credential is dead at the target the moment the new one is registered.
+// Leaving it here would be a locked-out reload that looks like a working one.
+TEST_F(TokenStoreIdentityTest, ResetClearsTheIssuedTokensAndTheCredentialWithThem)
 {
-    TokenManager::instance().saveToken("capability_module", "cap-tok");
     ASSERT_TRUE(TokenManager::isolateIdentity(id("reset_me")));
+    ASSERT_TRUE(TokenManager::adoptCredentialFor(id("reset_me"), "first-credential"));
 
     TokenManager& store = TokenManager::forIdentity(id("reset_me"));
     store.saveToken("target", "minted-for-previous-incarnation");
-    ASSERT_EQ(store.tokenCount(), 2);
+    ASSERT_EQ(store.tokenCount(), 3);
 
     EXPECT_TRUE(TokenManager::resetIdentity(id("reset_me")));
 
     // The store OBJECT survives — a client mid-flight holds it by raw pointer —
     // and only its CONTENTS have a lifetime.
     EXPECT_EQ(&TokenManager::forIdentity(id("reset_me")), &store);
-    EXPECT_TRUE(store.getToken("target").isEmpty());
-    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("cap-tok"));
+    EXPECT_EQ(store.tokenCount(), 0);
+
+    // The caller adopts the NEW credential; that is the whole re-admission.
+    EXPECT_TRUE(TokenManager::adoptCredentialFor(id("reset_me"), "second-credential"));
+    EXPECT_EQ(store.getToken("capability_module"), QStringLiteral("second-credential"));
 }
 
 // Clearing the shared ring would take the host's tokens and every other
@@ -435,6 +489,13 @@ TEST_F(TokenStoreClientTest, EachIsolatedIdentityMintsAndCachesItsOwnToken)
     ASSERT_TRUE(TokenManager::isolateIdentity(id("mint_alpha")));
     ASSERT_TRUE(TokenManager::isolateIdentity(id("mint_beta")));
 
+    // Each identity gets ITS OWN credential — what a host mints per consumer and
+    // registers with capability_module before handing it over. This used to be a
+    // copy of the host's anchor, which is what made every isolated caller
+    // authorize as the host; see test_consumer_credential.cpp.
+    ASSERT_TRUE(TokenManager::adoptCredentialFor(id("mint_alpha"), "credential-alpha"));
+    ASSERT_TRUE(TokenManager::adoptCredentialFor(id("mint_beta"), "credential-beta"));
+
     // when() also seeds instance() with a dummy token for the module, which is
     // what makes the shared ring look exactly like a host's: a token for the
     // target is sitting there for the taking.
@@ -451,15 +512,18 @@ TEST_F(TokenStoreClientTest, EachIsolatedIdentityMintsAndCachesItsOwnToken)
     LogosAPIClient beta(QStringLiteral("shared_target"), id("mint_beta"),
                         &TokenManager::forIdentity(id("mint_beta")));
 
-    // The bootstrap reached the CLIENT, not just the store: mintAndCacheToken
+    // The credential reached the CLIENT, not just the store: mintAndCacheToken
     // authenticates its requestModule with whatever getToken("capability_module")
-    // returns, so an isolated identity that did not inherit this token could
-    // never obtain any token at all. This is the first-call guarantee, checked
-    // where it is actually consumed.
+    // returns, so an isolated identity with no credential could never obtain any
+    // token at all. This is the first-call guarantee, checked where it is
+    // actually consumed — and it is EACH IDENTITY'S OWN value, not one shared
+    // secret and emphatically not the host's.
     EXPECT_EQ(alpha.getToken(QStringLiteral("capability_module")),
-              QStringLiteral("mock-token-capability_module"));
+              QStringLiteral("credential-alpha"));
     EXPECT_EQ(beta.getToken(QStringLiteral("capability_module")),
-              QStringLiteral("mock-token-capability_module"));
+              QStringLiteral("credential-beta"));
+    EXPECT_NE(alpha.getToken(QStringLiteral("capability_module")),
+              TokenManager::instance().getToken(QStringLiteral("capability_module")));
 
     EXPECT_EQ(alpha.invokeRemoteMethod(QStringLiteral("shared_target"),
                                        QStringLiteral("ping"), QVariantList{}).toString(),
@@ -552,22 +616,63 @@ TEST_F(TokenStoreAbiTest, PerIdentityGetAndSaveDoNotTouchTheImageStore)
     EXPECT_EQ(lp_token_get_for(who.constData(), "never_stored"), nullptr);
 }
 
-TEST_F(TokenStoreAbiTest, ResetIdentityClearsTheIssuedTokensOnly)
+TEST_F(TokenStoreAbiTest, ResetIdentityClearsTheStoreIncludingTheCredential)
 {
     ASSERT_EQ(lp_token_save("capability_module", "cap-tok"), LP_OK);
     const QByteArray who = id("abi_reset").toUtf8();
     ASSERT_EQ(lp_token_isolate_identity(who.constData()), LP_OK);
+    ASSERT_EQ(lp_token_adopt_credential(who.constData(), "own-credential"), LP_OK);
     ASSERT_EQ(lp_token_save_for(who.constData(), "target", "stale-tok"), LP_OK);
 
     EXPECT_EQ(lp_token_reset_identity(who.constData()), LP_OK);
     EXPECT_EQ(lp_token_get_for(who.constData(), "target"), nullptr);
-    EXPECT_EQ(takeString(lp_token_get_for(who.constData(), "capability_module")), "cap-tok");
+    // The credential goes with it; the caller adopts the newly-registered one.
+    EXPECT_EQ(lp_token_get_for(who.constData(), "capability_module"), nullptr);
 
     // Refused for a shared store rather than silently clearing everyone's.
     EXPECT_EQ(lp_token_reset_identity(id("abi_not_isolated").toUtf8().constData()),
               LP_ERR_UNSUPPORTED);
     EXPECT_EQ(takeString(lp_token_get("capability_module")), "cap-tok");
     EXPECT_EQ(lp_token_reset_identity(nullptr), LP_ERR_INVALID_ARG);
+}
+
+// The Qt-free half of the fix: a binding installs an identity's credential
+// through one call that owns the bootstrap key set, rather than spelling
+// "core"/"capability_module" for itself in every language.
+TEST_F(TokenStoreAbiTest, AdoptCredentialInstallsTheIdentitysOwnCredential)
+{
+    ASSERT_EQ(lp_token_save("core", "abi-host-anchor"), LP_OK);
+    ASSERT_EQ(lp_token_save("capability_module", "abi-host-anchor"), LP_OK);
+
+    const QByteArray who = id("abi_adopt").toUtf8();
+    ASSERT_EQ(lp_token_isolate_identity(who.constData()), LP_OK);
+    // Born empty.
+    EXPECT_EQ(lp_token_get_for(who.constData(), "capability_module"), nullptr);
+
+    EXPECT_EQ(lp_token_adopt_credential(who.constData(), "abi-own-credential"), LP_OK);
+    EXPECT_EQ(takeString(lp_token_get_for(who.constData(), "capability_module")),
+              "abi-own-credential");
+    EXPECT_EQ(takeString(lp_token_get_for(who.constData(), "core")), "abi-own-credential");
+    // The ambient ring is untouched.
+    EXPECT_EQ(takeString(lp_token_get("capability_module")), "abi-host-anchor");
+
+    // The two refusals, and both write nothing.
+    EXPECT_EQ(lp_token_adopt_credential(who.constData(), "abi-host-anchor"),
+              LP_ERR_UNSUPPORTED);
+    EXPECT_EQ(takeString(lp_token_get_for(who.constData(), "capability_module")),
+              "abi-own-credential");
+
+    const QByteArray plain = id("abi_adopt_plain").toUtf8();
+    EXPECT_EQ(lp_token_adopt_credential(plain.constData(), "would-be-ambient"),
+              LP_ERR_UNSUPPORTED);
+    EXPECT_EQ(takeString(lp_token_get("capability_module")), "abi-host-anchor");
+    // ...and the refusal did not vend the shared store under that name.
+    EXPECT_EQ(lp_token_isolate_identity(plain.constData()), LP_OK);
+
+    EXPECT_EQ(lp_token_adopt_credential(nullptr, "x"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_token_adopt_credential(who.constData(), nullptr), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_token_adopt_credential("", "x"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_token_adopt_credential(who.constData(), ""), LP_ERR_INVALID_ARG);
 }
 
 TEST_F(TokenStoreAbiTest, IsolationIsRefusedOnceAClientForThatOriginExists)
@@ -657,10 +762,13 @@ TEST_F(TokenStoreAbiTest, AnLpClientForANonIsolatedOriginKeepsUsingTheImageStore
 //     module, while the gate consults ORIGIN names. Origin names are in
 //     instance() because the HOST wrote `name -> root token` for every module it
 //     loaded, and this change does not touch host writes.
-//  4. The bootstrap survives because a private store is seeded with "core" and
-//     "capability_module", so the identity's first requestModule authenticates
-//     exactly as it did before (asserted in the seeding cases above, and at the
-//     client in EachIsolatedIdentityMintsAndCachesItsOwnToken).
+//  4. The bootstrap survives because the HOST gives each isolated identity its
+//     own credential under "core"/"capability_module"
+//     (TokenManager::adoptCredentialFor), so the identity's first requestModule
+//     authenticates — as ITSELF rather than as the host, which is the fix
+//     test_consumer_credential.cpp states end to end (asserted in the adoption
+//     cases above, and at the client in
+//     EachIsolatedIdentityMintsAndCachesItsOwnToken).
 
 class TokenStoreTrustRootTest : public ::testing::Test {
 protected:
