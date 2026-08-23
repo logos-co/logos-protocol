@@ -53,10 +53,26 @@ QCoreApplication* ensureDirectionApp() {
     return QCoreApplication::instance();
 }
 
-// Stands in for LogosProviderBase::informModuleToken, whose real body is
-// `m_logosAPI->getTokenManager()->saveToken(moduleName, token)` — i.e. it writes
-// the SAME store the proxy authorizes against. That identity is the whole point:
-// a provider that wrote somewhere else would not reproduce the collision.
+// Stands in for LogosProviderBase::informModuleToken, which writes the SAME
+// store the proxy authorizes against. That identity is the whole point: a
+// provider that wrote somewhere else would not reproduce the collision.
+//
+// THE ONE LINE THAT MOVED, AND THE COMPANION CHANGE IT MIRRORS. The real body
+// was `getTokenManager()->saveToken(moduleName, token)` — the OUTBOUND door,
+// keyed by the CALLEE — and that mis-spelling is half of what this file
+// detects. It is now `saveInboundToken`, and logos-plugin-qt owes the identical
+// one-line move in cpp/logos_provider_object.cpp:53 and
+// cpp/qt_provider_object.cpp:497 in the same wave.
+//
+// So this stand-in is NOT quietly moving the goalposts, and it is worth being
+// exact about which assertions depend on it. Tests 1 and 5-half-two are red on
+// the old tree with this provider written EITHER way: they are about the scan
+// no longer seeing the outbound map, which is a logos-protocol change alone.
+// Tests 2c, 3 and 5-half-one are the ones that need the door to move, and they
+// are precisely the assertions ABOUT the door: an inbound push must not land in
+// the outbound cache. Without the companion change those three stay red, which
+// is the correct signal — they are the thing that says logos-plugin-qt has not
+// landed yet.
 class DirectionProvider : public LogosProviderObject {
 public:
     explicit DirectionProvider(TokenManager* store) : m_store(store) {}
@@ -66,7 +82,7 @@ public:
         return QVariant();
     }
     bool informModuleToken(const QString& moduleName, const QString& token) override {
-        if (m_store) m_store->saveToken(moduleName, token);
+        if (m_store) m_store->saveInboundToken(moduleName, token);
         return true;
     }
     QJsonArray getMethods() override {
@@ -298,9 +314,49 @@ TEST(TokenDirection, AGrantOneWayIsNotAGrantTheOtherWay)
            "bidirectional and the access policy was never consulted";
 }
 
+// ── 6. THE SPLIT ITSELF: neither half may read the other ────────────────────
+//
+// The two accessors are the mechanism, so the mechanism gets its own assertion.
+// A read-side fall-through — `inbound().token(x)` answering from the outbound
+// map when it comes up empty, or getToken(x) answering from the inbound one —
+// is the single change that would put the collision back while looking like a
+// convenience, and it is the change this test exists to fail on.
+TEST(TokenDirection, NeitherHalfAnswersForTheOther)
+{
+    ensureDirectionApp();
+    ModuleImage m(QStringLiteral("direction_no_fallthrough"),
+                  QStringLiteral("direction-own-credential-7"));
+
+    m.store->saveToken(QStringLiteral("only_outbound"), QStringLiteral("tok-out"));
+    ASSERT_TRUE(m.store->saveInboundToken(QStringLiteral("only_inbound"),
+                                          QStringLiteral("tok-in")));
+
+    EXPECT_TRUE(m.store->inbound().token(QStringLiteral("only_outbound")).isEmpty())
+        << "the inbound read fell through to the outbound map";
+    EXPECT_FALSE(m.store->inbound().contains(QStringLiteral("only_outbound")));
+
+    EXPECT_TRUE(m.store->getToken(QStringLiteral("only_inbound")).isEmpty())
+        << "the outbound read fell through to the inbound map: a module would "
+           "present a peer's own credential as its own";
+    EXPECT_FALSE(m.store->hasToken(QStringLiteral("only_inbound")));
+    EXPECT_FALSE(m.store->getTokenKeys().contains(QStringLiteral("only_inbound")));
+
+    // The credential is a VALUE, not a key in either map, so no reverse lookup
+    // over either map can produce a name from it.
+    EXPECT_EQ(m.store->credential(), m.cred);
+    EXPECT_FALSE(m.store->inbound().keys().contains(QStringLiteral("core")));
+    EXPECT_FALSE(m.store->inbound().keys().contains(QStringLiteral("capability_module")));
+
+    // An empty inbound value is refused rather than stored: it would read as
+    // PRESENT to contains() while authorizing nothing.
+    EXPECT_FALSE(m.store->saveInboundToken(QStringLiteral("empty_peer"), QString()));
+    EXPECT_FALSE(m.store->inbound().contains(QStringLiteral("empty_peer")));
+}
+
 // ── HOW THIS WAS RUN, AND WHAT IT SAID ──────────────────────────────────────
 //
-// UNMODIFIED c698402 plus this file only — no production edit, so the reds
+// BEFORE — UNMODIFIED c698402 plus this file only (with DirectionProvider still
+// spelling its write `saveToken`, as logos-plugin-qt does today), so the reds
 // below are the shipped behaviour and not a neutered build.
 // `nix build .#checks.x86_64-linux.tests`, x86_64-linux, 24 cores.
 //
@@ -319,3 +375,6 @@ TEST(TokenDirection, AGrantOneWayIsNotAGrantTheOtherWay)
 //
 // The other 509 are untouched, which is the second half of the claim: the
 // collision is reachable from a store nothing else in the suite disturbs.
+//
+// AFTER — see the run recorded at the top of cpp/token_manager.cpp's DIRECTION
+// note and in the change's own report.

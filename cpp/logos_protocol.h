@@ -403,16 +403,62 @@ LP_API char* lp_get_methods(lp_client* client);
 
 /* ---------------------------------------------------------------------------
  * Tokens
+ *
+ * THE WHOLE lp_token_* FAMILY IS THE **OUTBOUND** FAMILY, and this paragraph is
+ * the contract, not a description of today's callers. `module_name` everywhere
+ * below is the module being CALLED, and the value is the token this image will
+ * PRESENT to it. None of these writes authorizes anybody to call US.
+ *
+ * WHY THERE IS NO INBOUND DOOR HERE, and why that is safe rather than an
+ * oversight. Authorization happens in exactly one function — ModuleProxy::
+ * authorize — which exists only where a ModuleProxy is constructed, and across
+ * the fleet that is one production file (logos-plugin-qt's LogosAPIProvider).
+ * A cdylib image has no LogosAPI, no ModuleProxy, and never authorizes
+ * anything; every read of a cdylib's store is an outbound presentation. So an
+ * inbound write from a cdylib is not merely discouraged, it is
+ * UNREPRESENTABLE — which is a stronger guarantee than a doc comment on a door
+ * that exists.
+ *
+ * That includes `logos_module_accept_token` (logos_module_impl.h), whose
+ * generated body in both backends forwards straight to lp_token_save. The Qt
+ * glue calls it from two places with two meanings — forwarding an inbound
+ * caller token, and seeding the module's own anchor — and after the split the
+ * first of those writes a value the cdylib can only ever use outbound, which
+ * the peer then correctly refuses, forcing a real requestModule. That is a
+ * behaviour improvement, not a regression.
+ *
+ * WHAT AN INBOUND DOOR WOULD COST, priced now so nobody discovers it late. A
+ * Qt-free host that authorizes in-image would need
+ * `logos_module_accept_inbound_token` (or lp_token_save_inbound). That is a
+ * MINOR bump here, a declaration that nix/module-impl-abi/extract-exports.sh
+ * picks up automatically, AND a definition in BOTH cdylib backends in the same
+ * wave (logos-cpp-sdk's lidl_gen_cdylib.cpp and logos-rust-sdk's
+ * rustgen_provider.rs). Miss one and it links clean and dies at dlopen with an
+ * undefined symbol — on Linux only, invisible on macOS. logos_module_impl.h
+ * records that this has shipped twice at perfect version agreement. Note also
+ * that the module-impl-abi checks in both SDKs only go red AFTER each bumps its
+ * logos-protocol lock: declaring alone turns nothing red, and that lag is the
+ * real risk.
  * ------------------------------------------------------------------------- */
 
-/** Get the stored token for `module_name`. Returns NULL when absent;
- *  caller frees via lp_string_free.
+/** Get the OUTBOUND token for `module_name` — what this image presents when it
+ *  CALLS `module_name`. Returns NULL when absent; caller frees via
+ *  lp_string_free.
  *
  *  Reads this IMAGE's store — the one lp_client_create uses for every origin
- *  that has not been isolated. For an isolated origin, see lp_token_get_for. */
+ *  that has not been isolated. For an isolated origin, see lp_token_get_for.
+ *
+ *  Does NOT see tokens this image issued to its own callers: those live in the
+ *  inbound half, which has no lp_* reader by design (see above). */
 LP_API char* lp_token_get(const char* module_name);
 
-/** Store a token for `module_name` in this image's store. */
+/** Store the OUTBOUND token for `module_name` — what this image will present
+ *  when it CALLS `module_name`.
+ *
+ *  Storing a token here does not let `module_name` call US. When `module_name`
+ *  is "core" or "capability_module" this also installs the value as this
+ *  store's identity credential, which is how the generated glue's
+ *  logos_module_accept_token("core") seeding keeps working unchanged. */
 LP_API int lp_token_save(const char* module_name, const char* token);
 
 /* --- per-identity token stores ---------------------------------------------
@@ -492,8 +538,8 @@ LP_API int lp_token_reset_identity(const char* identity);
  *  as your own is the elevation this whole surface exists to prevent). */
 LP_API int lp_token_adopt_credential(const char* identity, const char* credential);
 
-/** The module names this image's token store holds, as a JSON array. Caller
- *  frees via lp_string_free.
+/** The module names this image's OUTBOUND token store holds, as a JSON array.
+ *  Caller frees via lp_string_free.
  *
  *  Requires the "token_registry" host service (lp_grant_host_services): an
  *  ungranted image gets NULL. NULL is therefore "refused", never "empty" — a

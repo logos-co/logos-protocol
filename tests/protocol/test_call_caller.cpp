@@ -16,11 +16,13 @@
 //
 // THE THREE REFUSALS, which are the reason the type has an Unknown arm at all:
 //
-//   * A hit in TokenManager under a NON-anchor key names nobody. That store is
-//     direction-MIXED — LogosAPIClient files the token it will PRESENT to a
-//     callee under the CALLEE's name (logos_api_client.cpp:176) — so a reverse
-//     lookup there can name a module we CALL as the module CALLING us. Naming
-//     it would be affirmatively wrong, which is worse than declining.
+//   * A token found ONLY in TokenManager's OUTBOUND half names nobody, and
+//     since the direction split no longer authorizes either. LogosAPIClient
+//     files the token it will PRESENT to a callee under the CALLEE's name
+//     (logos_api_client.cpp:201), so a reverse lookup there could name a module
+//     we CALL as the module CALLING us — affirmatively wrong, worse than
+//     declining. authorize() is now handed an inbound-only view and cannot
+//     reach that half at all.
 //   * A hit on an anchor key names the HOST and carries no module name.
 //     TokenManager::bootstrapKeys() is "core" and "capability_module" holding
 //     one host secret under two keys, so any name from that arm is a coin flip.
@@ -40,8 +42,9 @@
 //       at the Unknown it initialises. 6 passed, 5 FAILED. The four
 //       Unknown-expecting cases survive, which is what makes (a) and (b)
 //       distinguishable rather than two spellings of one detector.
-//   (c) THE MIXED STORE NAMING PEOPLE — a second fold.offer() in the m_store
-//       loop. 10 passed, 1 FAILED (the direction-purity case).
+//   (c) THE STORE'S INBOUND HALF NAMING PEOPLE — a second fold.offer() in
+//       scanIssuedTokens' storeInbound loop. 10 passed, 1 FAILED (the
+//       direction-purity case, before the split made that loop inbound-only).
 //   (d) NO ANCHOR ARM. 9 passed, 2 FAILED — and the second failure is the
 //       interesting one: the tie case reports
 //       {"kind":"module","name":"impostor_module"} for a token that is
@@ -203,17 +206,26 @@ TEST(CallCaller, TheHostAnchorNamesTheHostAndCarriesNoName)
     EXPECT_EQ(provider.seen.find("name"), std::string::npos);
 }
 
-// ── 3. the direction-mixed store names NOBODY ────────────────────────────────
+// ── 3. an OUTBOUND token names nobody because it reaches nobody ──────────────
 //
 // THE REFUSAL THAT MATTERS MOST, and the one an "obvious simplification" would
 // delete. "some_callee" here is exactly the shape LogosAPIClient writes: a token
 // this module holds in order to CALL some_callee, filed under some_callee's
-// name. Reverse-looking-up that store would report some_callee as our CALLER.
+// name. Reverse-looking-up it would report some_callee as our CALLER.
 //
-// RED BEFORE: with a second fold.offer() added to the m_store loop — the
-// one-line "why not name it from there too" — this reports
-// {"kind":"module","name":"some_callee"} and fails.
-TEST(CallCaller, ATokenFoundOnlyInTheDirectionMixedStoreNamesNobody)
+// THIS ASSERTION MOVED, and the move is the point. It used to say the token
+// still AUTHORIZES and merely cannot be NAMED — pre-existing behaviour that the
+// caller-identity work deliberately did not touch. The direction split is the
+// change that touches it: authorize() is handed m_store->inbound() and a
+// credential, so an entry in the outbound half is not reachable, let alone
+// nameable. tests/protocol/test_token_direction.cpp holds the security
+// argument for why that had to move; this file keeps the naming consequence
+// next to the other four refusals.
+//
+// Two assertions rather than one, because either alone would be satisfiable by
+// the wrong mechanism: refusal WITHOUT the Unknown document would mean the
+// scope never opened, and Unknown WITHOUT the refusal is the old behaviour.
+TEST(CallCaller, AnOutboundTokenNeitherAuthorizesNorNames)
 {
     ensureCallerApp();
     TokenManager& store = privateStore(QStringLiteral("caller_mixed_store_no_name"));
@@ -226,10 +238,11 @@ TEST(CallCaller, ATokenFoundOnlyInTheDirectionMixedStoreNamesNobody)
     CallerProbeProvider provider;
     ModuleProxy proxy(&provider, nullptr, &store);
 
-    // It still AUTHORIZES — that is pre-existing behaviour and this change does
-    // not touch it. It simply cannot NAME anyone.
-    ASSERT_TRUE(dispatched(proxy.callRemoteMethod(outbound, QStringLiteral("work"), {})));
-    EXPECT_EQ(provider.seen, kUnknown);
+    EXPECT_FALSE(dispatched(proxy.callRemoteMethod(outbound, QStringLiteral("work"), {})))
+        << "a token we hold in order to CALL some_callee authorized some_callee "
+           "to call US";
+    EXPECT_EQ(provider.calls, 0);
+    EXPECT_EQ(provider.seen, std::string());   // never dispatched, never scoped
 }
 
 // ── 4. an operator token names nobody ────────────────────────────────────────

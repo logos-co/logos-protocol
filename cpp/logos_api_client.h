@@ -345,6 +345,10 @@ public:
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
 
     TokenManager* getTokenManager() const;
+    // The OUTBOUND token for `module_name`: what this client presents when it
+    // CALLS `module_name`. Never a token some caller was issued to call US —
+    // that half of the store has no reader here, by construction (see the
+    // DIRECTION note in token_manager.h).
     QString getToken(const QString& module_name);
 
     // nlohmann::json overloads — args is a JSON array, result is a JSON value.

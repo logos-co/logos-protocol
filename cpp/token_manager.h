@@ -245,9 +245,81 @@ public:
      */
     static bool resetIdentity(const QString& identity);
 
+    /* ── DIRECTION: three roles, and they are three different things ─────────
+     *
+     *   OUTBOUND    callee -> the token I present when I call that callee.
+     *               Written by LogosAPIClient on the first exchange
+     *               (logos_api_client.cpp:201, async twin :357) and read back
+     *               at :124 / :313. Keyed by the module I am CALLING.
+     *   INBOUND     caller -> the token I issued to that caller, which it
+     *               presents when it calls ME. Written by the provider's
+     *               informModuleToken. Keyed by the module CALLING me.
+     *   CREDENTIAL  MY OWN host-issued credential. One value, not a map — see
+     *               credential() below for why that is a finding rather than a
+     *               choice.
+     *
+     * WHAT SHARING ONE MAP COST. Until this split all three lived in one flat
+     * QHash<QString,QString> with no direction tag, and ModuleProxy::authorize
+     * accepted anything in it. So a token cached in order to CALL x authorized x
+     * to call ME: capability_module mints ONE value for <m -> b>, m caches it
+     * outbound under "b" and b records it inbound under "m", after which b may
+     * call m and m accepts — no handshake, nothing logged, and
+     * capability_module's access policy never consulted. The grant graph the
+     * policy is written against is directed; the enforcement was not. Reachable
+     * in the DEFAULT topology, not only under single-image: a module loaded by
+     * logos-module-loader-qt runs in its own process and one TokenManager there
+     * takes all three writes. tests/protocol/test_token_direction.cpp is the
+     * detector, with the numbers.
+     *
+     * WHAT KEEPS IT SPLIT, and it is not anyone remembering to:
+     *
+     *   * ModuleProxy::authorize is handed an InboundView and a credential
+     *     STRING — never a TokenManager* — so no expression inside the scan can
+     *     name THIS PROXY'S outbound map. That is a property of the injected
+     *     store, NOT of the class: TokenManager::instance() is a public static,
+     *     so any code that wants the process-wide outbound map can still reach
+     *     it in one expression. What the scan cannot do is reach it by
+     *     ACCIDENT, which is the failure this split is about — the pre-split
+     *     hole was one map serving both directions, not a deliberate lookup.
+     *   * getToken() never falls through to the inbound map, so a token some
+     *     caller was issued can never be presented as if it were ours.
+     *
+     * WHY THE UNADORNED SPELLINGS ARE THE OUTBOUND ONES. saveToken / getToken /
+     * hasToken / removeToken / getTokenKeys / tokenCount keep meaning OUTBOUND,
+     * deliberately: a future writer who reaches for the familiar name intending
+     * an inbound grant grants NOTHING, and the failure is a single visibly
+     * rejected call. The opposite default would over-grant, silently.
+     *
+     * THE ONE CHANGE THAT MUST NEVER BE MADE: a read-side fall-through between
+     * the two halves. One line puts the collision back and it would look like a
+     * convenience.
+     */
+
     /**
-     * @brief Save a token with the given key
-     * @param key The identifier for the token
+     * @brief Save an OUTBOUND token: what I present when I call `key`.
+     *
+     * `key` is the module I am CALLING. This does NOT authorize `key` to call
+     * me — see saveInboundToken() for that, and the DIRECTION note above for
+     * why reaching for this one by mistake fails closed.
+     *
+     * THE CREDENTIAL SHIM: when `key` is one of bootstrapKeys() this ALSO
+     * installs `token` as this store's credential(), which is what lets every
+     * existing anchor writer keep working untouched — logos-module-loader-qt's
+     * module_initializer.cpp:169-170, logos-plugin-qt's
+     * seedHandshakeTrustAnchor and its generated glue's
+     * logos_module_accept_token("core")/("capability_module"), logos-qt-sdk's
+     * LpBridge::syncFromApi. Retire the shim by moving those four to
+     * adoptCredential(); until then this is the only reason they are not a
+     * same-wave breaking change.
+     *
+     * The shim cannot be abused into re-creating the collision by caching a
+     * per-target token for a module literally NAMED "core" or
+     * "capability_module": LogosAPIClient only ever writes here after a MISS on
+     * getToken(objectName) (logos_api_client.cpp:124), and a store that has a
+     * credential answers both those names non-empty, so :201 is never reached
+     * for them. A store with no credential has nothing to clobber.
+     *
+     * @param key The CALLEE this token is for
      * @param token The token value to store
      */
     void saveToken(const QString& key, const QString& token);
@@ -264,8 +336,14 @@ public:
     void saveToken(const std::string& key, const std::string& token);
 
     /**
-     * @brief Retrieve a token by key
-     * @param key The identifier for the token
+     * @brief Retrieve an OUTBOUND token: what I present when I call `key`.
+     *
+     * Reads the outbound half and the outbound half ONLY. It does not fall
+     * through to the inbound map, and must never be made to: a token a caller
+     * was issued is that caller's to present, not ours, and answering it here
+     * would let any module present a peer's credential as its own.
+     *
+     * @param key The CALLEE whose token to look up
      * @return QString The token value, or empty string if not found
      */
     QString getToken(const QString& key) const;
@@ -324,8 +402,12 @@ public:
     void clearAllTokens();
 
     /**
-     * @brief Get all token keys
-     * @return QList<QString> List of all token keys
+     * @brief Every OUTBOUND key: the modules this store can call.
+     *
+     * The roster lp_token_keys() publishes (gated on the "token_registry" host
+     * service). Inbound callers are NOT here — see inbound().keys().
+     *
+     * @return QList<QString> List of all outbound token keys
      */
     QList<QString> getTokenKeys() const;
 
@@ -340,10 +422,110 @@ public:
     std::vector<std::string> getTokenKeysStd() const;
 
     /**
-     * @brief Get the number of stored tokens
-     * @return int Number of tokens stored
+     * @brief Get the number of OUTBOUND tokens stored.
+     * @return int Number of outbound tokens stored
      */
     int tokenCount() const;
+
+    /* ── the INBOUND half ────────────────────────────────────────────────────
+     *
+     * caller -> the token THIS store issued to that caller. The only store here
+     * that can honestly answer "who is calling me", and the only one
+     * ModuleProxy::authorize is allowed to see.
+     */
+
+    /**
+     * @brief A read-only handle onto the INBOUND half, and only the inbound
+     *        half.
+     *
+     * THIS IS THE MECHANISM, not a convenience wrapper. The authorization scan
+     * receives one of these instead of the TokenManager it came from, so the
+     * outbound accessors are not merely the wrong choice there — they cannot be
+     * named at all. A rename would have relied on every future caller choosing
+     * correctly; this does not.
+     *
+     * Copyable and non-owning: it is a pointer to a store whose address is
+     * stable for the lifetime of the image (see forIdentity()). Only
+     * TokenManager::inbound() can make one.
+     */
+    class InboundView
+    {
+    public:
+        /** @brief The token issued to `caller`, or empty. NEVER falls through
+         *         to the outbound map — that fall-through IS the bug this
+         *         split removes. */
+        inline QString token(const QString& caller) const;
+        /** @brief Every caller this store has issued a token to. */
+        inline QStringList keys() const;
+        /** @brief Whether `caller` has been issued a token. */
+        inline bool contains(const QString& caller) const;
+        /** @brief How many callers have been issued a token. */
+        inline int count() const;
+
+    private:
+        friend class TokenManager;
+        explicit InboundView(const TokenManager* owner) : m_owner(owner) {}
+        const TokenManager* m_owner;
+    };
+
+    /** @brief The inbound-only handle. See InboundView. */
+    InboundView inbound() const { return InboundView(this); }
+
+    /**
+     * @brief Record that `caller` may present `token` when calling ME.
+     *
+     * The INBOUND door. Its one production writer is the provider's
+     * informModuleToken (logos-plugin-qt LogosProviderBase::informModuleToken
+     * and QtProviderObject::informModuleToken), reached only through
+     * ModuleProxy::informModuleToken, which admits nothing that did not
+     * authenticate on the trusted core/capability channel first.
+     *
+     * Refuses an empty caller or an empty token, for the same reason
+     * ModuleProxy::saveToken does: an empty value reads as PRESENT to
+     * inbound().contains() while authorizing nothing.
+     *
+     * @return true if it was recorded
+     */
+    bool saveInboundToken(const QString& caller, const QString& token);
+
+    /**
+     * @brief saveInboundToken — const char* overload.
+     *
+     * Not sugar: without it a literal pair is AMBIGUOUS between the QString and
+     * std::string overloads and every `saveInboundToken("a", "b")` fails to
+     * compile, exactly as saveToken's own const char* overload exists to
+     * prevent. Found by building logos-qt-sdk's tests against this header, not
+     * by reading it.
+     */
+    bool saveInboundToken(const char* caller, const char* token)
+        { return saveInboundToken(QString(caller), QString(token)); }
+
+    /** @brief saveInboundToken — std::string overload. */
+    bool saveInboundToken(const std::string& caller, const std::string& token);
+
+    /**
+     * @brief THIS store's own host-issued credential — the trust anchor.
+     *
+     * A VALUE, not a map, and that is a finding rather than a design choice.
+     * The anchor is genuinely both directions — presented outbound to
+     * capability_module (logos_api_client.cpp:164/:341) and compared against
+     * inbound (module_proxy.cpp's informModuleToken gate and authorize's
+     * anchorHits) — which is exactly why it resists a two-way split and exactly
+     * why it must not be a third MAP: a key living in two maps is a rename.
+     *
+     * It already was one value under two names. adoptCredential() writes ONE
+     * credential under EVERY bootstrapKeys() key, those keys are role labels
+     * rather than module names (token_manager.cpp:38-45), and
+     * logos_caller_scope.h forbids the host arm from carrying a name for
+     * precisely that reason. Making it a scalar is what it already is.
+     *
+     * And it is what dissolves the objection: a scalar has no key namespace, so
+     * no reverse lookup can produce a NAME from it, and neither map contains it.
+     *
+     * Written by adoptCredential(), and by saveToken() under a bootstrap key
+     * (the shim documented there).
+     */
+    QString credential() const;
 
 signals:
     /**
@@ -395,37 +577,85 @@ private:
     TokenManager(const TokenManager&) = delete;
     TokenManager& operator=(const TokenManager&) = delete;
 
+    /* ONE MEMBER BECAME THREE, AND THAT IS SAFE HERE IN A WAY IT IS NOT IN
+     * LogosAPI (see the warning at logos_api.h:329). Nothing outside this class
+     * can touch these: the constructor is private, so no consumer ever
+     * allocates a TokenManager and none needs sizeof(); and no inline method in
+     * this header reads a member — the const char* overloads delegate to
+     * out-of-line ones, inbound() only takes `this`, and InboundView's inline
+     * bodies forward to out-of-line private methods. Every access therefore
+     * goes through a symbol the owning image exports, so a consumer compiled
+     * against the old header keeps working against the new library. The
+     * forIdentity() note above avoided touching the layout because it had no
+     * reason to; this has one, and pays no ABI cost for it. */
+
     /**
-     * @brief Hash map storing tokens by key.
+     * @brief OUTBOUND: callee name -> the token I present when calling it.
      *
-     * DIRECTION-MIXED, AND THEREFORE NEVER A CALLER ORACLE. One flat map with no
-     * direction tag, written from both sides of every relationship:
+     * NEVER read by ModuleProxy. That is enforced by authorize() being handed
+     * an InboundView and a credential string rather than this object — see the
+     * DIRECTION note on the public surface above.
      *
-     *   * OUTBOUND — LogosAPIClient stores the token it will PRESENT to a callee
-     *     under the CALLEE's name (logos_api_client.cpp:176, async twin :332).
-     *   * INBOUND — a token RECEIVED from a caller is stored under the CALLER's
-     *     name (lp_module_accept_token -> logos_protocol.cpp:635, and
-     *     LogosProviderBase::informModuleToken in logos-plugin-qt).
-     *
-     * Same key namespace, last write wins. So a reverse lookup here — "which key
-     * holds this token, therefore who is calling me" — can name a module we CALL
-     * as the module CALLING us. That is affirmatively wrong, and worse than
-     * declining to answer. ModuleProxy::m_tokens is the caller-keyed,
-     * inbound-only record; anything that needs to NAME a caller uses that.
-     *
-     * The two directions do not currently collide in the DEFAULT topology, but
-     * only by accident of linkage: a module cdylib links its own copy of this
-     * library, so its outbound writes land in the cdylib image's instance()
-     * while the host image's store takes the inbound ones. Any single-image
-     * configuration — an in-process plugin host, the shared-runtime migration,
-     * this test suite — puts both in one map again.
+     * Still not a caller oracle, and could not become one even now that it is
+     * direction-pure: its keys name modules we CALL.
      */
-    QHash<QString, QString> m_tokens;
+    QHash<QString, QString> m_outbound;
+
+    /**
+     * @brief INBOUND: caller name -> the token I issued to that caller.
+     *
+     * Direction-pure by construction — saveInboundToken() is the only writer —
+     * which is what makes it safe for the authorization scan. Reachable for
+     * reading only through InboundView.
+     */
+    QHash<QString, QString> m_inbound;
+
+    /**
+     * @brief This store's own host-issued credential. See credential().
+     *
+     * One value with two names, not a map: no key namespace, therefore nothing
+     * a reverse lookup can turn into a module name.
+     */
+    QString m_credential;
 
     /**
      * @brief Mutex for thread-safe access to tokens
      */
     mutable QMutex m_mutex;
+
+    /* The inbound reads, private so InboundView is the only way to reach them.
+     * A nested class is a member and has access to the enclosing class's
+     * private members, so no friend declaration is needed and no second public
+     * spelling of the inbound half exists to be picked by accident. */
+    QString inboundValue(const QString& caller) const;
+    QStringList inboundKeyList() const;
+    bool inboundContains(const QString& caller) const;
+    int inboundCount() const;
+
+    /* Recompute m_credential from whatever bootstrap keys the outbound map
+     * still holds. Called with m_mutex held, after a removal, so the two names
+     * and the one value cannot drift apart. */
+    void resyncCredentialLocked();
 };
+
+inline QString TokenManager::InboundView::token(const QString& caller) const
+{
+    return m_owner->inboundValue(caller);
+}
+
+inline QStringList TokenManager::InboundView::keys() const
+{
+    return m_owner->inboundKeyList();
+}
+
+inline bool TokenManager::InboundView::contains(const QString& caller) const
+{
+    return m_owner->inboundContains(caller);
+}
+
+inline int TokenManager::InboundView::count() const
+{
+    return m_owner->inboundCount();
+}
 
 #endif // TOKEN_MANAGER_H 

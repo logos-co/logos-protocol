@@ -84,8 +84,9 @@ public:
     using TokenValidator = std::function<bool(const QString& token,
                                               const QString& transportProtocol)>;
 
-    // `token_store` is the store this proxy AUTHORIZES AGAINST — the host
-    // anchors plus whatever else the host seeded for this provider's identity.
+    // `token_store` is the store this proxy AUTHORIZES AGAINST — specifically
+    // its INBOUND half and its CREDENTIAL; the outbound half is never consulted
+    // (TokenManager's DIRECTION note explains what that closed).
     // It must be the same store the provider's own informModuleToken writes to,
     // which for the Qt stack is LogosAPI::getTokenManager() ==
     // TokenManager::forIdentity(<this module's name>), NOT the ambient
@@ -129,9 +130,11 @@ signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
 
 private:
-    // Returns true when authToken matches a token THIS module has been told about
-    // (via saveToken / informModuleToken), or one held in this proxy's token
-    // store, OR the host-installed validator accepts it for `transportProtocol`.
+    // Returns true when authToken matches a token THIS module has been told
+    // about (via saveToken / informModuleToken), or one in the INBOUND half of
+    // this proxy's token store, or this identity's own credential, OR the
+    // host-installed validator accepts it for `transportProtocol`. The store's
+    // OUTBOUND half is deliberately not among them — see scanIssuedTokens().
     // Empty/unknown tokens are rejected. The built-in comparison is constant-time
     // and never early-outs, so neither a correct prefix nor the number of issued
     // tokens leaks through timing.
@@ -165,11 +168,18 @@ private:
     // informModuleToken(), both of which key by the CALLER — which is what makes
     // it the only store here that can honestly NAME a caller.
     //
-    // Do not reverse-look-up m_store for that. TokenManager is direction-MIXED:
-    // LogosAPIClient writes the token we will PRESENT to a callee under the
-    // CALLEE's name (logos_api_client.cpp:176), while inbound tokens are written
-    // under the CALLER's name. A hit there may name a module we CALL as the
-    // module CALLING us, which is affirmatively wrong and worse than unknown.
+    // NOT the only inbound record any more, and still the only NAMING one.
+    // TokenManager now has an inbound half of its own (m_store->inbound()),
+    // written by the provider; authorize() scans it but takes no name from it,
+    // because in the Qt stack the same (caller, token) pair lands in both and
+    // folding both would make every ordinary caller ambiguous. See
+    // scanIssuedTokens() in module_proxy.cpp.
+    //
+    // Never reverse-look-up m_store's OUTBOUND half for a caller name — and
+    // note that authorize() is no longer given anything that could: the
+    // outbound map holds the token we will PRESENT to a callee, filed under the
+    // CALLEE's name (logos_api_client.cpp:201), so a hit there would name a
+    // module we CALL as the module CALLING us.
     QHash<QString, QString> m_tokens;
     // Never null after construction; see the constructor comment.
     //

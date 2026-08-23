@@ -57,10 +57,10 @@ namespace {
 bool isHostAnchorValue(const QString& value)
 {
     if (value.isEmpty()) return false;
-    for (const QString& key : TokenManager::bootstrapKeys()) {
-        if (TokenManager::instance().getToken(key) == value) return true;
-    }
-    return false;
+    // credential(), not getToken(bootstrapKey): the anchor is ONE value under
+    // two role labels, and asking for it by that name is what stops this from
+    // being a reverse lookup over a key namespace.
+    return TokenManager::instance().credential() == value;
 }
 
 } // namespace
@@ -172,12 +172,8 @@ QStringList TokenManager::identitiesSharingHostAnchor()
     for (const QString& name : names) {
         TokenManager& store = forIdentity(name);
         if (&store == &instance()) continue;
-        for (const QString& key : bootstrapKeys()) {
-            if (isHostAnchorValue(store.getToken(key))) {
-                out.append(name);
-                break;
-            }
-        }
+        if (isHostAnchorValue(store.credential()))
+            out.append(name);
     }
     out.sort();
     return out;
@@ -208,7 +204,14 @@ TokenManager::~TokenManager()
 void TokenManager::saveToken(const QString& key, const QString& token)
 {
     QMutexLocker locker(&m_mutex);
-    m_tokens[key] = token;
+    m_outbound[key] = token;
+    // THE CREDENTIAL SHIM. See the note at the declaration: this is what keeps
+    // every existing anchor writer working while the credential becomes a value
+    // of its own. It writes the credential IN ADDITION TO the outbound entry,
+    // never instead of it, because getToken("core") is still how
+    // ModuleProxy::informModuleToken's callers and LogosAPIClient's
+    // capability-handshake read it.
+    if (bootstrapKeys().contains(key)) m_credential = token;
     emit tokenSaved(key);
 }
 
@@ -220,7 +223,10 @@ void TokenManager::saveToken(const std::string& key, const std::string& token)
 QString TokenManager::getToken(const QString& key) const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.value(key, QString());
+    // m_outbound only. A fall-through to m_inbound here would hand every module
+    // its peers' credentials to present as its own — the same collision this
+    // split removes, running the other way.
+    return m_outbound.value(key, QString());
 }
 
 std::string TokenManager::getToken(const std::string& key) const
@@ -231,7 +237,7 @@ std::string TokenManager::getToken(const std::string& key) const
 bool TokenManager::hasToken(const QString& key) const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.contains(key);
+    return m_outbound.contains(key);
 }
 
 bool TokenManager::hasToken(const std::string& key) const
@@ -242,8 +248,14 @@ bool TokenManager::hasToken(const std::string& key) const
 bool TokenManager::removeToken(const QString& key)
 {
     QMutexLocker locker(&m_mutex);
-    if (m_tokens.contains(key)) {
-        m_tokens.remove(key);
+    if (m_outbound.contains(key)) {
+        m_outbound.remove(key);
+        // One value, two names: dropping one of them must not leave the
+        // credential asserting a value the store no longer holds under any
+        // bootstrap key. LogosAPIClient removes a rejected per-target token on
+        // the re-exchange path (logos_api_client.cpp:139/:293), so this is
+        // reachable from ordinary traffic rather than only from teardown.
+        if (bootstrapKeys().contains(key)) resyncCredentialLocked();
         emit tokenRemoved(key);
         return true;
     }
@@ -258,22 +270,29 @@ bool TokenManager::removeToken(const std::string& key)
 void TokenManager::clearAllTokens()
 {
     QMutexLocker locker(&m_mutex);
-    m_tokens.clear();
+    // ALL THREE. resetIdentity() documents that the credential goes too — a
+    // reload re-mints and re-registers, so a surviving credential would be a
+    // locked-out reload wearing the appearance of a working one — and the
+    // inbound record must go for the same reason: it names the callers of the
+    // PREVIOUS incarnation.
+    m_outbound.clear();
+    m_inbound.clear();
+    m_credential.clear();
     emit allTokensCleared();
 }
 
 QList<QString> TokenManager::getTokenKeys() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.keys();
+    return m_outbound.keys();
 }
 
 std::vector<std::string> TokenManager::getTokenKeysStd() const
 {
     QMutexLocker locker(&m_mutex);
     std::vector<std::string> keys;
-    keys.reserve(static_cast<size_t>(m_tokens.size()));
-    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+    keys.reserve(static_cast<size_t>(m_outbound.size()));
+    for (auto it = m_outbound.constBegin(); it != m_outbound.constEnd(); ++it)
         keys.push_back(it.key().toStdString());
     return keys;
 }
@@ -281,5 +300,74 @@ std::vector<std::string> TokenManager::getTokenKeysStd() const
 int TokenManager::tokenCount() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.size();
+    return m_outbound.size();
+}
+
+/* ── the INBOUND half ───────────────────────────────────────────────────────
+ *
+ * Separate bodies rather than a direction parameter on the existing ones: a
+ * parameter is a value a caller can get wrong (and default), while a separate
+ * name is a symbol that either resolves or does not.
+ */
+
+bool TokenManager::saveInboundToken(const QString& caller, const QString& token)
+{
+    // Both refusals mirror ModuleProxy::saveToken. An empty token is the one
+    // that matters: it would read as PRESENT to inbound().contains() while
+    // authorizing nothing, which is the worst of both.
+    if (caller.isEmpty() || token.isEmpty()) return false;
+    QMutexLocker locker(&m_mutex);
+    m_inbound[caller] = token;
+    return true;
+}
+
+bool TokenManager::saveInboundToken(const std::string& caller, const std::string& token)
+{
+    return saveInboundToken(QString::fromStdString(caller),
+                            QString::fromStdString(token));
+}
+
+QString TokenManager::credential() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_credential;
+}
+
+QString TokenManager::inboundValue(const QString& caller) const
+{
+    QMutexLocker locker(&m_mutex);
+    // m_inbound only, and this is THE line the split exists to keep honest: no
+    // fall-through to m_outbound, however convenient it would look on the day
+    // some caller comes up empty here.
+    return m_inbound.value(caller, QString());
+}
+
+QStringList TokenManager::inboundKeyList() const
+{
+    QMutexLocker locker(&m_mutex);
+    return QStringList(m_inbound.keyBegin(), m_inbound.keyEnd());
+}
+
+bool TokenManager::inboundContains(const QString& caller) const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_inbound.contains(caller);
+}
+
+int TokenManager::inboundCount() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_inbound.size();
+}
+
+void TokenManager::resyncCredentialLocked()
+{
+    for (const QString& key : bootstrapKeys()) {
+        const QString value = m_outbound.value(key, QString());
+        if (!value.isEmpty()) {
+            m_credential = value;
+            return;
+        }
+    }
+    m_credential.clear();
 } 

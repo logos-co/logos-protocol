@@ -344,11 +344,12 @@ add_executable(protocol_tests
     # "unknown method" (no silent shadowing), and the listing agrees with what
     # is callable -- plus the auth gate, which introspection deliberately lacks.
     test_module_identity.cpp
-    # The INBOUND token store. ModuleProxy::m_tokens is the only caller-keyed,
-    # inbound-only record here, and it had ZERO production writers: every real
-    # authorization decision came out of TokenManager, which is direction-mixed
-    # (outbound tokens keyed by callee sit in the same flat map as inbound ones
-    # keyed by caller). Two detectors, one per mechanism —
+    # The INBOUND token store. ModuleProxy::m_tokens is the proxy's own
+    # caller-keyed record, and it had ZERO production writers: every real
+    # authorization decision came out of TokenManager, which was then
+    # direction-mixed (outbound tokens keyed by callee sat in the same flat map
+    # as inbound ones keyed by caller; test_token_direction.cpp split it). Two
+    # detectors, one per mechanism —
     # AnInformedTokenLandsInTheProxysOwnStore fails when informModuleToken does
     # not record, AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy fails when
     # isAuthorized scans TokenManager::instance() instead of the proxy's own
@@ -360,16 +361,20 @@ add_executable(protocol_tests
     # by-product of the authorization scan. Production of the caller
     # DOCUMENT and its lifetime on the dispatching thread only — nothing
     # in this repo delivers it into a module cdylib yet. Most of the file
-    # is about the three cases that must REFUSE to name anyone; the
-    # direction-mixed-store case is the one an obvious simplification
-    # would delete.
+    # is about the cases that must REFUSE to name anyone; the outbound-token
+    # case is the one an obvious simplification would delete, and since the
+    # direction split it asserts a refusal to AUTHORIZE as well.
     test_call_caller.cpp
     # An isolated identity's OWN credential: the store is born empty, the host
     # mints/registers/adopts, and both halves — no host anchor, and no lockout —
     # are asserted against real ModuleProxy authorization. See the file header
     # for the two neutered builds that make each half a detector.
     test_consumer_credential.cpp
-    # DIRECTION: outbound vs inbound in one store. The detector for the split.
+    # DIRECTION: outbound vs inbound in one store. The detector for the split,
+    # and the pins that say what the split must not break. Three of its
+    # assertions also detect whether logos-plugin-qt's companion one-line move
+    # (informModuleToken -> saveInboundToken) has landed; see the note on
+    # DirectionProvider.
     test_token_direction.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under

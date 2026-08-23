@@ -8,12 +8,14 @@
 //                     writer is saveToken(from_module_name, token)), but with
 //                     ZERO production writers anywhere in the workspace. In a
 //                     real process it was permanently empty.
-//   * TokenManager  — direction-MIXED. LogosAPIClient writes the token it will
-//                     PRESENT to a callee under the CALLEE's name
-//                     (logos_api_client.cpp:176); lp_module_accept_token writes
-//                     a token RECEIVED from a caller under the CALLER's name
-//                     (logos_protocol.cpp:635). One flat QHash<QString,QString>
-//                     with no direction tag, last write wins.
+//   * TokenManager  — direction-MIXED AT THE TIME. LogosAPIClient wrote the
+//                     token it will PRESENT to a callee under the CALLEE's name
+//                     (logos_api_client.cpp:201) into the same flat
+//                     QHash<QString,QString> that took a token RECEIVED from a
+//                     caller under the CALLER's name. Last write won. That map
+//                     is now two maps and a credential — see the DIRECTION note
+//                     in cpp/token_manager.h — but everything below was written
+//                     against the mixed version and is described as it was.
 //
 // So every inbound authorization decision rested on a store that also holds
 // outbound tokens, and the store that could not hold an outbound token was
@@ -64,12 +66,15 @@
 // on every build above, including (a). Do not read them as evidence of anything
 // this change added.
 //
-// WHAT IS DELIBERATELY NOT HERE. There is no assertion that a token found ONLY
-// in TokenManager is refused. It is still accepted, exactly as before — the
-// host anchors and every bootstrap seed live there and nothing else authorizes
-// them. This change adds a second, direction-pure record; it does not take the
-// mixed store out of the authorization scan, and doing so would be a behaviour
-// break rather than a bug fix.
+// WHAT USED TO BE DELIBERATELY NOT HERE, AND WHERE IT WENT. This file
+// originally declined to assert that a token found ONLY in TokenManager is
+// refused, on the grounds that taking the mixed store out of the scan would be
+// a behaviour break rather than a bug fix. It was both: the direction split
+// (tests/protocol/test_token_direction.cpp) took the OUTBOUND half out, and the
+// two halves that remain — the store's own inbound record and its credential —
+// are what the cases below exercise. The store this file's RecordingProvider
+// writes is now the inbound half, which is why nothing here needed to change
+// beyond the door it spells.
 
 #include <gtest/gtest.h>
 
@@ -98,9 +103,10 @@ QCoreApplication* ensureInboundApp() {
 //
 // It writes into a store handed to it at construction, which is what makes the
 // isolation case reproducible in-process: this is the stand-in for
-// LogosProviderBase::informModuleToken, whose real body is
-// `m_logosAPI->getTokenManager()->saveToken(moduleName, token)` and whose real
-// store is TokenManager::forIdentity(<this module's name>).
+// LogosProviderBase::informModuleToken, whose store is
+// TokenManager::forIdentity(<this module's name>). It writes through the
+// INBOUND door, which is the door that repo owes the same move to; see the note
+// on DirectionProvider in test_token_direction.cpp.
 class RecordingProvider : public LogosProviderObject {
 public:
     explicit RecordingProvider(TokenManager* store) : m_store(store) {}
@@ -110,7 +116,7 @@ public:
         return QVariant();
     }
     bool informModuleToken(const QString& moduleName, const QString& token) override {
-        if (m_store) m_store->saveToken(moduleName, token);
+        if (m_store) m_store->saveInboundToken(moduleName, token);
         ++informs;
         return acceptPushes;
     }
@@ -313,13 +319,21 @@ TEST(InboundTokenStore, AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy)
     TokenManager& isolated = TokenManager::forIdentity(identity);
     ASSERT_NE(&isolated, &TokenManager::instance());
 
-    // Planted in the AMBIENT ring only. The key is deliberately not a bootstrap
-    // key: those now hold the identity's OWN credential, which is a different
-    // value from the host's by construction, so a bootstrap key would prove the
-    // same thing less directly.
+    // Planted in the AMBIENT ring only, through the INBOUND door — this test is
+    // about WHICH STORE is scanned, not about direction, so it plants the kind
+    // of token that authorizes. Written with saveToken() it would now be
+    // refused by both proxies for the unrelated reason that an outbound entry
+    // never authorizes (test_token_direction.cpp), and the control below would
+    // stop being a control.
+    //
+    // The key is deliberately not a bootstrap key: those now hold the
+    // identity's OWN credential, which is a different value from the host's by
+    // construction, so a bootstrap key would prove the same thing less
+    // directly.
     const QString ambientOnly = QStringLiteral("inbound-token-ambient-only");
-    TokenManager::instance().saveToken(QStringLiteral("some_other_module"), ambientOnly);
-    ASSERT_TRUE(isolated.getToken(QStringLiteral("some_other_module")).isEmpty());
+    ASSERT_TRUE(TokenManager::instance().saveInboundToken(
+        QStringLiteral("some_other_module"), ambientOnly));
+    ASSERT_TRUE(isolated.inbound().token(QStringLiteral("some_other_module")).isEmpty());
 
     RecordingProvider provider(&isolated);
     ModuleProxy proxy(&provider, /*parent=*/nullptr, &isolated);
@@ -344,8 +358,12 @@ TEST(InboundTokenStore, TheDefaultStoreIsStillTheAmbientRing)
     ensureInboundApp();
     seedTrustAnchor();
 
+    // Through the inbound door, for the reason spelled out in test 5: the claim
+    // here is about which STORE a defaulted ModuleProxy scans, and it would be
+    // masked by the direction refusal if the token were planted outbound.
     const QString planted = QStringLiteral("inbound-token-default-store");
-    TokenManager::instance().saveToken(QStringLiteral("planted_module"), planted);
+    ASSERT_TRUE(TokenManager::instance().saveInboundToken(
+        QStringLiteral("planted_module"), planted));
 
     RecordingProvider provider(&TokenManager::instance());
     ModuleProxy proxy(&provider);
