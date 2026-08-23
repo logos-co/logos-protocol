@@ -369,6 +369,8 @@ add_executable(protocol_tests
     # are asserted against real ModuleProxy authorization. See the file header
     # for the two neutered builds that make each half a detector.
     test_consumer_credential.cpp
+    # DIRECTION: outbound vs inbound in one store. The detector for the split.
+    test_token_direction.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).
