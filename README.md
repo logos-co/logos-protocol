@@ -48,9 +48,14 @@ merely labelling the caller, and `isolateIdentity(origin)` is how a host opts a
 name in (`lp_token_isolate_identity` and friends from C). Both are additive and
 inert by default: until a name is isolated, `forIdentity()` returns the *same
 object* `instance()` returns, so a host that knows nothing about this is
-unchanged. A private store is seeded with the trust-root bootstrap (`core`,
-`capability_module`) so first-call `requestModule` still works, and with nothing
-else.
+unchanged. A private store is created **empty** — it does *not* inherit this
+image's `core` / `capability_module` tokens, which are the *host's* credential
+and would let the identity authorize as the host. The host mints a credential
+for the identity, registers it with `capability_module`, and installs it under
+the bootstrap keys with `TokenManager::adoptCredentialFor` /
+`lp_token_adopt_credential`, which is what makes first-call `requestModule` work
+— as that identity rather than as the host. `logos::admitConsumer`
+(logos-plugin-qt) is the one place that performs those three steps in order.
 
 This is a second axis, not a replacement for the per-**image** split: a module
 cdylib links its own copy of this library and therefore has its own

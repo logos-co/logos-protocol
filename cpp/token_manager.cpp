@@ -38,10 +38,32 @@ StoreRegistry& registry()
 QStringList TokenManager::bootstrapKeys()
 {
     // "capability_module" authenticates the requestModule handshake itself;
-    // "core" is the host-side channel ModuleProxy::informModuleToken accepts as
-    // trusted. Both are pre-seeded by every host before any module loads.
+    // "core" is the channel ModuleProxy::informModuleToken accepts as trusted.
+    // These are the keys an identity's OWN credential is installed under by
+    // adoptCredential(); they are no longer copied from anywhere.
     return QStringList{QStringLiteral("core"), QStringLiteral("capability_module")};
 }
+
+namespace {
+
+// Is `value` the HOST's anchor — the value instance() holds under a bootstrap
+// key? Used to refuse an adoption that would re-create the copy this change
+// removes, and to report identities that acquired it some other way.
+//
+// A plain == rather than a constant-time compare, deliberately: this is a
+// host-side administrative check between two values the HOST already holds, not
+// an authorization decision on an attacker-supplied token. The constant-time
+// path is ModuleProxy::authorize and stays there.
+bool isHostAnchorValue(const QString& value)
+{
+    if (value.isEmpty()) return false;
+    for (const QString& key : TokenManager::bootstrapKeys()) {
+        if (TokenManager::instance().getToken(key) == value) return true;
+    }
+    return false;
+}
+
+} // namespace
 
 TokenManager& TokenManager::forIdentity(const QString& identity)
 {
@@ -56,20 +78,26 @@ TokenManager& TokenManager::forIdentity(const QString& identity)
 
     auto it = registry().stores.find(identity);
     if (it == registry().stores.end()) {
-        // Seed BEFORE publishing into the hash, so no caller can ever observe a
-        // private store that has not been bootstrapped yet — and so the only
-        // saveToken() issued under the registry lock is on an object nobody else
-        // holds a handle to. That second part matters: saveToken emits
-        // tokenSaved, and an emit under a lock is a re-entrancy hazard in
-        // general. Here it cannot be one, because a brand-new unpublished store
-        // has no connections for the emit to reach.
-        TokenManager* store = new TokenManager(nullptr);
-        for (const QString& key : bootstrapKeys()) {
-            const QString token = instance().getToken(key);
-            if (!token.isEmpty())
-                store->saveToken(key, token);
-        }
-        it = registry().stores.insert(identity, store);
+        // BORN EMPTY, and that is the whole of the fix on this side.
+        //
+        // This used to copy instance()'s tokens for bootstrapKeys() into the
+        // new store. Those values are the HOST's, so every isolated identity
+        // came into existence holding the host's anchor: it authorized as the
+        // host at any callee (ModuleProxy::authorize -> callerHostAnchorJson)
+        // and satisfied informModuleToken's trusted-channel gate, which is a
+        // write into another module's token map. Isolating a name is the host
+        // declaring that this caller must NOT have the host's authority; the
+        // seed handed it exactly that.
+        //
+        // An empty store is a store that cannot call anything until the host
+        // gives the identity its OWN credential — see adoptCredentialFor(), and
+        // logos::admitConsumer in logos-plugin-qt, which mints it, registers it
+        // with capability_module and adopts it in that order.
+        //
+        // No saveToken() under the registry lock any more, which also retires
+        // the re-entrancy note that used to be here: saveToken emits
+        // tokenSaved, and an emit under a lock is a hazard in general.
+        it = registry().stores.insert(identity, new TokenManager(nullptr));
     }
     return *it.value();
 }
@@ -99,29 +127,60 @@ QStringList TokenManager::isolatedIdentities()
     return out;
 }
 
-int TokenManager::seedBootstrapTokens(const QString& identity)
+void TokenManager::adoptCredential(const QString& credential)
 {
+    // Empty is a no-op: an empty value under a bootstrap key reads as PRESENT
+    // to hasToken() and authorizes nothing, which is the worst of both.
+    if (credential.isEmpty()) return;
+    for (const QString& key : bootstrapKeys())
+        saveToken(key, credential);
+}
+
+bool TokenManager::adoptCredentialFor(const QString& identity, const QString& credential)
+{
+    if (identity.isEmpty() || credential.isEmpty()) return false;
+
     // Check isolation BEFORE calling forIdentity: for a name that is not
     // isolated, forIdentity would record a shared vend and thereby make future
-    // isolation of that name impossible. Seeding is a no-op there anyway, and a
-    // no-op must not have that side effect.
-    if (!isIsolated(identity)) return 0;
+    // isolation of that name impossible. A refusal must not have that side
+    // effect (same rule the old seedBootstrapTokens followed).
+    if (!isIsolated(identity)) return false;
 
-    // Resolving the store creates and seeds it on the first call; the loop then
-    // tops up any bootstrap key it is still missing, which is the case a host
-    // that learned a bootstrap token late needs.
+    // Refusing the host's own anchor is the sanctioned-API half of closing the
+    // elevation. Without it, `adoptCredentialFor(x, hostAnchor)` would be a
+    // one-line way to reintroduce exactly what forIdentity stopped doing.
+    if (isHostAnchorValue(credential)) return false;
+
     TokenManager& store = forIdentity(identity);
-    if (&store == &instance()) return 0;   // belt and braces
+    if (&store == &instance()) return false;   // belt and braces
+    store.adoptCredential(credential);
+    return true;
+}
 
-    int copied = 0;
-    for (const QString& key : bootstrapKeys()) {
-        if (store.hasToken(key)) continue;
-        const QString token = instance().getToken(key);
-        if (token.isEmpty()) continue;
-        store.saveToken(key, token);
-        ++copied;
+QStringList TokenManager::identitiesSharingHostAnchor()
+{
+    QStringList names;
+    {
+        QMutexLocker locker(&registry().mutex);
+        names = QStringList(registry().isolated.constBegin(),
+                            registry().isolated.constEnd());
     }
-    return copied;
+
+    // forIdentity() takes the registry lock itself, so the snapshot above is
+    // released first rather than recursing on a non-recursive QMutex.
+    QStringList out;
+    for (const QString& name : names) {
+        TokenManager& store = forIdentity(name);
+        if (&store == &instance()) continue;
+        for (const QString& key : bootstrapKeys()) {
+            if (isHostAnchorValue(store.getToken(key))) {
+                out.append(name);
+                break;
+            }
+        }
+    }
+    out.sort();
+    return out;
 }
 
 bool TokenManager::resetIdentity(const QString& identity)
@@ -129,8 +188,11 @@ bool TokenManager::resetIdentity(const QString& identity)
     if (!isIsolated(identity)) return false;
     TokenManager& store = forIdentity(identity);
     if (&store == &instance()) return false;   // belt and braces
+    // No re-seed. The credential is cleared along with everything else, and the
+    // caller must adopt the NEW one it just minted and registered — a reload
+    // that re-registers invalidates the previous credential at the target, so
+    // keeping it here would be a locked-out reload that looks like a live one.
     store.clearAllTokens();
-    seedBootstrapTokens(identity);
     return true;
 }
 

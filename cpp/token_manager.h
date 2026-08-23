@@ -134,43 +134,110 @@ public:
     static QStringList isolatedIdentities();
 
     /**
-     * @brief The keys a private store is seeded with: the trust-root bootstrap.
+     * @brief The keys an identity's CREDENTIAL is installed under: the
+     *        trust-root bootstrap.
      *
-     * A private store starts empty of everything a caller could escalate with,
-     * but NOT empty: a module's first call to an unknown target runs
-     * `capability_module.requestModule`, and that call is itself authenticated
-     * with the token stored under "capability_module" (and "core" for the
-     * host-side channel). Withhold those and the very first exchange fails, so
-     * an isolated identity could never obtain any token at all.
+     * A private store is born EMPTY, and it must not STAY empty: a caller's
+     * first call to an unknown target runs `capability_module.requestModule`,
+     * and that call is itself authenticated with the token stored under
+     * "capability_module". "core" is the other half — the channel
+     * ModuleProxy::informModuleToken accepts as trusted, which an isolated
+     * PROVIDER identity needs in order to be told about its own callers.
+     * Withhold both and the very first exchange fails at
+     * ModuleProxy::authorize's empty-token check, so an isolated identity could
+     * never obtain any token at all: isolation would be a LOCKOUT.
      *
-     * These two keys, and only these two, are copied from instance() into a
-     * private store when it is created. Every other module's root token — the
-     * thing that made the ambient ring an escalation — is not.
+     * WHAT USED TO HAPPEN HERE, AND WHY IT WAS WRONG. These two keys were
+     * COPIED from instance() when a private store was created. That value is
+     * the HOST's. A consumer presenting it hits an anchor key at the callee's
+     * proxy, so ModuleProxy::authorize answers logos::callerHostAnchorJson() —
+     * a sandboxed in-process view wearing the host's authority. And the half
+     * that was never latent: informModuleToken's trusted-channel gate compares
+     * against these same two keys, so any holder of the copy could push
+     * arbitrary (name, token) pairs into another module's token map with three
+     * public calls and no generated glue. The credential an identity presents
+     * must be ITS OWN.
+     *
+     * So these are the keys adoptCredential() writes, and the only keys any
+     * store is bootstrapped with. This function is their single owner: no host,
+     * binding or language backend should spell the pair a second time.
      */
     static QStringList bootstrapKeys();
 
     /**
-     * @brief Copy the bootstrap tokens from instance() into `identity`'s private
-     *        store, for keys it does not already hold.
+     * @brief Install `credential` as THIS store's identity credential — its
+     *        value under every bootstrapKeys() key.
      *
-     * Runs automatically when a private store is created, which is the ordering
-     * a host already satisfies (bootstrap tokens are seeded before any module
-     * loads). Exposed for the host that learns a bootstrap token later.
+     * THE RULE, and it is not new: an identity's store carries THAT IDENTITY'S
+     * OWN host-issued credential under the bootstrap keys. Every other image in
+     * the system already works this way. A module image writes its own
+     * `authToken` under both keys (LogosAPIProvider::seedHandshakeTrustAnchor);
+     * a ui-host process writes the per-spawn credential its parent minted and
+     * registered for it. The in-process private store was the ONE store in the
+     * system seeded with somebody else's credential.
      *
-     * @return the number of keys copied; 0 for a non-isolated identity.
+     * Both directions fall out of the one write:
+     *   * OUTBOUND — the identity presents the credential to
+     *     capability_module, whose proxy finds it in its caller-keyed inbound
+     *     record (written by informModuleToken) rather than on an anchor key,
+     *     so the caller resolves to {"kind":"module","name":<identity>} instead
+     *     of {"kind":"host"}.
+     *   * INBOUND — capability_module pushes to a provider identity using
+     *     `tokenManager->getToken(moduleName)`, which IS this credential, so
+     *     informModuleToken's trusted-channel gate still passes.
+     *
+     * An empty credential is a no-op: writing one would leave a value that
+     * reads as present to hasToken() while authorizing nothing.
      */
-    static int seedBootstrapTokens(const QString& identity);
+    void adoptCredential(const QString& credential);
 
     /**
-     * @brief Clear an isolated identity's private store and re-seed the
-     *        bootstrap, e.g. when the plugin behind it is unloaded.
+     * @brief adoptCredential() for an isolated identity's private store.
+     *
+     * REFUSES — returns false and writes nothing — in two cases, and both
+     * refusals are the mechanism rather than defensive padding:
+     *
+     *   * `identity` is NOT isolated. That store is the ambient ring, and
+     *     installing a credential there would hand it to every un-isolated
+     *     caller in the image, the host included.
+     *   * `credential` equals instance()'s value under any bootstrap key, i.e.
+     *     it IS the host's anchor. Adopting the host's anchor as your own is
+     *     exactly the bug this replaces, and it must not be reachable through
+     *     the sanctioned API.
+     *
+     * Deliberately does not vend the store for a non-isolated name: a refusal
+     * must not make later isolation impossible (see isolateIdentity()).
+     */
+    static bool adoptCredentialFor(const QString& identity, const QString& credential);
+
+    /**
+     * @brief Isolated identities whose store holds a bootstrap value equal to
+     *        instance()'s.
+     *
+     * Diagnostics, and a one-line assertion for a host's CI: after every
+     * consumer has been admitted this must be EMPTY. adoptCredentialFor()
+     * closes the sanctioned route to the host anchor; a host that copies the
+     * anchor by hand still can, and this is the instrument that sees it.
+     */
+    static QStringList identitiesSharingHostAnchor();
+
+    /**
+     * @brief Clear an isolated identity's private store, e.g. when the plugin
+     *        behind it is unloaded.
      *
      * The store OBJECT is immortal — a client mid-flight must never dereference
      * freed memory — so what has a lifetime is its CONTENTS. After a reload the
      * identity would otherwise present per-target tokens minted for its previous
-     * incarnation; the provider rejects them and the existing rejection-driven
-     * re-exchange heals it in one retry, so skipping this costs latency and log
-     * noise rather than correctness. Do it anyway.
+     * incarnation.
+     *
+     * CLEARS THE CREDENTIAL TOO, and that is a deliberate change from the
+     * version of this that re-seeded the bootstrap from instance(). A reload
+     * re-mints and re-registers, which invalidates the previous credential at
+     * the target (ModuleProxy::saveToken overwrites m_tokens[name]); leaving a
+     * stale credential in the store would therefore be a locked-out reload that
+     * looks like a working one. The caller must adopt the NEW credential after
+     * this — see logos::reissueConsumerCredential in logos-plugin-qt, which is
+     * the one place that sequences mint, register, reset and adopt.
      *
      * Deliberately a no-op returning false for a NON-isolated identity: that
      * store is the shared ring, and clearing it would take every other

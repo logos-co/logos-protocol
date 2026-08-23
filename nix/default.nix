@@ -12,7 +12,7 @@ in
   pname = "logos-protocol";
   inherit isWindows;
   # Tracks LOGOS_PROTOCOL_VERSION_STRING in cpp/logos_protocol.h.
-  version = "0.6.0";
+  version = "0.7.0";
 
   # Common native build inputs
   nativeBuildInputs = [
