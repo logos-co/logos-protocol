@@ -245,6 +245,122 @@ struct CallerFold {
     }
 };
 
+// ── THE AUTHORIZATION SCAN, GIVEN ONLY WHAT IT MAY SEE ───────────────────────
+//
+// Free function, and the parameter list is the mechanism. It takes an
+// InboundView and the credential VALUE — never the TokenManager they came from
+// — so the outbound accessors are not the discouraged choice in here, they are
+// unnameable. The bug this whole split removes was one line of "and also scan
+// the store", written by someone who had a TokenManager* in scope; nobody in
+// this function does.
+//
+// WHAT THE THREE SOURCES ARE, and why only one of them contributes a NAME:
+//
+//   (1) proxyInbound  ModuleProxy::m_tokens — caller-keyed by construction
+//                     (saveToken / informModuleToken are its only writers).
+//                     The naming oracle, EXCEPT under a bootstrapKeys() name:
+//                     see the anchor mask at the loop itself.
+//   (2) storeInbound  the provider identity's own inbound record. Also
+//                     caller-keyed, and it authorizes — but it offers NO name,
+//                     because in the Qt stack the same (caller, token) pair is
+//                     in BOTH (1) and (2): ModuleProxy::informModuleToken
+//                     records one and the provider it forwards to records the
+//                     other. Folding both would make moduleHits == 2 for every
+//                     ordinary caller and collapse every honest answer to
+//                     Unknown. Losing a name that (1) already has costs
+//                     nothing; double-counting would cost all of them.
+//   (3) credential    this identity's own host-issued anchor. One value, no
+//                     key, so there is nothing here that could be turned into
+//                     a name even by accident — which is the point of it being
+//                     a scalar.
+//
+// CONSTANT TIME. Every entry is compared exactly once, with no early exit and
+// no `break`, and the credential is compared exactly once whether or not it is
+// set (the emptiness test masks the RESULT, it does not skip the comparison).
+// So the number of constantTimeEquals calls is |proxyInbound| + |storeInbound|
+// + 1 — a function of the store sizes alone, never of the presented token, of
+// where a match sits, or of whether there was one.
+// logos::tokenComparisonCount() lets InboundTokenStore.
+// TheComparisonCountDependsOnStoreSizeOnly say so out loud.
+struct ScanOutcome {
+    bool authorized = false;
+    unsigned moduleHits = 0;   // matches in the caller-keyed naming oracle
+    unsigned anchorHits = 0;   // matches on this identity's own credential
+    CallerFold fold;
+};
+
+ScanOutcome scanIssuedTokens(const QString& authToken,
+                             const QHash<QString, QString>& proxyInbound,
+                             TokenManager::InboundView storeInbound,
+                             const QString& credential)
+{
+    ScanOutcome out;
+
+    // AN ANCHOR NAME IS NOT A CALLER NAME, and this is the one place that can
+    // still be told otherwise. THE INVARIANT: a store may only name a caller
+    // with a key IT ALONE CAN WRITE. m_tokens qualifies for every ordinary
+    // module name — informModuleToken is its only writer and it files under the
+    // caller's name — and does NOT qualify for "core" or "capability_module",
+    // which are the role labels every OTHER store in the system keeps its
+    // credential under. A key spelled that way is a name two mechanisms can
+    // produce, so the oracle can no longer say which one did.
+    //
+    // NOT HYPOTHETICAL. logos-rust-sdk/src/plugin.rs:144 hardcodes
+    // `CString::new("core")` as the origin of every outbound client a Rust
+    // module creates, so every Rust module announces itself as an anchor name
+    // unprompted; capability_module then pushes the minted pair token naming
+    // that caller "core", informModuleToken files it here, and without the mask
+    // below this scan reports {"kind":"module","name":"core"} for a caller that
+    // is nothing of the kind. Source (2) in the block above already declines to
+    // name from a store it does not exclusively own; this is that same rule,
+    // applied to the subset of THIS store's keys it does not exclusively own
+    // either.
+    //
+    // THE ANSWER IS UNKNOWN, NOT HOST. Masking the fold leaves keyLen == 0, so
+    // the `moduleHits == 1 && keyLen > 0` test in authorize() fails and the
+    // verdict falls through. That is the honest one: we know we cannot name the
+    // caller, we do NOT know it is the host. The host arm stays reserved for a
+    // match against this identity's credential, a value only the host installs.
+    //
+    // COSTS NO COMPARISON. `isAnchor` compares a public store KEY against two
+    // public role labels — it is not a token comparison, it does not touch
+    // constantTimeEquals, and the mask is applied inside the same branch-free
+    // fold `match` already goes through. The comparison count stays
+    // |proxyInbound| + |storeInbound| + 1; CallCaller.
+    // RefusingToNameAnAnchorKeyCostsNoComparison measures it.
+    const QStringList anchorNames = TokenManager::bootstrapKeys();
+    for (auto it = proxyInbound.constBegin(); it != proxyInbound.constEnd(); ++it) {
+        const int isAnchor = anchorNames.contains(it.key()) ? 1 : 0;
+        const int match = constantTimeEquals(authToken, it.value()) ? 1 : 0;
+        out.authorized |= (match != 0);
+        out.fold.offer(match & ~isAnchor, it.key().toUtf8());
+        // Still counted. The grant is real and it authorizes; what it may not
+        // do is supply a name. Counting it also keeps a second, honest caller
+        // sharing the value from being named through the tie rule.
+        out.moduleHits += static_cast<unsigned>(match);
+    }
+
+    // No fold.offer() below, and that absence is deliberate — see (2) above.
+    for (const QString& caller : storeInbound.keys()) {
+        const int match = constantTimeEquals(authToken, storeInbound.token(caller)) ? 1 : 0;
+        out.authorized |= (match != 0);
+    }
+
+    // Always compared, never skipped: `present` masks the answer rather than
+    // the work, so an empty credential costs the same comparison a set one
+    // does. authToken is already known non-empty at the call site, so an unset
+    // credential could not match anyway; the mask is there so the count does
+    // not depend on the store's state either.
+    {
+        const int present = credential.isEmpty() ? 0 : 1;
+        const int match   = constantTimeEquals(authToken, credential) ? 1 : 0;
+        out.authorized |= ((match & present) != 0);
+        out.anchorHits += static_cast<unsigned>(match & present);
+    }
+
+    return out;
+}
+
 } // namespace
 
 namespace logos {
@@ -284,11 +400,19 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     // succeeds and only the read comes up empty. It is unreached today: that
     // function runs in a module IMAGE, whose ring is the process ring. It stops
     // being unreached the moment a provider identity is isolated in-process.
-    const QString coreToken = m_store->getToken(QStringLiteral("core"));
-    const QString capToken  = m_store->getToken(QStringLiteral("capability_module"));
+    //
+    // ONE credential, not two key reads. TokenManager::credential() is the
+    // value adoptCredential() installs under every bootstrapKeys() key, so this
+    // asks for the anchor BY THE THING IT IS instead of by looking two module-
+    // shaped names up in a map — which is what a store that also holds outbound
+    // per-target tokens made dangerous. The two keys never disagree in any
+    // production store: every writer in the fleet sets both from one value
+    // (module_initializer.cpp:169-170, seedHandshakeTrustAnchor,
+    // lidl_gen_cdylib_glue.cpp:412-413, LpBridge::syncFromApi, ui-host
+    // main.cpp:212-213).
+    const QString credential = m_store->credential();
     const bool callerIsTrusted =
-        (!coreToken.isEmpty() && constantTimeEquals(authToken, coreToken)) ||
-        (!capToken.isEmpty()  && constantTimeEquals(authToken, capToken));
+        !credential.isEmpty() && constantTimeEquals(authToken, credential);
     if (authToken.isEmpty() || !callerIsTrusted) {
         qWarning() << "ModuleProxy: rejecting informModuleToken for" << moduleName
                    << "- caller is not the trusted core/capability_module channel";
@@ -310,25 +434,27 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     // module might call back into us from inside the push and be rejected with a
     // token we had already decided to accept. That window does not exist: the
     // push reaches module code only as far as a store write
-    // (lp_module_accept_token -> TokenManager::saveToken, logos_protocol.cpp),
-    // which calls nothing back. Absent a real window, mirroring the provider's
+    // (LogosProviderBase::informModuleToken -> TokenManager::saveInboundToken,
+    // and for a cdylib logos_module_accept_token -> lp_token_save), which calls
+    // nothing back. Absent a real window, mirroring the provider's
     // verdict is the smaller claim, so it is the one to make.
     if (!m_provider->informModuleToken(moduleName, token)) {
         return false;
     }
 
     // WHY THE PROXY KEEPS ITS OWN COPY of something the provider just stored.
-    // isAuthorized also scans m_store, and in the default out-of-process
-    // topology LogosProviderBase's write lands there — so on the happy path this
-    // is redundant. It is not redundant where it counts. m_store is
-    // direction-MIXED (LogosAPIClient writes the token it will PRESENT to a
-    // callee under the CALLEE's name, logos_api_client.cpp:176), so it can never
-    // say WHOSE a token is; m_tokens is keyed by the caller by construction and
-    // can, which is what a caller-identity oracle has to be built on. And
-    // m_store's contents have a lifetime this proxy does not control —
-    // TokenManager::resetIdentity() empties an isolated store on plugin reload —
-    // while a token this proxy was told about is good until the proxy dies with
-    // the module it fronts.
+    // authorize() also scans m_store's INBOUND half, where the provider's write
+    // lands — so on the happy path this is redundant. It is not redundant where
+    // it counts. m_tokens is the naming oracle (scanIssuedTokens takes a name
+    // from it and from nothing else), it survives a store this proxy does not
+    // control being emptied under it (TokenManager::resetIdentity() clears an
+    // isolated store on plugin reload), and it is the record that exists even
+    // when the provider writes nowhere at all.
+    //
+    // DELIBERATELY NOT ALSO m_store->saveInboundToken() here. One map, one
+    // writer: the provider owns its store's inbound record and this proxy owns
+    // m_tokens. A second writer would put the same fact in two halves of two
+    // objects with different lifetimes, which is the shape that rots.
     //
     // NOT a claim that a refused push leaves the token unusable. The generated
     // Qt glue saves to the host stack BEFORE it forwards across the C ABI and
@@ -359,16 +485,26 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
     }
 
     // A token is valid only if THIS module actually issued it to some caller.
-    // Two stores hold issued tokens:
-    //   * m_tokens          — the proxy's own INBOUND record, keyed by caller
-    //                         (saveToken / informModuleToken). Direction-pure.
-    //   * m_store           — this provider identity's TokenManager: the host
-    //                         anchors, the bootstrap seed, and whatever else the
-    //                         host put there. Direction-MIXED, so it authorizes
-    //                         but must never be reverse-looked-up to NAME anyone.
+    // Three sources hold issued tokens, and every one of them is now
+    // direction-pure:
+    //   * m_tokens               — the proxy's own INBOUND record, keyed by
+    //                              caller (saveToken / informModuleToken).
+    //   * m_store->inbound()     — this provider identity's inbound record, the
+    //                              tokens ITS provider was told to accept.
+    //   * m_store->credential()  — this identity's own host-issued anchor.
     // We scan every issued token with a constant-time compare and never early
     // out, so neither a match position nor the number of issued tokens leaks
     // through timing.
+    //
+    // WHAT IS NO LONGER HERE, AND WHY THAT IS THE FIX. The scan used to walk
+    // m_store's whole key set — which was one flat map holding OUTBOUND
+    // per-target tokens as well. A token this module cached in order to CALL
+    // peer_b therefore authorized peer_b to call US, so capability_module's one
+    // minted value for <me -> peer_b> was silently also a grant for
+    // <peer_b -> me>: no handshake, nothing logged, and the access policy at
+    // capability_module_plugin.cpp:99-106 never consulted. The outbound half is
+    // now a separate map, and scanIssuedTokens() is not given anything that can
+    // reach it. tests/protocol/test_token_direction.cpp is the detector.
     //
     // m_store, NOT TokenManager::instance(): the store that authorizes has to be
     // the store the inbound writes go to. LogosProviderBase::informModuleToken
@@ -380,48 +516,19 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
     // nobody isolated, which is why neither half had ever been observed.
     //
     // ── WHAT THE FOLD ADDS TO THIS SCAN, AND WHAT IT DOES NOT ────────────────
-    // The two loops below are the same two loops, over the same two stores, in
-    // the same order, calling constantTimeEquals exactly as many times as
-    // before: once per entry, with no early exit on either. Everything the
-    // caller-identity work adds is bookkeeping AFTER each comparison has already
-    // happened — a mask-select into a fixed-width buffer and two counter
-    // increments — so the comparison count, and with it the property the
-    // constant-time compare exists to provide, is unchanged by construction
-    // rather than by inspection. logos::tokenComparisonCount() lets a test say
-    // so out loud.
-    bool authorized = false;
-    CallerFold fold;
-    unsigned moduleHits = 0;   // matches in the caller-keyed INBOUND record
-    unsigned anchorHits = 0;   // matches on m_store's bootstrap anchor keys
-
-    // (1) m_tokens — the proxy's INBOUND record, keyed by CALLER by
-    // construction (saveToken / informModuleToken are its only writers). The one
-    // store here that can honestly NAME anyone.
-    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it) {
-        const int match = constantTimeEquals(authToken, it.value()) ? 1 : 0;
-        authorized |= (match != 0);
-        fold.offer(match, it.key().toUtf8());
-        moduleHits += static_cast<unsigned>(match);
-    }
-
-    // (2) m_store — direction-MIXED: LogosAPIClient writes the token we will
-    // PRESENT to a callee under the CALLEE's name (logos_api_client.cpp:176), so
-    // a hit here may name a module we CALL as the module CALLING us. It
-    // therefore contributes NO name — note there is no fold.offer() below, and
-    // that absence is the whole of rule (1) in the m_tokens comment above.
-    //
-    // The single thing this store can say honestly is "this is the host
-    // bootstrap token", because those keys have exactly one writer (the host
-    // initializer / seedHandshakeTrustAnchor) and exactly one meaning.
-    // `isAnchor` compares a public KEY, not a token, so branching on it leaks
-    // nothing; it is computed before the comparison so the fold stays uniform.
-    const QStringList anchorKeys = TokenManager::bootstrapKeys();
-    for (const QString& key : m_store->getTokenKeys()) {
-        const int isAnchor = anchorKeys.contains(key) ? 1 : 0;
-        const int match = constantTimeEquals(authToken, m_store->getToken(key)) ? 1 : 0;
-        authorized |= (match != 0);
-        anchorHits += static_cast<unsigned>(match & isAnchor);
-    }
+    // Everything the caller-identity work adds is bookkeeping AFTER each
+    // comparison has already happened — a mask-select into a fixed-width buffer
+    // and two counter increments — so the comparison count, and with it the
+    // property the constant-time compare exists to provide, is unchanged by
+    // construction rather than by inspection. logos::tokenComparisonCount()
+    // lets a test say so out loud. See scanIssuedTokens() above for the
+    // count and for why only one of the three sources contributes a name.
+    const ScanOutcome scan = scanIssuedTokens(authToken, m_tokens,
+                                              m_store->inbound(),
+                                              m_store->credential());
+    bool authorized       = scan.authorized;
+    const unsigned moduleHits = scan.moduleHits;   // matches in the INBOUND record
+    const unsigned anchorHits = scan.anchorHits;   // matches on our own credential
 
     // Not one of our own issued tokens — give a host-installed validator the
     // chance to accept it for this transport. This is how operator-issued named
@@ -451,12 +558,14 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
             // assert an identity the anchor's own ambiguity ("core" and
             // "capability_module" share one value) already forbids.
             *callerJson = logos::callerHostAnchorJson();
-        } else if (moduleHits == 1 && fold.keyLen > 0) {
-            *callerJson = logos::callerModuleJson(fold.name());
+        } else if (moduleHits == 1 && scan.fold.keyLen > 0) {
+            *callerJson = logos::callerModuleJson(scan.fold.name());
         }
         // Everything else stays Unknown, and each case is a real one:
         //   * zero name matches — a validator-accepted operator token, or a hit
-        //     on a non-anchor key of the direction-mixed store.
+        //     in the store's own inbound record that the proxy was never told
+        //     about (the legacy QtProviderObject path, or a host that seeded
+        //     the store directly).
         //   * two or more — two callers were issued the same token value.
         //     Impossible with UUIDs, but if it ever happens we do not get to
         //     pick one.

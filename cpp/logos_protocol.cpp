@@ -585,8 +585,57 @@ char* lp_token_get(const char* module_name)
 int lp_token_save(const char* module_name, const char* token)
 {
     if (!module_name || !token) return LP_ERR_INVALID_ARG;
-    TokenManager::instance().saveToken(QString::fromUtf8(module_name),
-                                       QString::fromUtf8(token));
+    const QString key = QString::fromUtf8(module_name);
+    // SYMMETRIC WITH lp_token_save_inbound, deliberately. saveToken() refuses a
+    // key carrying the reserved direction namespace and can only say so in the
+    // log: its signature is void and is pinned by the cross-package ABI freeze
+    // (see the layout note in token_manager.h), so it cannot report through a
+    // return value. Without this the two doors disagreed about the SAME
+    // refusal — LP_OK here, LP_ERR_INVALID_ARG there — and a module tripping
+    // the guard read rc=0 and carried on believing it held a credential it does
+    // not hold. Asked FIRST, so the answer cannot depend on saveToken's
+    // internals staying in step.
+    if (TokenManager::isReservedKey(key)) return LP_ERR_INVALID_ARG;
+    TokenManager::instance().saveToken(key, QString::fromUtf8(token));
+    return LP_OK;
+}
+
+int lp_token_save_inbound(const char* caller, const char* token)
+{
+    if (!caller || !token) return LP_ERR_INVALID_ARG;
+    const QString callerName = QString::fromUtf8(caller);
+    const QString value      = QString::fromUtf8(token);
+
+    // The inbound half, always. saveInboundToken refuses an empty name, an
+    // empty token, and a name carrying the reserved direction namespace --
+    // `caller` is named by capability_module over RPC, so it must not be able to
+    // address any key but its own.
+    if (!TokenManager::instance().saveInboundToken(callerName, value))
+        return LP_ERR_INVALID_ARG;
+
+    // THE TOKEN-REGISTRY CARVE-OUT. See the declaration for the argument; the
+    // short version is that informModuleToken means opposite things depending on
+    // WHO RECEIVES IT. To an ordinary provider it is "this caller may call you"
+    // and stops at the line above. To the module holding the registry it is
+    // "here is module X's token, present it when you call X", and that is
+    // outbound: capability_module reads lp_token_keys() for its known-caller
+    // gate and lp_token_get() for the credential it presents when pushing to the
+    // target. Both read the OUTBOUND half.
+    //
+    // The grant is the declaration of that role, so the grant decides. It is off
+    // by default, fail-closed, already the gate on lp_token_keys, and it lives
+    // in the image whose store is being written -- unlike a codegen flag, which
+    // would be a second place for the two to disagree and which the glue
+    // generator could not compute anyway (it is handed a LIDL contract, not
+    // metadata.json).
+    //
+    // MEASURED CONSEQUENCE OF OMITTING THIS, so nobody "simplifies" it away:
+    // capability_module's roster empties, every requestModule is refused with
+    // "rejecting request from unknown module identity", and the fleet locks out
+    // at the first cross-module call. Fail-closed, and total.
+    if (hostServiceGranted(ServiceTokenRegistry))
+        TokenManager::instance().saveToken(callerName, value);
+
     return LP_OK;
 }
 
@@ -631,8 +680,15 @@ int lp_token_save_for(const char* identity, const char* module_name,
                       const char* token)
 {
     if (!identity || !module_name || !token) return LP_ERR_INVALID_ARG;
+    const QString key = QString::fromUtf8(module_name);
+    // The same door with a store selector in front of it, so it owes the same
+    // answer — see lp_token_save. Checked BEFORE forIdentity(), which is not
+    // tidiness: forIdentity() records that a shared store was vended under
+    // `identity`, and that record makes a later isolateIdentity() refuse. A
+    // rejected argument must not be able to cost an identity its isolation.
+    if (TokenManager::isReservedKey(key)) return LP_ERR_INVALID_ARG;
     TokenManager::forIdentity(QString::fromUtf8(identity))
-        .saveToken(QString::fromUtf8(module_name), QString::fromUtf8(token));
+        .saveToken(key, QString::fromUtf8(token));
     return LP_OK;
 }
 

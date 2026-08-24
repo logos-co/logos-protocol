@@ -108,6 +108,72 @@ TEST_F(TokenManagerTest, SignalAllTokensCleared)
 // security-relevant properties: the raw value never appears, the output is
 // stable for correlation, and distinct tokens map to distinct fingerprints.
 
+// ── the store mechanics of the DIRECTION split ──────────────────────────────
+//
+// The behavioural consequences live in test_token_direction.cpp; these are the
+// three pieces of bookkeeping that hold the two names and the one value
+// together, and that nothing else exercises.
+
+TEST_F(TokenManagerTest, TheInboundOverloadsAllReachTheSameMap)
+{
+    // The const char* overload is not sugar: without it a literal pair is
+    // AMBIGUOUS between the QString and std::string forms and the call does not
+    // compile at all. This test is therefore as much a compile-time assertion
+    // as a runtime one — it was added because building logos-qt-sdk against
+    // this header failed on exactly that.
+    EXPECT_TRUE(TokenManager::instance().saveInboundToken("peer_lit", "tok-lit"));
+    EXPECT_TRUE(TokenManager::instance().saveInboundToken(
+        QStringLiteral("peer_q"), QStringLiteral("tok-q")));
+    EXPECT_TRUE(TokenManager::instance().saveInboundToken(
+        std::string("peer_std"), std::string("tok-std")));
+
+    const TokenManager::InboundView in = TokenManager::instance().inbound();
+    EXPECT_EQ(in.token(QStringLiteral("peer_lit")), QStringLiteral("tok-lit"));
+    EXPECT_EQ(in.token(QStringLiteral("peer_q")),   QStringLiteral("tok-q"));
+    EXPECT_EQ(in.token(QStringLiteral("peer_std")), QStringLiteral("tok-std"));
+    EXPECT_EQ(in.count(), 3);
+
+    // And none of them is visible to the outbound surface.
+    EXPECT_EQ(TokenManager::instance().tokenCount(), 0);
+    EXPECT_FALSE(TokenManager::instance().hasToken("peer_lit"));
+}
+
+TEST_F(TokenManagerTest, RemovingABootstrapKeyDoesNotStrandTheCredential)
+{
+    // One value under two names. Dropping ONE name must leave the credential
+    // asserting the value the store still holds under the other; dropping BOTH
+    // must leave no credential at all. Reachable from ordinary traffic:
+    // LogosAPIClient::removeToken() runs on the re-exchange path.
+    TokenManager::instance().adoptCredential(QStringLiteral("the-credential"));
+    ASSERT_EQ(TokenManager::instance().credential(), QStringLiteral("the-credential"));
+
+    ASSERT_TRUE(TokenManager::instance().removeToken("core"));
+    EXPECT_EQ(TokenManager::instance().credential(), QStringLiteral("the-credential"))
+        << "dropping one of the two bootstrap names cleared a credential the "
+           "store still holds under the other";
+
+    ASSERT_TRUE(TokenManager::instance().removeToken("capability_module"));
+    EXPECT_TRUE(TokenManager::instance().credential().isEmpty())
+        << "the credential outlived every bootstrap key it was installed under";
+}
+
+TEST_F(TokenManagerTest, ClearAllTokensClearsAllThree)
+{
+    // resetIdentity() is documented to clear the credential too — a reload
+    // re-mints and re-registers, so a surviving credential is a locked-out
+    // reload that looks live. The inbound record goes for the same reason: it
+    // names the callers of the PREVIOUS incarnation.
+    TokenManager::instance().saveToken("callee", "out-tok");
+    TokenManager::instance().saveInboundToken("caller", "in-tok");
+    TokenManager::instance().adoptCredential(QStringLiteral("cred"));
+
+    TokenManager::instance().clearAllTokens();
+
+    EXPECT_EQ(TokenManager::instance().tokenCount(), 0);
+    EXPECT_EQ(TokenManager::instance().inbound().count(), 0);
+    EXPECT_TRUE(TokenManager::instance().credential().isEmpty());
+}
+
 TEST(RedactTokenTest, NeverContainsRawTokenValue)
 {
     const QString secret = "3f2a9c00-dead-beef-cafe-0123456789ab";
