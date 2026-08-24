@@ -197,6 +197,11 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
     // token-rotation race where overlapping requestModule calls mint fresh tokens
     // that overwrite each other at the target (e.g. QtRO's sync wait reentering
     // via a nested event loop).
+    //
+    // saveToken == the OUTBOUND half, keyed by the CALLEE. It used to be one map
+    // with the inbound tokens, so this write also authorized `objectName` to
+    // call US and an inbound push for the same peer clobbered this cache. Both
+    // are closed; see the DIRECTION note in token_manager.h.
     if (!token.isEmpty())
         m_token_manager->saveToken(objectName, token);
     return token;

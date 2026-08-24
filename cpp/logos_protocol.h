@@ -160,9 +160,43 @@
 // "auth token not recognized" — which is the intended failure mode for a change
 // that removes a credential nobody was entitled to. Ship protocol, then
 // logos-plugin-qt, then the hosts, with matching flake.locks.
-#define LOGOS_PROTOCOL_VERSION_MINOR 7
+// 0.8: the INBOUND door -- lp_token_save_inbound(), and the module-impl export
+// that carries it across the cdylib boundary
+// (logos_module_accept_inbound_token, logos_module_impl.h).
+//
+// WHAT IT CLOSES. The generated Qt glue's informModuleToken wrote the SAME value
+// through two doors: LogosProviderBase::informModuleToken (inbound, into the
+// HOST image's store) and logos_module_accept_token (which forwarded to
+// lp_token_save -- OUTBOUND, into the cdylib's own store). The value is a
+// CALLER's token, so the second write filed it as a credential this module would
+// PRESENT to that caller. Measured end to end on shipped artifacts: after
+// capability_module minted <A -> B> and pushed it to B, B's own client found it
+// under "A", skipped requestModule, presented it to A, was rejected, and
+// re-exchanged. Every such pair paid a rejection plus a full extra round trip,
+// forever, and the caller saw only success.
+//
+// ADDITIVE AT THE ABI, and unusually cleanly so: no existing symbol changes
+// signature or behaviour, logos_module_accept_token keeps meaning exactly what
+// its name says, and a module generated below 0.8 emits neither the call nor
+// the definition and behaves exactly as it does today.
+//
+// NOT ADDITIVE FOR A TOKEN REGISTRY, which is the one thing to get right when
+// reading this. See lp_token_save_inbound below.
+//
+// AND WHAT DID **NOT** HAPPEN AT 0.7, said here because it nearly cost the
+// fleet. The inbound/outbound split shipped under 0.7 without a version of its
+// own AND with three members where TokenManager had one, which moved m_mutex
+// from +24 to +56 on an object the host allocates and module images mutate.
+// Two versions of that object both answered "0.7.0" and mixing them deadlocked
+// a host process on the first token push, with no diagnostic anywhere. The
+// storage is now a key namespace inside the original single QHash, so the
+// layout is back to what every shipped module was compiled against and MAJOR
+// remains the only gate that has to mean anything. token_manager.h's private
+// section carries the measurements; token_manager.cpp's static_assert is the
+// tripwire.
+#define LOGOS_PROTOCOL_VERSION_MINOR 8
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.7.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.8.0"
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -403,17 +437,101 @@ LP_API char* lp_get_methods(lp_client* client);
 
 /* ---------------------------------------------------------------------------
  * Tokens
+ *
+ * THE WHOLE lp_token_* FAMILY IS THE **OUTBOUND** FAMILY, and this paragraph is
+ * the contract, not a description of today's callers. `module_name` everywhere
+ * below is the module being CALLED, and the value is the token this image will
+ * PRESENT to it. None of these writes authorizes anybody to call US.
+ *
+ * ONE FUNCTION HERE IS NOT OUTBOUND, and it is the last one in the section:
+ * lp_token_save_inbound, added at 0.8. Everything named above it is outbound;
+ * it is placed after the family and labelled at every mention so the paragraph
+ * above stays readable as the rule it is.
+ *
+ * WHY AN INBOUND DOOR EXISTS AT ALL, since an earlier version of this note
+ * argued one was UNREPRESENTABLE and that the absence was a stronger guarantee
+ * than a doc comment on a door that exists. The argument was that a cdylib has
+ * no LogosAPI, no ModuleProxy and never authorizes, so every read of its store
+ * is an outbound presentation. Both halves are true and neither is the point:
+ * the problem was never a cdylib READING inbound, it was the generated glue
+ * WRITING a caller's token through the only door available, which was the
+ * outbound one. With one door the direction had nowhere to go, so an inbound
+ * grant landed in the outbound cache and the module then presented a peer's own
+ * token back at that peer. Measured end to end on shipped artifacts: after
+ * capability_module minted <A -> B> and pushed it to B, B's client found the
+ * value under "A", skipped requestModule, presented it to A, was rejected, and
+ * re-exchanged -- a rejection plus a full extra round trip on every call of
+ * every two-way pair, permanently, reported to the caller as success. A second
+ * door is what gives the inbound value somewhere to land that no outbound read
+ * can reach.
+ *
+ * `logos_module_accept_token` (logos_module_impl.h) is therefore the OUTBOUND
+ * door and nothing else -- the module's own anchor, seeded in the glue's
+ * onInit. The caller path goes through logos_module_accept_inbound_token.
+ * Both backends owe the new definition in the same wave as the declaration:
+ * miss one and it links clean and dies at dlopen with an undefined symbol, on
+ * Linux only, invisible on macOS. logos_module_impl.h records that this has
+ * shipped twice at perfect version agreement. Note also that the
+ * module-impl-abi checks in both SDKs only go red AFTER each bumps its
+ * logos-protocol lock: declaring alone turns nothing red, and that lag is the
+ * real risk.
  * ------------------------------------------------------------------------- */
 
-/** Get the stored token for `module_name`. Returns NULL when absent;
- *  caller frees via lp_string_free.
+/** Get the OUTBOUND token for `module_name` — what this image presents when it
+ *  CALLS `module_name`. Returns NULL when absent; caller frees via
+ *  lp_string_free.
  *
  *  Reads this IMAGE's store — the one lp_client_create uses for every origin
- *  that has not been isolated. For an isolated origin, see lp_token_get_for. */
+ *  that has not been isolated. For an isolated origin, see lp_token_get_for.
+ *
+ *  Does NOT see tokens this image issued to its own callers: those live in the
+ *  inbound half, which has no lp_* reader by design (see above). */
 LP_API char* lp_token_get(const char* module_name);
 
-/** Store a token for `module_name` in this image's store. */
+/** Store the OUTBOUND token for `module_name` — what this image will present
+ *  when it CALLS `module_name`.
+ *
+ *  Storing a token here does not let `module_name` call US. When `module_name`
+ *  is "core" or "capability_module" this also installs the value as this
+ *  store's identity credential, which is how the generated glue's
+ *  logos_module_accept_token("core") seeding keeps working unchanged. */
 LP_API int lp_token_save(const char* module_name, const char* token);
+
+/** THE INBOUND DOOR (protocol 0.8). Record that `caller` may present `token`
+ *  when it calls THIS image. The mirror of lp_token_save, and the ONE function
+ *  in this family that is not outbound.
+ *
+ *  Writes the inbound key namespace, which lp_token_get and lp_token_keys
+ *  cannot read and no outbound presentation can reach. Refuses an empty name or
+ *  token, and refuses a name carrying the reserved namespace character --
+ *  `caller` arrives over RPC, named by capability_module, so it must not be able
+ *  to address any key but its own.
+ *
+ *  THE TOKEN-REGISTRY CARVE-OUT, and it is the whole reason this is not simply
+ *  "the inbound half of lp_token_save". The same wire message means opposite
+ *  things depending on WHO RECEIVES IT. To an ordinary provider,
+ *  informModuleToken(caller, token) is "caller may present this to you" --
+ *  inbound. To the module holding the token registry it is "here is module X's
+ *  token; present it when you call X" -- outbound, and the same map is also the
+ *  roster that answers "is this caller a module I know". capability_module reads
+ *  exactly that: lp_token_keys() for the known-caller gate, lp_token_get() for
+ *  the credential it presents when pushing to the target.
+ *
+ *  So when, and only when, this image holds the "token_registry" grant, this
+ *  ALSO writes the outbound half. Without the carve-out, routing the glue's
+ *  second write here empties capability_module's roster and every cross-module
+ *  call in the fleet is refused with "rejecting request from unknown module
+ *  identity" -- fail-closed, but a fleet-wide lockout at the first call.
+ *
+ *  The grant is the right discriminator rather than a codegen flag: it IS the
+ *  declaration of the registry role (metadata.json host_services), it is off by
+ *  default and fail-closed, it is already what gates lp_token_keys, and it lives
+ *  in the image whose store is being written. A per-module codegen flag would
+ *  add a second place for the two to disagree -- and the glue generator is
+ *  handed a LIDL contract, not metadata, so it cannot see host_services at all.
+ *
+ *  Returns 0 on acceptance. */
+LP_API int lp_token_save_inbound(const char* caller, const char* token);
 
 /* --- per-identity token stores ---------------------------------------------
  *
@@ -492,8 +610,8 @@ LP_API int lp_token_reset_identity(const char* identity);
  *  as your own is the elevation this whole surface exists to prevent). */
 LP_API int lp_token_adopt_credential(const char* identity, const char* credential);
 
-/** The module names this image's token store holds, as a JSON array. Caller
- *  frees via lp_string_free.
+/** The module names this image's OUTBOUND token store holds, as a JSON array.
+ *  Caller frees via lp_string_free.
  *
  *  Requires the "token_registry" host service (lp_grant_host_services): an
  *  ungranted image gets NULL. NULL is therefore "refused", never "empty" — a

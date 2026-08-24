@@ -1,6 +1,38 @@
 #include "token_manager.h"
+#include <QDebug>
 #include <QMutexLocker>
 #include <QSet>
+
+/* -- THE ABI TRIPWIRE -------------------------------------------------------
+ *
+ * A TokenManager is allocated by one image and mutated by another: a module
+ * plugin links its own copy of every accessor in this file and runs it on the
+ * object the HOST image constructed (LogosAPI::getTokenManager()). The host is
+ * one package, each module is its own .lgx, and they are built months apart.
+ * So a member added here is an ABI break that shows up as a mutex CAS at the
+ * wrong offset -- measured as a permanent deadlock in a shipped host process,
+ * with no diagnostic anywhere (evaluateProtocolGate compares MAJOR only, and
+ * logos_module_get_protocol_version() is called by nobody).
+ *
+ * This reference struct is the layout every module in the field was compiled
+ * against. Direction lives in the KEY namespace precisely so that this line
+ * never has to change; if it does have to change, that is a MAJOR bump and a
+ * fleet-wide rebuild, not a MINOR.
+ *
+ * sizeof-equality is what a static_assert can see. The ORDER of the two members
+ * is pinned by tests/protocol/test_token_manager_abi.cpp, which measures the
+ * offsets. */
+namespace {
+struct TokenManagerAbiReference : QObject {
+    QHash<QString, QString> tokens;
+    mutable QMutex mutex;
+};
+}  // namespace
+static_assert(sizeof(TokenManager) == sizeof(TokenManagerAbiReference),
+              "TokenManager's layout is frozen: this object is allocated by the "
+              "host image and mutated by module images built against other "
+              "revisions of this header. Adding a member moves m_mutex and "
+              "deadlocks them. Encode new state in the key namespace instead.");
 
 TokenManager& TokenManager::instance()
 {
@@ -57,10 +89,10 @@ namespace {
 bool isHostAnchorValue(const QString& value)
 {
     if (value.isEmpty()) return false;
-    for (const QString& key : TokenManager::bootstrapKeys()) {
-        if (TokenManager::instance().getToken(key) == value) return true;
-    }
-    return false;
+    // credential(), not getToken(bootstrapKey): the anchor is ONE value under
+    // two role labels, and asking for it by that name is what stops this from
+    // being a reverse lookup over a key namespace.
+    return TokenManager::instance().credential() == value;
 }
 
 } // namespace
@@ -172,12 +204,8 @@ QStringList TokenManager::identitiesSharingHostAnchor()
     for (const QString& name : names) {
         TokenManager& store = forIdentity(name);
         if (&store == &instance()) continue;
-        for (const QString& key : bootstrapKeys()) {
-            if (isHostAnchorValue(store.getToken(key))) {
-                out.append(name);
-                break;
-            }
-        }
+        if (isHostAnchorValue(store.credential()))
+            out.append(name);
     }
     out.sort();
     return out;
@@ -207,8 +235,25 @@ TokenManager::~TokenManager()
 
 void TokenManager::saveToken(const QString& key, const QString& token)
 {
+    // The namespace guard, on the OUTBOUND door. `key` arrives from the wire on
+    // the paths that matter (capability_module names the peer in
+    // informModuleToken, and lp_token_save takes whatever the C ABI was handed),
+    // so a name carrying the direction-namespace character would be a way to
+    // write an outbound value into an inbound key and re-create the collision
+    // this split removes. Loud, because a legitimate module name can never
+    // contain a C0 control character and there is therefore no benign case.
+    if (isReservedKey(key)) {
+        qWarning() << "TokenManager: refusing to save a token under a reserved key"
+                   << "(the direction namespace is not addressable from outside)";
+        return;
+    }
     QMutexLocker locker(&m_mutex);
     m_tokens[key] = token;
+    // No separate credential to write: credential() reads whichever
+    // bootstrapKeys() key is set, which is exactly where this call just put it.
+    // That is THE CREDENTIAL SHIM -- see the note at the declaration -- and
+    // deriving rather than caching is what makes it survive a store written by
+    // an image built against a different revision of this header.
     emit tokenSaved(key);
 }
 
@@ -219,6 +264,11 @@ void TokenManager::saveToken(const std::string& key, const std::string& token)
 
 QString TokenManager::getToken(const QString& key) const
 {
+    // The outbound namespace only. Refusing a reserved key here is the read-side
+    // half of the same guard: without it, getToken(inboundKey(x)) would hand a
+    // caller a token that caller was ISSUED, to present as if it were its own --
+    // the collision this split removes, running the other way.
+    if (isReservedKey(key)) return QString();
     QMutexLocker locker(&m_mutex);
     return m_tokens.value(key, QString());
 }
@@ -230,6 +280,7 @@ std::string TokenManager::getToken(const std::string& key) const
 
 bool TokenManager::hasToken(const QString& key) const
 {
+    if (isReservedKey(key)) return false;
     QMutexLocker locker(&m_mutex);
     return m_tokens.contains(key);
 }
@@ -241,9 +292,18 @@ bool TokenManager::hasToken(const std::string& key) const
 
 bool TokenManager::removeToken(const QString& key)
 {
+    // Outbound door: an inbound entry is not removable through it, for the same
+    // reason it is not readable through it.
+    if (isReservedKey(key)) return false;
     QMutexLocker locker(&m_mutex);
     if (m_tokens.contains(key)) {
         m_tokens.remove(key);
+        // No credential to resync. credential() derives from whichever
+        // bootstrapKeys() key is still set, so dropping one of the two names can
+        // no longer leave a cached value asserting a token the store does not
+        // hold. LogosAPIClient removes a rejected per-target token on the
+        // re-exchange path (logos_api_client.cpp:139/:293), so that drift was
+        // reachable from ordinary traffic rather than only from teardown.
         emit tokenRemoved(key);
         return true;
     }
@@ -258,6 +318,11 @@ bool TokenManager::removeToken(const std::string& key)
 void TokenManager::clearAllTokens()
 {
     QMutexLocker locker(&m_mutex);
+    // BOTH NAMESPACES, and the credential with them. resetIdentity() documents
+    // why: a reload re-mints and re-registers, so a surviving credential would
+    // be a locked-out reload wearing the appearance of a working one, and the
+    // inbound record names the callers of the PREVIOUS incarnation. One clear()
+    // takes all three because all three live in this map.
     m_tokens.clear();
     emit allTokensCleared();
 }
@@ -265,7 +330,14 @@ void TokenManager::clearAllTokens()
 QList<QString> TokenManager::getTokenKeys() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.keys();
+    // OUTBOUND ONLY. This is the roster lp_token_keys() publishes to a granted
+    // token registry, and leaking the inbound namespace into it would publish
+    // the names of everyone who may call US as if they were modules we can call.
+    QList<QString> keys;
+    keys.reserve(m_tokens.size());
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+        if (!isReservedKey(it.key())) keys.append(it.key());
+    return keys;
 }
 
 std::vector<std::string> TokenManager::getTokenKeysStd() const
@@ -274,12 +346,124 @@ std::vector<std::string> TokenManager::getTokenKeysStd() const
     std::vector<std::string> keys;
     keys.reserve(static_cast<size_t>(m_tokens.size()));
     for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
-        keys.push_back(it.key().toStdString());
+        if (!isReservedKey(it.key())) keys.push_back(it.key().toStdString());
     return keys;
 }
 
 int TokenManager::tokenCount() const
 {
     QMutexLocker locker(&m_mutex);
-    return m_tokens.size();
+    int n = 0;
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+        if (!isReservedKey(it.key())) ++n;
+    return n;
+}
+
+/* ── the INBOUND half ───────────────────────────────────────────────────────
+ *
+ * Separate bodies rather than a direction parameter on the existing ones: a
+ * parameter is a value a caller can get wrong (and default), while a separate
+ * name is a symbol that either resolves or does not.
+ */
+
+bool TokenManager::saveInboundToken(const QString& caller, const QString& token)
+{
+    // The first two refusals mirror ModuleProxy::saveToken. An empty token is
+    // the one that matters: it would read as PRESENT to inbound().contains()
+    // while authorizing nothing, which is the worst of both.
+    if (caller.isEmpty() || token.isEmpty()) return false;
+    // The third is the namespace guard on the INBOUND door. `caller` is named by
+    // capability_module over RPC; a name carrying the namespace character would
+    // let it address a key other than its own inbound slot.
+    if (isReservedKey(caller)) {
+        qWarning() << "TokenManager: refusing an inbound token for a caller name "
+                      "carrying the reserved direction namespace";
+        return false;
+    }
+    QMutexLocker locker(&m_mutex);
+    m_tokens[inboundKey(caller)] = token;
+    return true;
+}
+
+bool TokenManager::saveInboundToken(const std::string& caller, const std::string& token)
+{
+    return saveInboundToken(QString::fromStdString(caller),
+                            QString::fromStdString(token));
+}
+
+QString TokenManager::credential() const
+{
+    QMutexLocker locker(&m_mutex);
+    return credentialLocked();
+}
+
+QString TokenManager::inboundValue(const QString& caller) const
+{
+    if (isReservedKey(caller)) return QString();
+    QMutexLocker locker(&m_mutex);
+    // The inbound namespace only, and this is THE line the split exists to keep
+    // honest: no fall-through to the bare key, however convenient it would look
+    // on the day some caller comes up empty here.
+    return m_tokens.value(inboundKey(caller), QString());
+}
+
+QStringList TokenManager::inboundKeyList() const
+{
+    QMutexLocker locker(&m_mutex);
+    // The stored keys carry the namespace prefix; callers -- ModuleProxy's scan
+    // among them -- want the bare caller names, so strip it here rather than
+    // letting the encoding escape the class.
+    //
+    // THIS READS "RESERVED" AS "INBOUND", AND THAT IS ONLY TRUE WHILE THERE IS
+    // EXACTLY ONE RESERVED NAMESPACE. isReservedKey() asks whether a key
+    // carries the namespace CHARACTER anywhere; inboundKey() is the only
+    // producer of such a key today, so the two coincide and a fixed-width strip
+    // is exact. Introduce a second namespace -- U+0001 "out", U+0001 "meta",
+    // anything -- and this silently mis-reports every key in it AS AN INBOUND
+    // CALLER, with a mangled name, straight into ModuleProxy's authorization
+    // scan. inboundCount() below makes the same assumption and would over-count
+    // the same way.
+    //
+    // WHAT TO DO INSTEAD, at that point and not before: match the specific
+    // prefix (`it.key().startsWith(inboundKey(QString()))`) rather than the
+    // character class, in both functions. It is not written that way now
+    // because the guard would be dead code today and an untested branch in a
+    // security scan is worse than an invariant stated where it can be read.
+    const int skip = inboundKey(QString()).size();
+    QStringList out;
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+        if (isReservedKey(it.key())) out.append(it.key().mid(skip));
+    return out;
+}
+
+bool TokenManager::inboundContains(const QString& caller) const
+{
+    if (isReservedKey(caller)) return false;
+    QMutexLocker locker(&m_mutex);
+    return m_tokens.contains(inboundKey(caller));
+}
+
+int TokenManager::inboundCount() const
+{
+    QMutexLocker locker(&m_mutex);
+    // "reserved" == "inbound" only while one namespace exists -- see the note
+    // in inboundKeyList() above, which this shares.
+    int n = 0;
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
+        if (isReservedKey(it.key())) ++n;
+    return n;
+}
+
+QString TokenManager::credentialLocked() const
+{
+    // ONE VALUE UNDER TWO ROLE LABELS, read rather than cached. Every anchor
+    // writer in the fleet installs it with saveToken() under both bootstrap
+    // keys, so this is not an inference about where it might be -- it is the
+    // place it is put. Deriving it is also what makes the answer correct on a
+    // store written by an image built against another revision of this header.
+    for (const QString& key : bootstrapKeys()) {
+        const QString value = m_tokens.value(key, QString());
+        if (!value.isEmpty()) return value;
+    }
+    return QString();
 } 

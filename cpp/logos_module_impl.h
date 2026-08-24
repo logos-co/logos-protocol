@@ -81,10 +81,54 @@ LOGOS_MODULE_IMPL_EXPORT void logos_module_set_context(
 LOGOS_MODULE_IMPL_EXPORT void logos_module_set_emit_callback(
     logos_module_emit_cb cb, void* user_data);
 
-/* Deliver an auth token for `module_name` (the provider-side
- * informModuleToken). Returns 0 on acceptance. */
+/* THE OUTBOUND DOOR. Deliver the token this module will PRESENT when it CALLS
+ * `module_name`. Returns 0 on acceptance.
+ *
+ * ONE MEANING ONLY, and that is the change: the glue used to call this from two
+ * places with two opposite meanings -- seeding the module's own anchor in
+ * onInit (outbound, correct) and forwarding a CALLER's token from
+ * informModuleToken (inbound, filed as an outbound credential). The second
+ * write is what let a module present, to a peer, the very token that peer had
+ * been issued to call IT -- the direction collision, one image deeper than the
+ * one ModuleProxy::authorize sees. The caller path now goes through
+ * logos_module_accept_inbound_token below; this one is the anchor seeding and
+ * nothing else. Do not merge them back together. */
 LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
                                                        const char* token);
+
+/* THE INBOUND DOOR. Record that `caller` may present `token` when it calls THIS
+ * module. Returns 0 on acceptance.
+ *
+ * WHY IT IS A SECOND SYMBOL RATHER THAN A FLAG ON THE FIRST. A parameter is a
+ * value a caller can get wrong, and default; a separate name either resolves or
+ * does not. The two doors write two disjoint key namespaces in the image's
+ * TokenManager (logos-protocol cpp/token_manager.h), and nothing reachable from
+ * one can read the other -- which is the property that makes a grant one way
+ * stop being a grant the other way.
+ *
+ * WHAT A TOKEN REGISTRY GETS INSTEAD, said here because it is the one thing
+ * about this door that surprises. To an ordinary provider `informModuleToken`
+ * means "this caller may call you". To the module holding the token registry
+ * (capability_module) the SAME wire message means "here is module X's token,
+ * present it when you call X" -- outbound. So lp_token_save_inbound, which this
+ * forwards to, ALSO writes the outbound half when, and only when, the image has
+ * been granted the "token_registry" host service. Without that carve-out
+ * capability_module's roster (lp_token_keys) empties and every requestModule in
+ * the fleet is refused with "rejecting request from unknown module identity".
+ * The grant is the declaration of the role, so the role decides -- see
+ * lp_token_save_inbound in logos_protocol.h.
+ *
+ * CONDITIONAL on protocol >= 0.8, with the same teeth as every other entry
+ * here: the glue emits a DIRECT call, so a module generated for >= 0.8 whose
+ * backend omits this definition links cleanly and then fails at dlopen() on
+ * ELF with "undefined symbol" -- invisible on macOS. Both backends
+ * (logos-cpp-sdk's lidl_gen_cdylib.cpp and logos-rust-sdk's
+ * rustgen_provider.rs) owe it in the SAME WAVE as this declaration.
+ * nix/module-impl-abi.nix is what makes that fail in CI instead of at a user's
+ * dlopen -- but only after each backend bumps its logos-protocol lock, which is
+ * the real lag to watch. */
+LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_inbound_token(const char* caller,
+                                                               const char* token);
 
 /* Grant the module the privileged host services named in `services_json` (a
  * JSON array from the closed set lp_grant_host_services documents). Returns 0

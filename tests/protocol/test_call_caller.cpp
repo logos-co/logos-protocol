@@ -16,11 +16,13 @@
 //
 // THE THREE REFUSALS, which are the reason the type has an Unknown arm at all:
 //
-//   * A hit in TokenManager under a NON-anchor key names nobody. That store is
-//     direction-MIXED — LogosAPIClient files the token it will PRESENT to a
-//     callee under the CALLEE's name (logos_api_client.cpp:176) — so a reverse
-//     lookup there can name a module we CALL as the module CALLING us. Naming
-//     it would be affirmatively wrong, which is worse than declining.
+//   * A token found ONLY in TokenManager's OUTBOUND half names nobody, and
+//     since the direction split no longer authorizes either. LogosAPIClient
+//     files the token it will PRESENT to a callee under the CALLEE's name
+//     (logos_api_client.cpp:201), so a reverse lookup there could name a module
+//     we CALL as the module CALLING us — affirmatively wrong, worse than
+//     declining. authorize() is now handed an inbound-only view and cannot
+//     reach that half at all.
 //   * A hit on an anchor key names the HOST and carries no module name.
 //     TokenManager::bootstrapKeys() is "core" and "capability_module" holding
 //     one host secret under two keys, so any name from that arm is a coin flip.
@@ -40,8 +42,9 @@
 //       at the Unknown it initialises. 6 passed, 5 FAILED. The four
 //       Unknown-expecting cases survive, which is what makes (a) and (b)
 //       distinguishable rather than two spellings of one detector.
-//   (c) THE MIXED STORE NAMING PEOPLE — a second fold.offer() in the m_store
-//       loop. 10 passed, 1 FAILED (the direction-purity case).
+//   (c) THE STORE'S INBOUND HALF NAMING PEOPLE — a second fold.offer() in
+//       scanIssuedTokens' storeInbound loop. 10 passed, 1 FAILED (the
+//       direction-purity case, before the split made that loop inbound-only).
 //   (d) NO ANCHOR ARM. 9 passed, 2 FAILED — and the second failure is the
 //       interesting one: the tie case reports
 //       {"kind":"module","name":"impostor_module"} for a token that is
@@ -203,17 +206,26 @@ TEST(CallCaller, TheHostAnchorNamesTheHostAndCarriesNoName)
     EXPECT_EQ(provider.seen.find("name"), std::string::npos);
 }
 
-// ── 3. the direction-mixed store names NOBODY ────────────────────────────────
+// ── 3. an OUTBOUND token names nobody because it reaches nobody ──────────────
 //
 // THE REFUSAL THAT MATTERS MOST, and the one an "obvious simplification" would
 // delete. "some_callee" here is exactly the shape LogosAPIClient writes: a token
 // this module holds in order to CALL some_callee, filed under some_callee's
-// name. Reverse-looking-up that store would report some_callee as our CALLER.
+// name. Reverse-looking-up it would report some_callee as our CALLER.
 //
-// RED BEFORE: with a second fold.offer() added to the m_store loop — the
-// one-line "why not name it from there too" — this reports
-// {"kind":"module","name":"some_callee"} and fails.
-TEST(CallCaller, ATokenFoundOnlyInTheDirectionMixedStoreNamesNobody)
+// THIS ASSERTION MOVED, and the move is the point. It used to say the token
+// still AUTHORIZES and merely cannot be NAMED — pre-existing behaviour that the
+// caller-identity work deliberately did not touch. The direction split is the
+// change that touches it: authorize() is handed m_store->inbound() and a
+// credential, so an entry in the outbound half is not reachable, let alone
+// nameable. tests/protocol/test_token_direction.cpp holds the security
+// argument for why that had to move; this file keeps the naming consequence
+// next to the other four refusals.
+//
+// Two assertions rather than one, because either alone would be satisfiable by
+// the wrong mechanism: refusal WITHOUT the Unknown document would mean the
+// scope never opened, and Unknown WITHOUT the refusal is the old behaviour.
+TEST(CallCaller, AnOutboundTokenNeitherAuthorizesNorNames)
 {
     ensureCallerApp();
     TokenManager& store = privateStore(QStringLiteral("caller_mixed_store_no_name"));
@@ -226,10 +238,11 @@ TEST(CallCaller, ATokenFoundOnlyInTheDirectionMixedStoreNamesNobody)
     CallerProbeProvider provider;
     ModuleProxy proxy(&provider, nullptr, &store);
 
-    // It still AUTHORIZES — that is pre-existing behaviour and this change does
-    // not touch it. It simply cannot NAME anyone.
-    ASSERT_TRUE(dispatched(proxy.callRemoteMethod(outbound, QStringLiteral("work"), {})));
-    EXPECT_EQ(provider.seen, kUnknown);
+    EXPECT_FALSE(dispatched(proxy.callRemoteMethod(outbound, QStringLiteral("work"), {})))
+        << "a token we hold in order to CALL some_callee authorized some_callee "
+           "to call US";
+    EXPECT_EQ(provider.calls, 0);
+    EXPECT_EQ(provider.seen, std::string());   // never dispatched, never scoped
 }
 
 // ── 4. an operator token names nobody ────────────────────────────────────────
@@ -439,4 +452,185 @@ TEST(CallCaller, TheProducedDocumentsMatchTheDeclaredWireShape)
     EXPECT_EQ(logos::callerModuleJson(std::string()), kUnknown);
     // Escaping goes through a real JSON writer rather than string concatenation.
     EXPECT_EQ(logos::callerModuleJson("a\"b"), R"({"kind":"module","name":"a\"b"})");
+}
+
+// ── 12. an inbound key spelled as an ANCHOR name names nobody ────────────────
+//
+// THE INVARIANT: a store may only name a caller with a key it alone can write.
+//
+// m_tokens is the naming oracle because informModuleToken is its only writer
+// and that writer files a token under the CALLER's name. The bootstrap names
+// break that exclusivity: "core" and "capability_module" are role labels the
+// anchor lives under in every OTHER store in the system, so a key spelled that
+// way is a name two different mechanisms can produce and the oracle can no
+// longer say which one did.
+//
+// NOT HYPOTHETICAL. logos-rust-sdk/src/plugin.rs:144 hardcodes
+// `CString::new("core")` as the ORIGIN of every outbound client a Rust module
+// creates, so every Rust module announces itself to capability_module as
+// "core" — an anchor name — unprompted. capability_module then pushes the
+// minted pair token at the victim naming the caller "core", informModuleToken
+// files it in m_tokens under that key, and the fold happily reports
+// {"kind":"module","name":"core"} for a caller that is nothing of the kind.
+// The C++ SDK is unaffected: logos_lp_client.h passes a real m_origin.
+//
+// UNKNOWN, NOT HOST, and the distinction is the whole answer. We know we cannot
+// name this caller; we do NOT know it is the host. The host arm is reserved for
+// a match against THIS store's credential, which is a value only the host
+// installs — see case 2. Answering host here would hand an attacker the very
+// escalation the anchor arm exists to make unforgeable.
+//
+// RED BEFORE (measured, at this commit, with the fold offering every key):
+//   Expected equality of these values:
+//     provider.seen
+//       Which is: "{\"kind\":\"module\",\"name\":\"core\"}"
+//     kUnknown
+//       Which is: "{\"kind\":\"unknown\"}"
+TEST(CallCaller, AnInboundKeySpelledAsAnAnchorNamesNobody)
+{
+    ensureCallerApp();
+
+    for (const QString& anchorName : TokenManager::bootstrapKeys()) {
+        TokenManager& store = privateStore(
+            QStringLiteral("caller_anchor_named_key_%1").arg(anchorName));
+        // This store's OWN credential, distinct per iteration so a value that
+        // leaked between the two could not satisfy the assertions below.
+        const QString anchor =
+            QStringLiteral("caller-test-anchor-12-%1").arg(anchorName);
+        store.saveToken(QStringLiteral("core"), anchor);
+
+        CallerProbeProvider provider;
+        ModuleProxy proxy(&provider, nullptr, &store);
+
+        // The push capability_module makes on behalf of a caller that announced
+        // itself as "core". It is accepted — this is not about refusing the
+        // grant, which would break the fleet — it is about refusing to NAME it.
+        const QString granted =
+            QStringLiteral("caller-token-anchor-named-%1").arg(anchorName);
+        ASSERT_NE(granted, anchor);
+        ASSERT_TRUE(proxy.informModuleToken(anchor, anchorName, granted));
+
+        ASSERT_TRUE(dispatched(proxy.callRemoteMethod(granted, QStringLiteral("work"), {})))
+            << "the grant itself must still authorize: " << anchorName.toStdString();
+        EXPECT_EQ(provider.seen, kUnknown)
+            << "named a caller from an anchor key: " << anchorName.toStdString();
+        // Spelled separately because "no name" is the property that must not be
+        // helpfully improved later, exactly as in case 2.
+        EXPECT_EQ(provider.seen.find(anchorName.toStdString()), std::string::npos);
+        EXPECT_EQ(provider.seen.find("host"), std::string::npos)
+            << "Unknown, not host: we cannot name this caller, and we do not "
+               "know it is the host";
+    }
+}
+
+// ── 13. an ordinary key still names, with an anchor key in the same store ────
+//
+// THE CONTROL for case 12, and it is not optional: masking the fold with
+// `match & ~isAnchor` on a per-entry basis is one line away from masking it for
+// the whole scan, which would silently retire caller identity altogether while
+// every Unknown-expecting case above stayed green.
+TEST(CallCaller, AnAnchorKeyInTheStoreDoesNotSuppressOtherNames)
+{
+    ensureCallerApp();
+    TokenManager& store = privateStore(QStringLiteral("caller_anchor_key_control"));
+    const QString anchor = seedAnchor(store, "caller-test-anchor-13");
+
+    CallerProbeProvider provider;
+    ModuleProxy proxy(&provider, nullptr, &store);
+
+    const QString impostorToken = QStringLiteral("caller-token-13-impostor");
+    const QString honestToken   = QStringLiteral("caller-token-13-honest");
+    ASSERT_TRUE(proxy.informModuleToken(anchor, QStringLiteral("core"), impostorToken));
+    ASSERT_TRUE(proxy.informModuleToken(anchor, QStringLiteral("chat_module"), honestToken));
+
+    ASSERT_TRUE(dispatched(proxy.callRemoteMethod(honestToken, QStringLiteral("work"), {})));
+    EXPECT_EQ(provider.seen, moduleDoc("chat_module"));
+
+    ASSERT_TRUE(dispatched(proxy.callRemoteMethod(impostorToken, QStringLiteral("work"), {})));
+    EXPECT_EQ(provider.seen, kUnknown);
+}
+
+// ── 14. refusing to name an anchor key costs no comparison ───────────────────
+//
+// WHAT THE REFUSAL IS ALLOWED TO BE: a mask on the FOLD, which runs after each
+// constantTimeEquals has already happened. It must not be a `continue`, a
+// filtered key list, or anything else that changes how many comparisons a scan
+// performs — that would make the cost of an inbound call depend on how the
+// store's keys are spelled, which is a property of the caller.
+//
+// `isAnchor` compares a public store KEY against two public role labels, so
+// branching on it leaks nothing; this pins that it also does not COUNT.
+//
+// The formula is |m_tokens| + |m_store->inbound()| + 1 — the credential is
+// always compared once. CallerProbeProvider writes to no store, so the second
+// term is 0 and the expected cost is (number of informed callers) + 1.
+//
+// A PIN, NOT A DETECTOR OF THE MASK: it is green both before and after the
+// anchor refusal exists, which is exactly what "the comparison count is
+// unchanged" has to mean. What it detects is the refusal written the OTHER way.
+// Measured, with the mask replaced by the `continue` anyone reaching for
+// "just skip anchor-named keys" would write:
+//
+//   withAnchorKey    Which is: 4
+//   withoutAnchorKey Which is: 5
+//
+// — the cost of an inbound call became a function of how the store's keys are
+// spelled. The same build also lost the grant entirely
+// (AnInboundKeySpelledAsAnAnchorNamesNobody: "the grant itself must still
+// authorize: core"), which is the second reason a skip is the wrong shape.
+TEST(CallCaller, RefusingToNameAnAnchorKeyCostsNoComparison)
+{
+    ensureCallerApp();
+
+    // Two stores of IDENTICAL size whose key sets differ only in whether one
+    // key is spelled as an anchor name.
+    const QStringList anchorNamed{ QStringLiteral("a_module"), QStringLiteral("b_module"),
+                                   QStringLiteral("c_module"), QStringLiteral("core") };
+    const QStringList plainNamed { QStringLiteral("a_module"), QStringLiteral("b_module"),
+                                   QStringLiteral("c_module"), QStringLiteral("d_module") };
+
+    auto measure = [](const QString& identity, const QStringList& callers) {
+        TokenManager& store = privateStore(identity);
+        const QString anchor = QStringLiteral("ct-anchor-%1").arg(identity);
+        store.saveToken(QStringLiteral("core"), anchor);
+
+        CallerProbeProvider provider;
+        ModuleProxy proxy(&provider, nullptr, &store);
+
+        QStringList issued;
+        for (const QString& caller : callers) {
+            const QString token = QStringLiteral("ct-tok-%1-%2").arg(identity, caller);
+            EXPECT_TRUE(proxy.informModuleToken(anchor, caller, token));
+            issued << token;
+        }
+
+        // The reference: a token that matches nothing, so the scan runs to the
+        // end of both stores.
+        const unsigned long long beforeMiss = logos::tokenComparisonCount();
+        proxy.callRemoteMethod(QStringLiteral("ct-no-such-token"),
+                               QStringLiteral("work"), {});
+        const unsigned long long missCost =
+            logos::tokenComparisonCount() - beforeMiss;
+
+        // EVERY issued token, including the anchor-named one: the cost of a hit
+        // must not depend on which key held it.
+        for (const QString& token : issued) {
+            const unsigned long long before = logos::tokenComparisonCount();
+            EXPECT_TRUE(dispatched(proxy.callRemoteMethod(token, QStringLiteral("work"), {})));
+            EXPECT_EQ(logos::tokenComparisonCount() - before, missCost)
+                << "identity=" << identity.toStdString()
+                << " token=" << token.toStdString();
+        }
+        return missCost;
+    };
+
+    const unsigned long long withAnchorKey =
+        measure(QStringLiteral("ct_anchor_named"), anchorNamed);
+    const unsigned long long withoutAnchorKey =
+        measure(QStringLiteral("ct_plain_named"), plainNamed);
+
+    EXPECT_EQ(withAnchorKey, withoutAnchorKey);
+    // Anti-vacuity: pin the closed form, so a counter that stopped being fed
+    // cannot satisfy the equality above. 4 inbound keys + 1 credential.
+    EXPECT_EQ(withAnchorKey, 5ull);
 }
