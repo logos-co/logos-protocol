@@ -112,7 +112,9 @@ public:
         QStringList out;
         for (const Entry& e : m_entries)
             out << (e.objectName + QStringLiteral("::")
-                    + (e.readinessOnly ? QStringLiteral("(readiness)") : e.eventName));
+                    + (e.readinessOnly ? QStringLiteral("(readiness)")
+                       : e.eventName.isEmpty() ? QStringLiteral("(any)")
+                       : e.eventName));
         return out;
     }
 
@@ -555,8 +557,15 @@ quint64 LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
                                                std::function<void(const QString&, const QVariantList&)> callback,
                                                std::function<void(bool)> onArmed)
 {
-    if (objectName.isEmpty() || eventName.isEmpty() || !callback) {
-        qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object/event name "
+    // An EMPTY eventName is deliberately allowed: LogosObject::onEvent reads it
+    // as "every event on this object", and the arm path below hands eventName
+    // straight to it, so the wildcard costs nothing to support and behaves
+    // exactly as it does on the plain onEvent(). It used to be lumped in with
+    // the two arguments that really are unusable, which silently denied every
+    // hand-rolled wildcard subscriber the deferred path -- logoscore's
+    // `watch <module>` with no --event is one.
+    if (objectName.isEmpty() || !callback) {
+        qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object name "
                       "or null callback -- refusing" << objectName << eventName;
         if (onArmed) onArmed(false);
         return 0;
