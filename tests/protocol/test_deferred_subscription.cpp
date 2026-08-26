@@ -212,6 +212,113 @@ TEST_F(DeferredSubscriptionTest, OnEventWhenAvailable_PublishBeforeSubscribe_Con
     EXPECT_GE(received.load(), 1);
 }
 
+// An EMPTY event name is the WILDCARD -- every event on the object -- and it
+// has to reach the deferred path like any other subscription.
+//
+// It used to be refused by the same guard that rejects an empty object name
+// and a null callback, which is a category error: those two are unusable,
+// while an empty event name is meaningful and the plain onEvent() has always
+// honoured it. The refusal silently denied the deferred path to every
+// hand-rolled wildcard subscriber -- logoscore's `watch <module>` with no
+// --event among them -- leaving exactly the one-shot subscription this class
+// exists to replace.
+//
+// Two DIFFERENT event names are fired on purpose. One would pass for a
+// subscription that merely matched the empty string against nothing; catching
+// both is what distinguishes a wildcard from an accident.
+TEST_F(DeferredSubscriptionTest, OnEventWhenAvailable_Wildcard_SubscribeBeforePublish_Delivers)
+{
+    const QString mod = QStringLiteral("sub_wildcard_late_module");
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+
+    std::atomic<int> alpha{0};
+    std::atomic<int> beta{0};
+    const quint64 id = client->onEventWhenAvailable(mod, QString(),
+        [&](const QString& name, const QVariantList&) {
+            if (name == QLatin1String("alpha")) alpha.fetch_add(1);
+            if (name == QLatin1String("beta"))  beta.fetch_add(1);
+        });
+    ASSERT_NE(id, 0u) << "the wildcard was refused outright";
+
+    // Registered, not armed -- and it names itself as the wildcard rather than
+    // rendering a truncated "mod::".
+    const QStringList pending = client->pendingEventSubscriptions();
+    ASSERT_FALSE(pending.isEmpty());
+    EXPECT_EQ(pending.first().toStdString(),
+              (mod + QStringLiteral("::(any)")).toStdString())
+        << pending.join(", ").toStdString();
+
+    pump(300);
+    Publisher pub(mod);
+
+    // Events are not buffered by QtRO, so re-fire while waiting for the arm.
+    for (int i = 0; i < 200 && (alpha.load() == 0 || beta.load() == 0); ++i) {
+        if (pub.echo.emitFn) {
+            pub.echo.emitFn(QStringLiteral("alpha"), QVariantList{ 1 });
+            pub.echo.emitFn(QStringLiteral("beta"),  QVariantList{ 2 });
+        }
+        pump(50);
+    }
+
+    EXPECT_GE(alpha.load(), 1) << "wildcard subscription missed 'alpha'";
+    EXPECT_GE(beta.load(), 1)  << "wildcard subscription missed 'beta'";
+    EXPECT_TRUE(client->pendingEventSubscriptions().isEmpty())
+        << "armed but still reported pending";
+}
+
+// Control: published first. Must be green regardless of the guard, so a red
+// wildcard test above cannot be blamed on the fixture.
+TEST_F(DeferredSubscriptionTest, OnEventWhenAvailable_Wildcard_PublishBeforeSubscribe_Control)
+{
+    const QString mod = QStringLiteral("sub_wildcard_ready_module");
+    Publisher pub(mod);
+
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+
+    std::atomic<int> seen{0};
+    ASSERT_NE(client->onEventWhenAvailable(mod, QString(),
+        [&](const QString&, const QVariantList&) { seen.fetch_add(1); }), 0u);
+
+    for (int i = 0; i < 200 && seen.load() == 0; ++i) {
+        if (pub.echo.emitFn) pub.echo.emitFn(QStringLiteral("alpha"), QVariantList{ 1 });
+        pump(50);
+    }
+    EXPECT_GE(seen.load(), 1);
+}
+
+// The refusals that REMAIN, pinned so widening the guard to admit the wildcard
+// cannot quietly widen it further. Both arguments are unusable rather than
+// meaningful: there is no object to acquire, and nothing to deliver to.
+TEST_F(DeferredSubscriptionTest, OnEventWhenAvailable_StillRefusesUnusableArguments)
+{
+    const QString mod = QStringLiteral("sub_refusal_module");
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+
+    // A refusal must ANSWER, not go quiet: onArmed(false) is how a caller that
+    // passed a bad argument finds out at all.
+    bool armedAnswer = true;
+    bool armedCalled = false;
+    EXPECT_EQ(client->onEventWhenAvailable(QString(), QStringLiteral("ev0"),
+        [](const QString&, const QVariantList&) {},
+        [&](bool ok) { armedCalled = true; armedAnswer = ok; }), 0u)
+        << "an empty object name must be refused";
+    EXPECT_TRUE(armedCalled);
+    EXPECT_FALSE(armedAnswer);
+
+    EXPECT_EQ(client->onEventWhenAvailable(mod, QStringLiteral("ev0"), nullptr), 0u)
+        << "a null callback must be refused";
+
+    // ...and nothing was left behind by either refusal.
+    EXPECT_TRUE(client->pendingEventSubscriptions().isEmpty())
+        << client->pendingEventSubscriptions().join(", ").toStdString();
+}
+
 // ── C ABI (lp_subscribe) ─────────────────────────────────────────────────────
 //
 // This is the half that a LogosQmlBridge-only fix would have missed: a ui_qml

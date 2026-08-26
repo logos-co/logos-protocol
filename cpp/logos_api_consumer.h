@@ -194,11 +194,15 @@ public:
      * missed": a module whose startup event matters must also expose a pull
      * method the subscriber can call after arming.
      *
+     * @param eventName The event to subscribe to, or EMPTY for every event on
+     *                  the object — the same wildcard the plain onEvent()
+     *                  accepts, and delivered by the same mechanism.
      * @param onArmed Optional; called with true the moment the subscription
      *                goes live, or false if it is abandoned. Never called for
      *                "not yet".
      * @return A non-zero id for cancelEventSubscription() /
-     *         eventSubscriptionState(), or 0 if the arguments were refused.
+     *         eventSubscriptionState(), or 0 if the arguments were refused —
+     *         an empty objectName or a null callback, and nothing else.
      */
     quint64 onEventWhenAvailable(const QString& objectName,
                                  const QString& eventName,
