@@ -24,6 +24,7 @@
 #include <QVariant>
 #include <QVariantList>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -153,6 +154,17 @@ struct lp_subscription {
     LogosAPIClient* owner = nullptr;
     std::shared_ptr<CbGuard> ownerGuard;
     quint64 id = 0;
+    // Mirror of the registry's per-subscription generation, so
+    // lp_subscription_generation() is a lock-free read from any thread instead
+    // of a blocking marshal onto the owner thread.
+    //
+    // SHARED, not a plain member: lp_unsubscribe() deletes this struct, and the
+    // status callback that writes the counter can still be in flight. Handing
+    // the callback a shared_ptr to the cell rather than a pointer to `sub`
+    // removes the lifetime question entirely — the same reason the delivery
+    // callback captures `guard` by value rather than dereferencing `sub`.
+    std::shared_ptr<std::atomic<unsigned long long>> generation =
+        std::make_shared<std::atomic<unsigned long long>>(0);
 };
 
 struct lp_provider {
@@ -417,10 +429,11 @@ int lp_invoke_async(lp_client* client,
 
 /* ------------------------------------------------------------- subscribe */
 
-lp_subscription* lp_subscribe(lp_client* client,
-                              const char* event_name,
-                              lp_event_cb cb,
-                              void* user_data)
+lp_subscription* lp_subscribe_ex(lp_client* client,
+                                 const char* event_name,
+                                 lp_event_cb cb,
+                                 lp_subscription_status_cb status_cb,
+                                 void* user_data)
 {
     if (!client || !client->client || !event_name || !*event_name || !cb)
         return nullptr;
@@ -479,7 +492,62 @@ lp_subscription* lp_subscribe(lp_client* client,
         delete sub;
         return nullptr;
     }
+
+    // ALWAYS installed, even when the caller passed no status_cb: the
+    // generation mirror is what makes lp_subscription_generation() work for a
+    // plain lp_subscribe caller, which is the half of this feature that is not
+    // opt-in.
+    //
+    // Captures the generation CELL and the guards, never `sub` — lp_unsubscribe
+    // deletes `sub` while this callback can still be in flight.
+    {
+        auto gen = sub->generation;
+        client->client->setSubscriptionStatusCallback(
+            sub->id,
+            [subGuard, clientGuard, gen, status_cb, user_data](
+                LogosSubscriptionEvent ev, quint64 generation, const QString& reason) {
+                // Record the generation before any liveness gate: a caller that
+                // polls lp_subscription_generation() must see the arming even
+                // if it never installed a status_cb, and an unsubscribed
+                // handle's counter is simply never read again.
+                if (ev == LogosSubscriptionEvent::Armed)
+                    gen->store(generation, std::memory_order_release);
+
+                if (!status_cb) return;
+                // Same gating and the same order as the delivery callback
+                // above, for the same reason: after lp_unsubscribe() returns,
+                // nothing fires.
+                std::lock_guard<std::recursive_mutex> subLock(subGuard->mutex);
+                if (!subGuard->alive) return;
+                std::lock_guard<std::recursive_mutex> clientLock(clientGuard->mutex);
+                if (!clientGuard->alive) return;
+
+                int state = LP_SUB_ARMED;
+                switch (ev) {
+                    case LogosSubscriptionEvent::Armed:     state = LP_SUB_ARMED;     break;
+                    case LogosSubscriptionEvent::Lost:      state = LP_SUB_LOST;      break;
+                    case LogosSubscriptionEvent::Abandoned: state = LP_SUB_ABANDONED; break;
+                }
+                const QByteArray reasonUtf8 = reason.toUtf8();
+                status_cb(state, static_cast<unsigned long long>(generation),
+                          reason.isEmpty() ? nullptr : reasonUtf8.constData(),
+                          user_data);
+            });
+    }
     return sub;
+}
+
+lp_subscription* lp_subscribe(lp_client* client,
+                              const char* event_name,
+                              lp_event_cb cb,
+                              void* user_data)
+{
+    return lp_subscribe_ex(client, event_name, cb, nullptr, user_data);
+}
+
+unsigned long long lp_subscription_generation(lp_subscription* sub)
+{
+    return sub ? sub->generation->load(std::memory_order_acquire) : 0;
 }
 
 void lp_unsubscribe(lp_subscription* sub)

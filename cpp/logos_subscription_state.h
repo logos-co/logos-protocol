@@ -20,4 +20,24 @@ enum class LogosSubscriptionState {
     Armed,
 };
 
+/**
+ * @brief A transition worth telling the subscriber about.
+ *
+ * The state above answers "where is my subscription now?"; this answers "what
+ * just happened to it?" — the difference that matters when a provider restarts.
+ * A subscription that goes Lost and later Armed again is a NEW subscription:
+ * events emitted in between reached nobody and cannot be recovered. Without
+ * this edge a subscriber cannot distinguish that gap from a quiet module, which
+ * is the whole reason it exists.
+ *
+ * Lost is NOT terminal — the registry keeps re-arming, exactly as it always
+ * has. Abandoned is: the transport proved the object is unreachable on this
+ * connection and the subscription will never fire again.
+ */
+enum class LogosSubscriptionEvent {
+    Armed = 1,
+    Lost,
+    Abandoned,
+};
+
 #endif // LOGOS_SUBSCRIPTION_STATE_H

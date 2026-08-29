@@ -310,6 +310,13 @@ add_executable(protocol_tests
     # refresh_balances onClientRead re-entrancy crash lived.
     test_remote_transport_events.cpp
     test_deferred_subscription.cpp
+    # The other half of deferred subscription: a provider that dies UNDER an
+    # already-armed subscription. It re-arms on the same node with the event
+    # helper still attached, so the stream resumed silently with a hole in it
+    # and nothing was even polling for the death. Pins the generation counter
+    # (visible to a plain lp_subscribe caller) and the LOST -> ARMED pair
+    # lp_subscribe_ex delivers, with a provider-stays-up control.
+    test_subscription_continuity.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller

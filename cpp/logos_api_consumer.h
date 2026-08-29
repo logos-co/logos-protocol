@@ -254,6 +254,58 @@ public:
     bool cancelEventSubscription(quint64 subscriptionId);
 
     /**
+     * @brief Watch a subscription's transitions, not just its arrival.
+     *
+     * onEventWhenAvailable()'s `onArmed` answers a bool, which can say "live"
+     * and "given up" and nothing else. That was enough while the only question
+     * was whether a subscription had started; it cannot express the one that
+     * matters afterwards — the provider went away and came back, so this is a
+     * NEW subscription and the events in between are gone.
+     *
+     * `onStatus` fires on every transition:
+     *   Armed(generation)     — live. `generation` is THIS arming's identity:
+     *                           1 for the first, N+1 for each re-establishment.
+     *   Lost(generation)      — the provider's handle stopped being valid.
+     *                           `generation` is the arming that just ended.
+     *                           NOT terminal: the registry re-arms as always.
+     *   Abandoned(generation) — terminal; it will never fire again.
+     *
+     * `reason` is a lowercase snake_case code on Lost/Abandoned
+     * ("provider_unavailable", "connection_reset", "object_unreachable"), empty
+     * on Armed.
+     *
+     * A SEPARATE installer rather than a fifth defaulted parameter on
+     * onEventWhenAvailable(), deliberately: logos-rust-sdk hand-declares that
+     * function's C-ABI twin inside an `extern "C"` block, and Rust does not
+     * check a hand-written declaration against the real symbol — an arity
+     * change would link against the same name and mis-call it with no
+     * diagnostic anywhere. Adding a function cannot do that. It also mirrors
+     * logos_module_set_unload_done_callback(), which installs a completion the
+     * same way for the same reason.
+     *
+     * Replays the CURRENT state synchronously before returning, so a
+     * subscription that armed inside add() cannot be missed by a caller that
+     * installs its watcher immediately afterwards.
+     *
+     * @return true if the id was known.
+     */
+    bool setSubscriptionStatusCallback(
+        quint64 subscriptionId,
+        std::function<void(LogosSubscriptionEvent, quint64 generation,
+                           const QString& reason)> onStatus);
+
+    /**
+     * @brief Which arming this subscription is currently on.
+     *
+     * 0 = never armed, 1 = the first arming, N+1 after each re-establishment.
+     * A caller that reads this alongside each delivered event and sees it
+     * change has observed an unrecoverable gap — which makes gap DETECTION
+     * available to every existing subscriber without changing how they
+     * subscribe, even one that never installs a status callback.
+     */
+    quint64 subscriptionGeneration(quint64 subscriptionId) const;
+
+    /**
      * @brief Whether a subscription id is still pending, armed, or forgotten.
      *
      * Lets a caller that keeps its own de-duplication record check it against
