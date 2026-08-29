@@ -461,6 +461,22 @@ LogosSubscriptionState LogosAPIClient::eventSubscriptionState(quint64 subscripti
     });
 }
 
+bool LogosAPIClient::setSubscriptionStatusCallback(
+    quint64 subscriptionId,
+    std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
+{
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->setSubscriptionStatusCallback(subscriptionId, std::move(onStatus));
+    });
+}
+
+quint64 LogosAPIClient::subscriptionGeneration(quint64 subscriptionId) const
+{
+    return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> quint64 {
+        return m_consumer->subscriptionGeneration(subscriptionId);
+    });
+}
+
 QStringList LogosAPIClient::pendingEventSubscriptions() const
 {
     return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> QStringList {

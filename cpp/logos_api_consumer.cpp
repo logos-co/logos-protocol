@@ -107,6 +107,39 @@ public:
         return LogosSubscriptionState::Unknown;
     }
 
+    quint64 generation(quint64 id) const
+    {
+        for (const Entry& e : m_entries)
+            if (e.id == id) return e.generation;
+        for (const Entry& e : m_armed)
+            if (e.id == id) return e.generation;
+        return 0;
+    }
+
+    bool setStatusCallback(
+        quint64 id,
+        std::function<void(LogosSubscriptionEvent, quint64, const QString&)> cb)
+    {
+        for (Entry& e : m_entries) {
+            if (e.id != id) continue;
+            e.onStatus = std::move(cb);
+            return true;   // pending: no edge has happened yet, nothing to replay
+        }
+        for (Entry& e : m_armed) {
+            if (e.id != id) continue;
+            e.onStatus = std::move(cb);
+            // Replay, so a caller that installs its watcher just after add()
+            // armed synchronously does not miss the arming it is waiting for.
+            // Copied out first: the callback may re-enter and reallocate
+            // m_armed underneath the reference.
+            const auto fn  = e.onStatus;
+            const quint64 g = e.generation;
+            if (fn) fn(LogosSubscriptionEvent::Armed, g, QString());
+            return true;
+        }
+        return false;
+    }
+
     QStringList pending() const
     {
         QStringList out;
@@ -161,6 +194,14 @@ private:
         QString eventName;
         LogosObject::EventCallback callback;
         std::function<void(bool)> onArmed;
+        // The richer twin of onArmed: every transition, not just arrival.
+        // Installed after the fact by setStatusCallback(), so it is null for
+        // every caller that predates it — which is what keeps this additive.
+        std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus;
+        // Which arming this is on. 0 until the first arm, then +1 each time.
+        // Carried across the armed/pending move so a re-arm is distinguishable
+        // from a first arm by the SUBSCRIBER, not just by us.
+        quint64 generation = 0;
         QElapsedTimer since;
         int warnLevel = 0;   // 0 = quiet, 1 = warned at 3s, 2 = warned at 60s
         // Readiness-only: the caller wants to know WHEN the object becomes
@@ -276,9 +317,22 @@ private:
     // such line per 5 s per object. That noise is deliberate — it is the
     // transport truthfully reporting a module that is not there — and silencing
     // it would be the silent-failure shape this whole change exists to remove.
+    // The timer now has TWO jobs: chase pending subscriptions, and watch armed
+    // ones for a provider that goes away. It runs while either set is
+    // non-empty, where it used to run only for the first.
+    bool timerNeeded() const { return !m_entries.isEmpty() || !m_armed.isEmpty(); }
+
+    // Cadence for the armed-set liveness poll, deliberately faster than the
+    // 5 s retry-backoff cap: this is the delay before a subscriber learns its
+    // provider died, and it bounds how long a consumer keeps believing a dead
+    // stream is merely quiet. One virtual isValid() per held handle per second
+    // — on qt_remote a replica state read — is cheap enough that the tighter
+    // number costs nothing worth measuring.
+    static constexpr int kLivenessIntervalMs = 1000;
+
     void ensureTimer()
     {
-        if (m_entries.isEmpty()) return;
+        if (!timerNeeded()) return;
         if (!m_timer) {
             m_timer = new QTimer(m_owner);
             QObject::connect(m_timer, &QTimer::timeout, m_owner, [this]() { tick(); });
@@ -289,6 +343,10 @@ private:
 
     void tick()
     {
+        // First, because a provider that just died turns armed subscriptions
+        // back into pending ones that this same tick should then chase.
+        checkLiveness();
+
         QSet<QString> wanted;
         for (const Entry& e : m_entries)
             if (!m_acquiring.contains(e.objectName)) wanted.insert(e.objectName);
@@ -314,7 +372,17 @@ private:
     void rescheduleOrStop()
     {
         if (!m_timer) return;
-        if (m_entries.isEmpty()) { m_timer->stop(); return; }
+        if (!timerNeeded()) { m_timer->stop(); return; }
+
+        // Nothing PENDING to chase, but something is armed: fall back to the
+        // liveness cadence. This is the new steady state — where the timer used
+        // to stop once everything armed, it now idles doing one isValid() per
+        // handle, which is what makes a provider's death observable at all.
+        if (m_entries.isEmpty()) {
+            m_intervalMs = kLivenessIntervalMs;
+            m_timer->start(m_intervalMs);
+            return;
+        }
 
         // Nothing to do means: every pending object already has an acquire in
         // flight (the transport will arm it with no help from us) and every
@@ -330,12 +398,19 @@ private:
                 return;
             }
         }
+        // Every pending entry is quiet and in flight. Keep ticking anyway if
+        // anything is armed, so the watchdog does not go blind.
+        if (!m_armed.isEmpty()) {
+            m_intervalMs = kLivenessIntervalMs;
+            m_timer->start(m_intervalMs);
+            return;
+        }
         m_timer->stop();
     }
 
     void stopTimerIfIdle()
     {
-        if (m_timer && m_entries.isEmpty()) m_timer->stop();
+        if (m_timer && !timerNeeded()) m_timer->stop();
     }
 
     // Bounded diagnostics. A subscription that is deferred for a few
@@ -414,10 +489,18 @@ private:
                 continue;
             }
             handle->onEvent(e.eventName, e.callback);
+            ++e.generation;
             // Log at the level that matches what was already said: if we
             // warned that this one was pending, close the loop out loud;
-            // otherwise it armed promptly and is not news.
-            if (e.warnLevel > 0)
+            // otherwise it armed promptly and is not news. A RE-arm is always
+            // worth a line: it is the visible half of an unrecoverable gap.
+            if (e.generation > 1)
+                qInfo().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' subscription RE-ARMED (generation " << e.generation
+                    << ") after " << e.since.elapsed()
+                    << " ms -- events emitted while it was down were not delivered";
+            else if (e.warnLevel > 0)
                 qInfo().nospace()
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
                     << "' subscription ARMED after " << e.since.elapsed() << " ms";
@@ -426,8 +509,14 @@ private:
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
                     << "' subscription armed after " << e.since.elapsed() << " ms";
             if (e.onArmed) e.onArmed(true);
+            if (e.onStatus) e.onStatus(LogosSubscriptionEvent::Armed, e.generation, QString());
             m_armed.push_back(std::move(e));           // keep, so reconnect can re-arm
         }
+
+        // The armed set is now non-empty, so the liveness watchdog has work
+        // even though nothing is pending. takeMatching() above stopped the
+        // timer on exactly that condition; restart it.
+        ensureTimer();
     }
 
     // Move every ARMED subscription for an object back into the pending set,
@@ -454,7 +543,7 @@ private:
             else                            remaining.push_back(std::move(e));
         }
         m_entries = std::move(remaining);
-        if (m_entries.isEmpty() && m_timer) m_timer->stop();
+        if (!timerNeeded() && m_timer) m_timer->stop();
         return matched;
     }
 
@@ -471,7 +560,62 @@ private:
                 << "' ABANDONED -- the transport reported this object permanently "
                    "unavailable. This subscription will never fire.";
             if (e.onArmed) e.onArmed(false);
+            if (e.onStatus)
+                e.onStatus(LogosSubscriptionEvent::Abandoned, e.generation,
+                           QStringLiteral("object_unreachable"));
         }
+    }
+
+    // Liveness watchdog: the missing half of subscription continuity.
+    //
+    // A provider that unloads and reloads drives its replica out of Valid and
+    // back on the SAME node, and the event helper stays attached to that
+    // replica — so the subscription survives with nothing to do here and, until
+    // now, nothing to SAY here either. reconnected() covers a torn-down
+    // connection and reviveArmed() covers a handle being replaced; neither
+    // observes a provider dying underneath a subscription that is already
+    // armed. That is the case a subscriber cannot detect for itself, and it is
+    // the one that silently loses events.
+    //
+    // So poll the handles we hold while anything is armed. LogosObject::isValid
+    // is the transport's own answer (on qt_remote, the default, it is exactly
+    // "the replica is still synced to its source"); the base returns true, so
+    // on a transport with no notion of staleness this costs one virtual call
+    // per handle per tick and never fires.
+    void checkLiveness()
+    {
+        if (m_armed.isEmpty()) return;
+
+        QSet<QString> dead;
+        for (auto it = m_handles.cbegin(); it != m_handles.cend(); ++it)
+            if (it.value() && !it.value()->isValid()) dead.insert(it.key());
+        if (dead.isEmpty()) return;
+
+        for (const QString& objectName : dead) {
+            // Report BEFORE reviving: a status callback may re-enter the
+            // registry, and reviveArmed() mutates the very vector we would
+            // otherwise be iterating.
+            for (const Entry& e : m_armed) {
+                if (e.objectName != objectName) continue;
+                qWarning().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' subscription LOST (generation " << e.generation
+                    << ") -- the provider became unreachable. Re-arming; events "
+                       "emitted before it returns are unrecoverable.";
+                if (e.onStatus)
+                    e.onStatus(LogosSubscriptionEvent::Lost, e.generation,
+                               QStringLiteral("provider_unavailable"));
+            }
+
+            // Drop the dead handle so liveHandle() stops answering with it and
+            // beginAcquire() is free to fetch a fresh one.
+            if (LogosObject* obj = m_handles.take(objectName))
+                obj->release();
+            m_acquiring.remove(objectName);
+            reviveArmed(objectName);
+            beginAcquire(objectName);
+        }
+        ensureTimer();
     }
 
     LogosAPIConsumer* m_owner;
@@ -585,6 +729,20 @@ LogosSubscriptionState LogosAPIConsumer::eventSubscriptionState(quint64 subscrip
 {
     if (!subscriptionId || !m_pendingSubs) return LogosSubscriptionState::Unknown;
     return m_pendingSubs->state(subscriptionId);
+}
+
+bool LogosAPIConsumer::setSubscriptionStatusCallback(
+    quint64 subscriptionId,
+    std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
+{
+    if (!subscriptionId || !m_pendingSubs) return false;
+    return m_pendingSubs->setStatusCallback(subscriptionId, std::move(onStatus));
+}
+
+quint64 LogosAPIConsumer::subscriptionGeneration(quint64 subscriptionId) const
+{
+    if (!subscriptionId || !m_pendingSubs) return 0;
+    return m_pendingSubs->generation(subscriptionId);
 }
 
 quint64 LogosAPIConsumer::whenObjectAvailable(const QString& objectName,

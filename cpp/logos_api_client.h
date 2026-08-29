@@ -317,6 +317,25 @@ public:
     LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
 
     /**
+     * @brief Watch a subscription's transitions. See
+     *        LogosAPIConsumer::setSubscriptionStatusCallback for the contract.
+     *
+     * The edge that matters is Lost → Armed with a higher generation: the
+     * provider went away and came back, so this is a NEW subscription and the
+     * events in between are unrecoverable.
+     */
+    bool setSubscriptionStatusCallback(
+        quint64 subscriptionId,
+        std::function<void(LogosSubscriptionEvent, quint64 generation,
+                           const QString& reason)> onStatus);
+
+    /**
+     * @brief Which arming this subscription is on; 0 if never armed.
+     *        See LogosAPIConsumer::subscriptionGeneration.
+     */
+    quint64 subscriptionGeneration(quint64 subscriptionId) const;
+
+    /**
      * @brief Diagnostics: "<object>::<event>" for every deferred subscription
      *        that has not armed yet.
      */
