@@ -1,10 +1,78 @@
 #include "mock_store.h"
-#include <QMutexLocker>
+#include "../../token_manager.h"
+
 #include <QDebug>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QJsonValue>
+#include <QMutexLocker>
+#include <QtGlobal>
+
+namespace {
+
+// Seed this image's MockStore from LOGOS_MOCK_FIXTURE, if set.
+//
+// Self-service because the static is per-image: a plugin that links
+// logos-protocol statically carries its own MockStore and TokenManager, so a
+// host can only ever seed its own copy and the plugin would read an empty one.
+// Every copy reads the fixture instead. LogosModeConfig::getMode() does the same.
+//
+// The file must be FULLY RESOLVED — this runs in images that have no idea where
+// an application installed anything.
+//
+// Keys are "<module>.<wireMethod>"; keys starting with '_' are comments.
+void seedFromFixtureIfRequested(MockStore& store)
+{
+    const QByteArray path = qgetenv("LOGOS_MOCK_FIXTURE");
+    if (path.isEmpty()) return;
+
+    QFile f(QString::fromUtf8(path));
+    if (!f.open(QIODevice::ReadOnly)) {
+        qWarning() << "MockStore: LOGOS_MOCK_FIXTURE is set to" << path
+                   << "but could not be opened — this image will answer every"
+                      " call with an invalid QVariant";
+        return;
+    }
+
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+    if (doc.isNull() || !doc.isObject()) {
+        qWarning() << "MockStore: could not parse LOGOS_MOCK_FIXTURE" << path
+                   << "-" << err.errorString();
+        return;
+    }
+
+    const QJsonObject calls = doc.object().value(QStringLiteral("calls")).toObject();
+    int loaded = 0;
+    for (auto it = calls.constBegin(); it != calls.constEnd(); ++it) {
+        const QString key = it.key();
+        if (key.startsWith(QLatin1Char('_'))) continue;
+        const int dot = key.indexOf(QLatin1Char('.'));
+        if (dot <= 0 || dot == key.size() - 1) continue;
+
+        const QString module = key.left(dot);
+        store.when(module, key.mid(dot + 1)).thenReturn(it.value().toVariant());
+        // A non-empty token stops LogosAPIClient dialling capability_module and
+        // waiting out its 20s timeout on the first call. Per-image too.
+        TokenManager::instance().saveToken(module,
+                                           QStringLiteral("mock-token-") + module);
+        ++loaded;
+    }
+
+    qInfo().noquote() << QStringLiteral(
+        "MockStore: seeded %1 canned call(s) from %2")
+        .arg(loaded).arg(QString::fromUtf8(path));
+}
+
+} // namespace
 
 MockStore& MockStore::instance()
 {
     static MockStore s;
+    static const bool seeded = [&] { seedFromFixtureIfRequested(s); return true; }();
+    Q_UNUSED(seeded);
     return s;
 }
 
