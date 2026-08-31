@@ -2,6 +2,7 @@
 #define LOGOS_MODE_H
 
 #include <QDebug>
+#include <QtGlobal>   // qEnvironmentVariableIsSet
 
 /**
  * @brief LogosMode defines the communication mode for the SDK
@@ -50,6 +51,12 @@ namespace LogosModeConfig {
         return mode;
     }
 
+    // Set by setMode(). Per-image, like the mode itself.
+    inline bool& modeExplicitlySet() {
+        static bool v = false;
+        return v;
+    }
+
     /**
      * @brief Set the SDK communication mode
      * @param mode The mode to use (Remote or Local)
@@ -58,6 +65,7 @@ namespace LogosModeConfig {
      */
     inline void setMode(LogosMode mode) {
         modeStorage() = mode;
+        modeExplicitlySet() = true;
         QString modeName = (mode == LogosMode::Local) ? "Local"
                          : (mode == LogosMode::Mock)  ? "Mock"
                                                        : "Remote";
@@ -69,6 +77,11 @@ namespace LogosModeConfig {
      * @return The current mode
      */
     inline LogosMode getMode() {
+        // Re-read every call until setMode() overrides it. Latching lets a
+        // static initialiser read this before a host can export the variable,
+        // and a statically-linked plugin's own copy is unreachable from outside.
+        if (!modeExplicitlySet() && qEnvironmentVariableIsSet("LOGOS_MOCK_FIXTURE"))
+            return LogosMode::Mock;
         return modeStorage();
     }
 
@@ -77,7 +90,7 @@ namespace LogosModeConfig {
      * @return true if Local mode, false if Remote mode
      */
     inline bool isLocal() {
-        return modeStorage() == LogosMode::Local;
+        return getMode() == LogosMode::Local;
     }
 
     /**
@@ -85,7 +98,7 @@ namespace LogosModeConfig {
      * @return true if Remote mode, false if Local mode
      */
     inline bool isRemote() {
-        return modeStorage() == LogosMode::Remote;
+        return getMode() == LogosMode::Remote;
     }
 
     /**
@@ -93,7 +106,7 @@ namespace LogosModeConfig {
      * @return true if Mock mode, false otherwise
      */
     inline bool isMock() {
-        return modeStorage() == LogosMode::Mock;
+        return getMode() == LogosMode::Mock;
     }
 
 }
