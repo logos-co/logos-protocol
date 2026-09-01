@@ -14,7 +14,7 @@
 // Three properties are pinned here:
 //   1. the generation counter advances across a provider restart, for a plain
 //      lp_subscribe caller that adopts nothing,
-//   2. lp_subscribe_ex's status callback reports the LOST -> ARMED pair that
+//   2. the client's status callback reports the LOST -> ARMED pair that
 //      brackets the gap,
 //   3. a provider that never dies produces neither -- the control, without
 //      which a green LOST cannot be distinguished from a mis-wired fixture.
@@ -133,14 +133,14 @@ TEST_F(SubscriptionContinuityTest, ProviderRestart_ReportsLostThenArmedWithNewGe
 
     struct Edge { LogosSubscriptionEvent ev; quint64 generation; QString reason; };
     std::vector<Edge> edges;
-    ASSERT_TRUE(client->setSubscriptionStatusCallback(
-        id, [&](LogosSubscriptionEvent ev, quint64 gen, const QString& reason) {
+    client->setSubscriptionStatusCallback(
+        mod, [&](LogosSubscriptionEvent ev, quint64 gen, const QString& reason) {
             edges.push_back({ev, gen, reason});
-        }));
+        });
 
     // Armed at generation 1 -- either already (replayed by the installer) or
     // shortly, depending on whether the arm beat the install.
-    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(id) == 1; },
+    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(mod) == 1; },
                           kRestartBudgetMs))
         << "subscription never armed against a published module";
     ASSERT_FALSE(edges.empty());
@@ -166,7 +166,7 @@ TEST_F(SubscriptionContinuityTest, ProviderRestart_ReportsLostThenArmedWithNewGe
 
     // ...and comes back. A re-established subscription is a NEW one.
     auto pub2 = std::make_unique<Publisher>(mod);
-    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(id) >= 2; },
+    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(mod) >= 2; },
                           kRestartBudgetMs))
         << "subscription never re-armed after the provider returned";
 
@@ -192,19 +192,19 @@ TEST_F(SubscriptionContinuityTest, ProviderStaysUp_NoLostAndGenerationStaysOne)
     ASSERT_NE(id, 0u);
 
     std::atomic<int> lost{0};
-    ASSERT_TRUE(client->setSubscriptionStatusCallback(
-        id, [&](LogosSubscriptionEvent ev, quint64, const QString&) {
+    client->setSubscriptionStatusCallback(
+        mod, [&](LogosSubscriptionEvent ev, quint64, const QString&) {
             if (ev == LogosSubscriptionEvent::Lost) lost.fetch_add(1);
-        }));
+        });
 
-    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(id) == 1; },
+    ASSERT_TRUE(pumpUntil([&] { return client->subscriptionGeneration(mod) == 1; },
                           kRestartBudgetMs));
 
     // Several liveness cycles with the provider healthy.
     pump(5000);
 
     EXPECT_EQ(lost.load(), 0) << "reported LOST for a provider that never went away";
-    EXPECT_EQ(client->subscriptionGeneration(id), 1u)
+    EXPECT_EQ(client->subscriptionGeneration(mod), 1u)
         << "re-armed a subscription that was never lost";
 }
 
@@ -228,14 +228,14 @@ TEST_F(SubscriptionContinuityTest, LpSubscribe_GenerationAdvancesAcrossRestart)
         nullptr);
     ASSERT_NE(sub, nullptr);
 
-    ASSERT_TRUE(pumpUntil([&] { return lp_subscription_generation(sub) == 1; },
+    ASSERT_TRUE(pumpUntil([&] { return lp_client_subscription_generation(client) == 1; },
                           kRestartBudgetMs))
         << "lp_subscribe never armed";
 
     pub.reset();
     auto pub2 = std::make_unique<Publisher>(mod);
 
-    EXPECT_TRUE(pumpUntil([&] { return lp_subscription_generation(sub) >= 2; },
+    EXPECT_TRUE(pumpUntil([&] { return lp_client_subscription_generation(client) >= 2; },
                           kRestartBudgetMs))
         << "generation did not advance across a provider restart -- a plain "
            "lp_subscribe caller has no way to see the gap";
@@ -244,8 +244,8 @@ TEST_F(SubscriptionContinuityTest, LpSubscribe_GenerationAdvancesAcrossRestart)
     lp_client_destroy(client);
 }
 
-// The opt-in half: the status callback delivers the bracketing pair.
-TEST_F(SubscriptionContinuityTest, LpSubscribeEx_DeliversLostThenArmed)
+// The opt-in half: the client's status callback delivers the bracketing pair.
+TEST_F(SubscriptionContinuityTest, LpClientStatusCb_DeliversLostThenArmed)
 {
     const QString mod = QStringLiteral("continuity_abi_ex_module");
     TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
@@ -260,16 +260,20 @@ TEST_F(SubscriptionContinuityTest, LpSubscribeEx_DeliversLostThenArmed)
         std::string lastReason;
     } seen;
 
-    lp_subscription* sub = lp_subscribe_ex(
-        client, "ev",
-        [](const char*, const char*, void*) {},
+    ASSERT_EQ(lp_client_set_subscription_status_cb(
+        client,
         [](int state, unsigned long long gen, const char* reason, void* ud) {
             auto* s = static_cast<Seen*>(ud);
             s->states.push_back(state);
             s->gens.push_back(gen);
             if (reason) s->lastReason = reason;
         },
-        &seen);
+        &seen), 1);
+
+    lp_subscription* sub = lp_subscribe(
+        client, "ev",
+        [](const char*, const char*, void*) {},
+        nullptr);
     ASSERT_NE(sub, nullptr);
 
     ASSERT_TRUE(pumpUntil([&] { return !seen.states.empty(); }, kRestartBudgetMs));
@@ -284,7 +288,7 @@ TEST_F(SubscriptionContinuityTest, LpSubscribeEx_DeliversLostThenArmed)
     EXPECT_EQ(seen.lastReason, "provider_unavailable");
 
     auto pub2 = std::make_unique<Publisher>(mod);
-    EXPECT_TRUE(pumpUntil([&] { return lp_subscription_generation(sub) >= 2; },
+    EXPECT_TRUE(pumpUntil([&] { return lp_client_subscription_generation(client) >= 2; },
                           kRestartBudgetMs));
     EXPECT_EQ(seen.states.back(), LP_SUB_ARMED);
 
@@ -292,10 +296,11 @@ TEST_F(SubscriptionContinuityTest, LpSubscribeEx_DeliversLostThenArmed)
     lp_client_destroy(client);
 }
 
-// lp_subscribe is now lp_subscribe_ex(..., nullptr, ...); a null status_cb must
-// stay byte-for-byte the old behaviour rather than crashing in the always-
-// installed generation mirror.
-TEST_F(SubscriptionContinuityTest, LpSubscribeEx_NullStatusCb_IsPlainSubscribe)
+// The generation mirror is installed at lp_client_create whether or not anyone
+// asks for a status callback. A client that never installs one must keep
+// working — and keep counting — rather than crashing in that always-present
+// trampoline.
+TEST_F(SubscriptionContinuityTest, NoStatusCb_IsStillPlainSubscribe)
 {
     const QString mod = QStringLiteral("continuity_abi_null_module");
     TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
@@ -305,15 +310,15 @@ TEST_F(SubscriptionContinuityTest, LpSubscribeEx_NullStatusCb_IsPlainSubscribe)
     ASSERT_NE(client, nullptr);
 
     std::atomic<int> events{0};
-    lp_subscription* sub = lp_subscribe_ex(
+    lp_subscription* sub = lp_subscribe(
         client, "ev",
         [](const char*, const char*, void* ud) {
             static_cast<std::atomic<int>*>(ud)->fetch_add(1);
         },
-        nullptr, &events);
+        &events);
     ASSERT_NE(sub, nullptr);
 
-    EXPECT_TRUE(pumpUntil([&] { return lp_subscription_generation(sub) == 1; },
+    EXPECT_TRUE(pumpUntil([&] { return lp_client_subscription_generation(client) == 1; },
                           kRestartBudgetMs));
 
     lp_unsubscribe(sub);

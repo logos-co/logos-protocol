@@ -138,11 +138,26 @@ bool parseArgs(const char* args_json, const QString& origin,
 
 } // namespace
 
+// Everything the status/generation surface needs, per CLIENT — which is per
+// TARGET MODULE, since an lp_client names exactly one. Held by shared_ptr and
+// captured by the registry trampoline rather than referenced through `client`,
+// because that callback can still be in flight when lp_client_destroy runs.
+struct LpClientSubState {
+    // Mirror of the registry's per-target generation, so
+    // lp_client_subscription_generation() is a lock-free read from any thread
+    // instead of a blocking marshal onto the owner thread.
+    std::atomic<unsigned long long> generation{0};
+    std::mutex cbMu;
+    lp_subscription_status_cb cb = nullptr;
+    void* userData = nullptr;
+};
+
 struct lp_client {
     LogosAPIClient* client = nullptr;
     QString target;
     QString origin;
     std::shared_ptr<CbGuard> guard;
+    std::shared_ptr<LpClientSubState> subState = std::make_shared<LpClientSubState>();
 };
 
 struct lp_subscription {
@@ -154,17 +169,6 @@ struct lp_subscription {
     LogosAPIClient* owner = nullptr;
     std::shared_ptr<CbGuard> ownerGuard;
     quint64 id = 0;
-    // Mirror of the registry's per-subscription generation, so
-    // lp_subscription_generation() is a lock-free read from any thread instead
-    // of a blocking marshal onto the owner thread.
-    //
-    // SHARED, not a plain member: lp_unsubscribe() deletes this struct, and the
-    // status callback that writes the counter can still be in flight. Handing
-    // the callback a shared_ptr to the cell rather than a pointer to `sub`
-    // removes the lifetime question entirely — the same reason the delivery
-    // callback captures `guard` by value rather than dereferencing `sub`.
-    std::shared_ptr<std::atomic<unsigned long long>> generation =
-        std::make_shared<std::atomic<unsigned long long>>(0);
 };
 
 struct lp_provider {
@@ -235,6 +239,9 @@ int lp_set_default_transport(const char* transport_json)
 
 /* ---------------------------------------------------------------- clients */
 
+// Defined with the rest of the per-target subscription surface, below.
+static void lpInstallStatusTrampoline(lp_client* handle);
+
 lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,
                             const char* target_transport_json,
@@ -300,6 +307,12 @@ lp_client* lp_client_create(const char* target_module,
                       "hosts";
     }
     handle->client = qtAffine ? logos::runOnQtMainThread(construct) : construct();
+
+    // Unconditionally, before the caller can subscribe to anything: the
+    // generation mirror is the half of the continuity surface that is NOT
+    // opt-in, so a plain lp_subscribe caller that never installs a status
+    // callback still gets a counter it can poll for gap detection.
+    lpInstallStatusTrampoline(handle);
     return handle;
 }
 
@@ -429,11 +442,10 @@ int lp_invoke_async(lp_client* client,
 
 /* ------------------------------------------------------------- subscribe */
 
-lp_subscription* lp_subscribe_ex(lp_client* client,
-                                 const char* event_name,
-                                 lp_event_cb cb,
-                                 lp_subscription_status_cb status_cb,
-                                 void* user_data)
+lp_subscription* lp_subscribe(lp_client* client,
+                              const char* event_name,
+                              lp_event_cb cb,
+                              void* user_data)
 {
     if (!client || !client->client || !event_name || !*event_name || !cb)
         return nullptr;
@@ -492,62 +504,135 @@ lp_subscription* lp_subscribe_ex(lp_client* client,
         delete sub;
         return nullptr;
     }
-
-    // ALWAYS installed, even when the caller passed no status_cb: the
-    // generation mirror is what makes lp_subscription_generation() work for a
-    // plain lp_subscribe caller, which is the half of this feature that is not
-    // opt-in.
-    //
-    // Captures the generation CELL and the guards, never `sub` — lp_unsubscribe
-    // deletes `sub` while this callback can still be in flight.
-    {
-        auto gen = sub->generation;
-        client->client->setSubscriptionStatusCallback(
-            sub->id,
-            [subGuard, clientGuard, gen, status_cb, user_data](
-                LogosSubscriptionEvent ev, quint64 generation, const QString& reason) {
-                // Record the generation before any liveness gate: a caller that
-                // polls lp_subscription_generation() must see the arming even
-                // if it never installed a status_cb, and an unsubscribed
-                // handle's counter is simply never read again.
-                if (ev == LogosSubscriptionEvent::Armed)
-                    gen->store(generation, std::memory_order_release);
-
-                if (!status_cb) return;
-                // Same gating and the same order as the delivery callback
-                // above, for the same reason: after lp_unsubscribe() returns,
-                // nothing fires.
-                std::lock_guard<std::recursive_mutex> subLock(subGuard->mutex);
-                if (!subGuard->alive) return;
-                std::lock_guard<std::recursive_mutex> clientLock(clientGuard->mutex);
-                if (!clientGuard->alive) return;
-
-                int state = LP_SUB_ARMED;
-                switch (ev) {
-                    case LogosSubscriptionEvent::Armed:     state = LP_SUB_ARMED;     break;
-                    case LogosSubscriptionEvent::Lost:      state = LP_SUB_LOST;      break;
-                    case LogosSubscriptionEvent::Abandoned: state = LP_SUB_ABANDONED; break;
-                }
-                const QByteArray reasonUtf8 = reason.toUtf8();
-                status_cb(state, static_cast<unsigned long long>(generation),
-                          reason.isEmpty() ? nullptr : reasonUtf8.constData(),
-                          user_data);
-            });
-    }
     return sub;
 }
 
-lp_subscription* lp_subscribe(lp_client* client,
-                              const char* event_name,
-                              lp_event_cb cb,
-                              void* user_data)
+/* --------------------------------------------- per-target subscription state */
+
+// Install the ONE registry watcher this client needs, at creation, whether or
+// not the caller ever asks for a status callback: the generation mirror is the
+// half of this feature that is not opt-in, and a plain lp_subscribe caller
+// polling lp_client_subscription_generation() has to see arms it never
+// subscribed to hear about.
+//
+// Captures the shared state and guard, never `client` — the callback can still
+// be in flight when lp_client_destroy runs.
+static void lpInstallStatusTrampoline(lp_client* handle)
 {
-    return lp_subscribe_ex(client, event_name, cb, nullptr, user_data);
+    auto st = handle->subState;
+    auto guard = handle->guard;
+    handle->client->setSubscriptionStatusCallback(
+        handle->target,
+        [st, guard](LogosSubscriptionEvent ev, quint64 generation, const QString& reason) {
+            // Record before any liveness gate: the counter is read by callers
+            // that never installed a status_cb, and a destroyed client's
+            // counter is simply never read again.
+            if (ev == LogosSubscriptionEvent::Armed)
+                st->generation.store(generation, std::memory_order_release);
+
+            lp_subscription_status_cb cb = nullptr;
+            void* userData = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(st->cbMu);
+                cb = st->cb;
+                userData = st->userData;
+            }
+            if (!cb) return;
+
+            std::lock_guard<std::recursive_mutex> clientLock(guard->mutex);
+            if (!guard->alive) return;
+
+            // No default: on purpose. -Wswitch then makes a new
+            // LogosSubscriptionEvent a COMPILE error here rather than a silent
+            // fall-through to ARMED, which is exactly what adding Held did
+            // before this case existed — the registry held the subscription
+            // correctly and the C ABI reported it as armed.
+            int state = LP_SUB_ARMED;
+            switch (ev) {
+                case LogosSubscriptionEvent::Armed:     state = LP_SUB_ARMED;     break;
+                case LogosSubscriptionEvent::Lost:      state = LP_SUB_LOST;      break;
+                case LogosSubscriptionEvent::Abandoned: state = LP_SUB_ABANDONED; break;
+                case LogosSubscriptionEvent::Held:      state = LP_SUB_HELD;      break;
+            }
+            const QByteArray reasonUtf8 = reason.toUtf8();
+            cb(state, static_cast<unsigned long long>(generation),
+               reason.isEmpty() ? nullptr : reasonUtf8.constData(), userData);
+        });
 }
 
-unsigned long long lp_subscription_generation(lp_subscription* sub)
+int lp_client_set_subscription_status_cb(lp_client* client,
+                                         lp_subscription_status_cb status_cb,
+                                         void* user_data)
 {
-    return sub ? sub->generation->load(std::memory_order_acquire) : 0;
+    if (!client || !client->client) return 0;
+    {
+        std::lock_guard<std::mutex> lk(client->subState->cbMu);
+        client->subState->cb = status_cb;
+        client->subState->userData = user_data;
+    }
+    // Re-install so the registry replays the CURRENT state into the callback
+    // that was just set — a consumer that subscribes first and installs its
+    // watcher afterwards would otherwise never hear about the arm that already
+    // happened. Re-installing replaces the trampoline with an identical one.
+    if (status_cb) lpInstallStatusTrampoline(client);
+    return 1;
+}
+
+unsigned long long lp_client_subscription_generation(lp_client* client)
+{
+    return client ? client->subState->generation.load(std::memory_order_acquire) : 0;
+}
+
+int lp_client_set_subscription_options(lp_client* client, const char* options_json)
+{
+    if (!client || !client->client) return 0;
+
+    // Unknown keys and an unparseable document both fall back to the defaults
+    // rather than failing: a newer caller against an older runtime should lose
+    // the OPTION, not its subscriptions.
+    LogosRestartPolicy restart = LogosRestartPolicy::Automatic;
+    if (options_json && *options_json) {
+        auto opts = nlohmann::json::parse(options_json, nullptr, /*allow_exceptions=*/false);
+        if (opts.is_discarded()) {
+            qWarning("lp_client_set_subscription_options: options_json is not valid JSON");
+            return 0;
+        }
+        if (opts.is_object() && opts.contains("restart") && opts["restart"].is_string()) {
+            const std::string r = opts["restart"].get<std::string>();
+            if (r == "manual") restart = LogosRestartPolicy::Manual;
+            else if (r != "automatic")
+                qWarning("lp_client_set_subscription_options: unknown restart '%s'; using automatic",
+                         r.c_str());
+        }
+    }
+    client->client->setSubscriptionRestartPolicy(client->target, restart);
+    return 1;
+}
+
+int lp_client_rearm_subscriptions(lp_client* client)
+{
+    if (!client || !client->client || !client->guard) return 0;
+
+    // POSTED, exactly as lp_unsubscribe's de-tracking half is, and for the same
+    // reason: the natural place to call this from is INSIDE the status callback,
+    // which runs on the owner thread holding this client's guard. Marshalling
+    // synchronously from there would re-enter that guard, and would hang
+    // outright once the owner's event loop has stopped.
+    //
+    // The cost is that the answer is "accepted", not "done": 1 means the revive
+    // was queued against a live client, not that anything has re-armed. The ARM
+    // itself is what the caller should watch for, and it already has a signal
+    // for that — LP_SUB_ARMED with a higher generation.
+    auto ownerGuard = client->guard;
+    LogosAPIClient* owner = client->client;
+    const QString target = client->target;
+    std::lock_guard<std::recursive_mutex> ownerLock(ownerGuard->mutex);
+    if (!ownerGuard->alive) return 0;
+    QMetaObject::invokeMethod(owner, [ownerGuard, owner, target]() {
+        std::lock_guard<std::recursive_mutex> lock(ownerGuard->mutex);
+        if (ownerGuard->alive) owner->rearmSubscriptions(target);
+    }, Qt::QueuedConnection);
+    return 1;
 }
 
 void lp_unsubscribe(lp_subscription* sub)

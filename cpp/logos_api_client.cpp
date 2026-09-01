@@ -461,19 +461,43 @@ LogosSubscriptionState LogosAPIClient::eventSubscriptionState(quint64 subscripti
     });
 }
 
-bool LogosAPIClient::setSubscriptionStatusCallback(
-    quint64 subscriptionId,
+void LogosAPIClient::setSubscriptionStatusCallback(
+    const QString& objectName,
     std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
 {
-    return logos::runOnOwnerThread(this, [&]() -> bool {
-        return m_consumer->setSubscriptionStatusCallback(subscriptionId, std::move(onStatus));
+    if (!m_consumer) return;
+    // Same owner-thread marshalling as onEventWhenAvailable, and not only for
+    // symmetry: installing replays the current state, which can run the
+    // caller's callback on whichever thread installed it unless this hops
+    // first.
+    logos::runOnOwnerThread(this, [&]() {
+        m_consumer->setSubscriptionStatusCallback(objectName, std::move(onStatus));
     });
 }
 
-quint64 LogosAPIClient::subscriptionGeneration(quint64 subscriptionId) const
+quint64 LogosAPIClient::subscriptionGeneration(const QString& objectName) const
 {
-    return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> quint64 {
-        return m_consumer->subscriptionGeneration(subscriptionId);
+    if (!m_consumer) return 0;
+    auto* self = const_cast<LogosAPIClient*>(this);
+    return logos::runOnOwnerThread(self, [&]() -> quint64 {
+        return m_consumer->subscriptionGeneration(objectName);
+    });
+}
+
+void LogosAPIClient::setSubscriptionRestartPolicy(const QString& objectName,
+                                                  LogosRestartPolicy policy)
+{
+    if (!m_consumer) return;
+    logos::runOnOwnerThread(this, [&]() {
+        m_consumer->setSubscriptionRestartPolicy(objectName, policy);
+    });
+}
+
+bool LogosAPIClient::rearmSubscriptions(const QString& objectName)
+{
+    if (!m_consumer) return false;
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->rearmSubscriptions(objectName);
     });
 }
 

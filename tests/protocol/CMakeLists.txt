@@ -317,6 +317,11 @@ add_executable(protocol_tests
     # (visible to a plain lp_subscribe caller) and the LOST -> ARMED pair
     # lp_subscribe_ex delivers, with a provider-stays-up control.
     test_subscription_continuity.cpp
+    # The other half of continuity: a per-subscription restart policy. The
+    # load-bearing test is ManualStillArmsDeferred — manual must mean "do not
+    # RE-arm", never "do not arm", or every subscription taken during init()
+    # before its provider listens stops working.
+    test_subscription_restart_policy.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller
