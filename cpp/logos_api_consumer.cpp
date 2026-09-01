@@ -95,6 +95,11 @@ public:
             m_armed.remove(i);
             return true;
         }
+        for (int i = 0; i < m_held.size(); ++i) {
+            if (m_held[i].id != id) continue;
+            m_held.remove(i);
+            return true;
+        }
         return false;
     }
 
@@ -104,40 +109,72 @@ public:
             if (e.id == id) return LogosSubscriptionState::Pending;
         for (const Entry& e : m_armed)
             if (e.id == id) return LogosSubscriptionState::Armed;
+        for (const Entry& e : m_held)
+            if (e.id == id) return LogosSubscriptionState::Held;
         return LogosSubscriptionState::Unknown;
     }
 
-    quint64 generation(quint64 id) const
+    quint64 generation(const QString& objectName) const
     {
-        for (const Entry& e : m_entries)
-            if (e.id == id) return e.generation;
-        for (const Entry& e : m_armed)
-            if (e.id == id) return e.generation;
-        return 0;
+        return m_targets.value(objectName).generation;
     }
 
-    bool setStatusCallback(
-        quint64 id,
+    void setStatusCallback(
+        const QString& objectName,
         std::function<void(LogosSubscriptionEvent, quint64, const QString&)> cb)
     {
-        for (Entry& e : m_entries) {
-            if (e.id != id) continue;
-            e.onStatus = std::move(cb);
-            return true;   // pending: no edge has happened yet, nothing to replay
+        Target& t = m_targets[objectName];
+        t.onStatus = std::move(cb);
+
+        // Replay where the object IS, so a watcher installed after a synchronous
+        // arm does not wait for an edge that already happened. Copied out
+        // first: the callback may re-enter and rehash m_targets.
+        const auto fn   = t.onStatus;
+        const quint64 g = t.generation;
+        if (!fn) return;
+        if (hasArmedFor(objectName))     fn(LogosSubscriptionEvent::Armed, g, QString());
+        else if (hasHeldFor(objectName)) fn(LogosSubscriptionEvent::Held, g,
+                                            QStringLiteral("provider_unavailable"));
+    }
+
+    // Set the restart policy for an OBJECT. Takes effect on the NEXT loss; it
+    // never touches any subscription's current position, so switching to Manual
+    // while armed is safe and switching to Automatic while HELD does not itself
+    // revive anything (call rearm() for that — an implicit revive here would
+    // make the setter's effect depend on state the caller cannot see).
+    //
+    // Cannot fail: the object need not have any subscriptions yet, which is the
+    // point. A consumer sets the policy once when it creates its client and
+    // never has to order that against its own first subscribe.
+    void setRestartPolicy(const QString& objectName, LogosRestartPolicy policy)
+    {
+        m_targets[objectName].restart = policy;
+    }
+
+    // Move an object's held subscriptions back into the pending set and chase
+    // it again. The generation is untouched: it advances on the ARM, so the
+    // subscriber still sees Held(N) -> Armed(N+1) and can tell the gap
+    // happened.
+    bool rearm(const QString& objectName)
+    {
+        QVector<Entry> keep;
+        bool any = false;
+        for (Entry& e : m_held) {
+            if (e.objectName != objectName) { keep.push_back(std::move(e)); continue; }
+            e.since.start();
+            e.warnLevel = 0;
+            m_entries.push_back(std::move(e));
+            any = true;
         }
-        for (Entry& e : m_armed) {
-            if (e.id != id) continue;
-            e.onStatus = std::move(cb);
-            // Replay, so a caller that installs its watcher just after add()
-            // armed synchronously does not miss the arming it is waiting for.
-            // Copied out first: the callback may re-enter and reallocate
-            // m_armed underneath the reference.
-            const auto fn  = e.onStatus;
-            const quint64 g = e.generation;
-            if (fn) fn(LogosSubscriptionEvent::Armed, g, QString());
-            return true;
-        }
-        return false;
+        if (!any) return false;
+        m_held = std::move(keep);
+
+        if (LogosObject* obj = liveHandle(objectName))
+            armAgainst(objectName, obj);   // provider already back
+        else
+            beginAcquire(objectName);
+        ensureTimer();
+        return true;
     }
 
     QStringList pending() const
@@ -169,14 +206,38 @@ public:
 
         QVector<Entry> revive = std::move(m_armed);
         m_armed.clear();
-        QSet<QString> objects;
+        QSet<QString> chase, holdReported;
         for (Entry& e : revive) {
+            // Manual holds here too, deliberately UNIFORM with the liveness
+            // watchdog: one rule, no exception to remember. The argument for
+            // exempting reconnect is real — the provider never went away, only
+            // our socket did — but a subscriber that asked to control its own
+            // restarts should not have that decision made for it by which of
+            // the two paths happened to notice, and the two are not otherwise
+            // distinguishable from the outside.
+            if (m_targets.value(e.objectName).restart == LogosRestartPolicy::Manual) {
+                qWarning().nospace()
+                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                    << "' subscription HELD (generation "
+                    << m_targets.value(e.objectName).generation
+                    << ") -- the connection was rebuilt and this module's restart "
+                       "policy is Manual. Call rearmSubscriptions() to revive it.";
+                holdReported.insert(e.objectName);
+                m_held.push_back(std::move(e));
+                continue;
+            }
             e.since.start();
             e.warnLevel = 0;
-            objects.insert(e.objectName);
+            chase.insert(e.objectName);
             m_entries.push_back(std::move(e));
         }
-        for (const QString& name : objects)
+        // One edge per OBJECT, after the moves: a status callback may re-enter
+        // to rearm(), and it must find the held set already populated or the
+        // revive it asks for is a silent no-op.
+        for (const QString& name : holdReported)
+            reportTarget(name, LogosSubscriptionEvent::Held,
+                         QStringLiteral("connection_reset"));
+        for (const QString& name : chase)
             beginAcquire(name);
 
         // MUST be last, and must happen even when beginAcquire() armed some of
@@ -194,14 +255,10 @@ private:
         QString eventName;
         LogosObject::EventCallback callback;
         std::function<void(bool)> onArmed;
-        // The richer twin of onArmed: every transition, not just arrival.
-        // Installed after the fact by setStatusCallback(), so it is null for
-        // every caller that predates it — which is what keeps this additive.
-        std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus;
-        // Which arming this is on. 0 until the first arm, then +1 each time.
-        // Carried across the armed/pending move so a re-arm is distinguishable
-        // from a first arm by the SUBSCRIBER, not just by us.
-        quint64 generation = 0;
+        // Per-ENTRY, unlike the generation number (see Target): a subscription
+        // taken for the first time against an object that already restarted
+        // twice is not itself re-arming.
+        bool everArmed = false;
         QElapsedTimer since;
         int warnLevel = 0;   // 0 = quiet, 1 = warned at 3s, 2 = warned at 60s
         // Readiness-only: the caller wants to know WHEN the object becomes
@@ -209,6 +266,18 @@ private:
         // and is then forgotten — it is not re-armed on reconnect, because a
         // one-shot readiness answer that arrives twice is not an answer.
         bool readinessOnly = false;
+    };
+
+    // What is true of a TARGET rather than of one subscription to it: m_handles
+    // holds one handle per object name, so losing a provider and regaining it
+    // are indivisibly per-object. Created on demand and never erased — a policy
+    // installed before the first subscribe must still be here when it arrives.
+    struct Target {
+        LogosRestartPolicy restart = LogosRestartPolicy::Automatic;
+        // How many times this provider has been established. 0 until the first
+        // arm, then +1 on each one.
+        quint64 generation = 0;
+        std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus;
     };
 
     // What the transport said when we asked it to acquire an object.
@@ -480,6 +549,17 @@ private:
         // add() (a consumer re-subscribing on arm), and mutating m_entries
         // while iterating it would be a use-after-free.
         QVector<Entry> matched = takeMatching(objectName);
+
+        // The generation belongs to the OBJECT, so it advances once here, not
+        // once per subscription. Readiness-only entries do not count: a
+        // whenObjectAvailable() probe attaches nothing and must not look like a
+        // re-establishment.
+        bool anyReal = false;
+        for (const Entry& e : matched)
+            if (!e.readinessOnly) { anyReal = true; break; }
+        if (anyReal) ++m_targets[objectName].generation;
+        const quint64 gen = m_targets.value(objectName).generation;
+
         for (Entry& e : matched) {
             if (e.readinessOnly) {
                 // No subscription to attach — the caller only wanted to know
@@ -489,15 +569,18 @@ private:
                 continue;
             }
             handle->onEvent(e.eventName, e.callback);
-            ++e.generation;
+            // Re-arming is a per-entry question; the generation is the
+            // object's. See Entry::everArmed.
+            const bool reArm = e.everArmed;
+            e.everArmed = true;
             // Log at the level that matches what was already said: if we
             // warned that this one was pending, close the loop out loud;
             // otherwise it armed promptly and is not news. A RE-arm is always
             // worth a line: it is the visible half of an unrecoverable gap.
-            if (e.generation > 1)
+            if (reArm)
                 qInfo().nospace()
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
-                    << "' subscription RE-ARMED (generation " << e.generation
+                    << "' subscription RE-ARMED (generation " << gen
                     << ") after " << e.since.elapsed()
                     << " ms -- events emitted while it was down were not delivered";
             else if (e.warnLevel > 0)
@@ -509,9 +592,13 @@ private:
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
                     << "' subscription armed after " << e.since.elapsed() << " ms";
             if (e.onArmed) e.onArmed(true);
-            if (e.onStatus) e.onStatus(LogosSubscriptionEvent::Armed, e.generation, QString());
             m_armed.push_back(std::move(e));           // keep, so reconnect can re-arm
         }
+
+        // ONE edge for the object, and only after every entry is in m_armed: a
+        // watcher may re-enter to read state or subscribe, and it must not see
+        // half a transition.
+        if (anyReal) reportTarget(objectName, LogosSubscriptionEvent::Armed, QString());
 
         // The armed set is now non-empty, so the liveness watchdog has work
         // even though nothing is pending. takeMatching() above stopped the
@@ -534,6 +621,37 @@ private:
         }
         m_armed = std::move(keep);
     }
+
+    // The mirror of reviveArmed for Manual subscriptions: park them in m_held
+    // instead of putting them back in the pending set. Run this FIRST, so the
+    // reviveArmed that follows finds only the Automatic ones.
+    //
+    // A SEPARATE VECTOR, not a flag on m_entries, and every reason is a sweep
+    // that would otherwise pick a held entry back up:
+    //   * takeMatching() is per-object and unconditional, so an unrelated
+    //     subscriber arming this same object would re-arm the held one as a
+    //     side effect — the bug that is hardest to see, because nothing the
+    //     held subscription did caused it;
+    //   * tick()'s `wanted` set would keep asking the transport for it;
+    //   * reportStillPending() would warn that it is "DEFERRED, not lost" about
+    //     something deliberately not being chased;
+    //   * timerNeeded() would hold the watchdog up forever.
+    // With m_held out of the pending set, all four are correct with no edits.
+    void holdArmed(const QString& objectName)
+    {
+        const bool manual =
+            m_targets.value(objectName).restart == LogosRestartPolicy::Manual;
+        if (!manual) return;
+        QVector<Entry> keep;
+        for (Entry& e : m_armed) {
+            if (e.objectName == objectName && manual)
+                m_held.push_back(std::move(e));
+            else
+                keep.push_back(std::move(e));
+        }
+        m_armed = std::move(keep);
+    }
+
 
     QVector<Entry> takeMatching(const QString& objectName)
     {
@@ -560,10 +678,10 @@ private:
                 << "' ABANDONED -- the transport reported this object permanently "
                    "unavailable. This subscription will never fire.";
             if (e.onArmed) e.onArmed(false);
-            if (e.onStatus)
-                e.onStatus(LogosSubscriptionEvent::Abandoned, e.generation,
-                           QStringLiteral("object_unreachable"));
         }
+        if (!matched.isEmpty())
+            reportTarget(objectName, LogosSubscriptionEvent::Abandoned,
+                         QStringLiteral("object_unreachable"));
     }
 
     // Liveness watchdog: the missing half of subscription continuity.
@@ -592,19 +710,25 @@ private:
         if (dead.isEmpty()) return;
 
         for (const QString& objectName : dead) {
-            // Report BEFORE reviving: a status callback may re-enter the
-            // registry, and reviveArmed() mutates the very vector we would
-            // otherwise be iterating.
+            const bool held =
+                m_targets.value(objectName).restart == LogosRestartPolicy::Manual;
+            // A handle can go stale with nothing armed against it -- every
+            // subscription to it cancelled, the handle not yet dropped. There
+            // is no loss to report there: nobody was receiving anything.
+            // Sampled BEFORE the moves below, which empty m_armed for this
+            // object.
+            const bool wasArmed = hasArmedFor(objectName);
             for (const Entry& e : m_armed) {
                 if (e.objectName != objectName) continue;
                 qWarning().nospace()
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
-                    << "' subscription LOST (generation " << e.generation
-                    << ") -- the provider became unreachable. Re-arming; events "
-                       "emitted before it returns are unrecoverable.";
-                if (e.onStatus)
-                    e.onStatus(LogosSubscriptionEvent::Lost, e.generation,
-                               QStringLiteral("provider_unavailable"));
+                    << (held ? "' subscription HELD (generation " : "' subscription LOST (generation ")
+                    << m_targets.value(objectName).generation
+                    << (held ? ") -- the provider became unreachable and this module's "
+                               "restart policy is Manual, so it will NOT re-arm. Call "
+                               "rearmSubscriptions() to revive it."
+                             : ") -- the provider became unreachable. Re-arming; events "
+                               "emitted before it returns are unrecoverable.");
             }
 
             // Drop the dead handle so liveHandle() stops answering with it and
@@ -612,17 +736,73 @@ private:
             if (LogosObject* obj = m_handles.take(objectName))
                 obj->release();
             m_acquiring.remove(objectName);
+            // Park the Manual ones FIRST, so reviveArmed sees only Automatic.
+            holdArmed(objectName);
             reviveArmed(objectName);
-            beginAcquire(objectName);
+
+            // After the moves, so a watcher that calls rearmSubscriptions() on
+            // Held finds the held set populated; before the chase, because
+            // beginAcquire() can arm synchronously and would otherwise deliver
+            // Armed ahead of the Lost it answers.
+            if (wasArmed)
+                reportTarget(objectName, held ? LogosSubscriptionEvent::Held
+                                              : LogosSubscriptionEvent::Lost,
+                             QStringLiteral("provider_unavailable"));
+
+            // Only chase the object if something still wants it. An
+            // all-Manual object has nothing pending, and asking the transport
+            // for it would re-acquire a handle no subscription is waiting on.
+            if (hasPendingFor(objectName))
+                beginAcquire(objectName);
         }
         ensureTimer();
+    }
+
+    bool hasPendingFor(const QString& objectName) const
+    {
+        for (const Entry& e : m_entries)
+            if (e.objectName == objectName) return true;
+        return false;
+    }
+
+    bool hasArmedFor(const QString& objectName) const
+    {
+        for (const Entry& e : m_armed)
+            if (e.objectName == objectName) return true;
+        return false;
+    }
+
+    bool hasHeldFor(const QString& objectName) const
+    {
+        for (const Entry& e : m_held)
+            if (e.objectName == objectName) return true;
+        return false;
+    }
+
+    // Deliver one object-level edge. The callback is copied out first: a
+    // watcher may re-enter and rehash m_targets, dangling the record.
+    void reportTarget(const QString& objectName, LogosSubscriptionEvent ev,
+                      const QString& reason)
+    {
+        auto it = m_targets.constFind(objectName);
+        if (it == m_targets.cend() || !it->onStatus) return;
+        const auto fn   = it->onStatus;
+        const quint64 g = it->generation;
+        fn(ev, g, reason);
     }
 
     LogosAPIConsumer* m_owner;
     LogosTransportConnection* m_transport;
     QVector<Entry> m_entries;   // waiting to arm
     QVector<Entry> m_armed;     // live; retained only so reconnected() can re-arm
+    // Armed, then lost, under a Manual restart policy. Deliberately outside
+    // m_entries so no sweep resurrects it — see holdArmed().
+    QVector<Entry> m_held;
     QSet<QString> m_acquiring;
+    // Per-TARGET policy, generation and watcher. Keyed by object name, created
+    // on demand by the setters so a consumer can configure a module before it
+    // subscribes to anything on it.
+    QHash<QString, Target> m_targets;
     // Subscription handles, one per object, deliberately SEPARATE from
     // LogosAPIConsumer::m_objectCache. Sharing that cache would let the call
     // path release() a handle a live subscription is attached to (it drops a
@@ -714,8 +894,7 @@ quint64 LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
         if (onArmed) onArmed(false);
         return 0;
     }
-    if (!m_pendingSubs)
-        m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
+    ensureRegistry();
     return m_pendingSubs->add(objectName, eventName, std::move(callback), std::move(onArmed));
 }
 
@@ -731,18 +910,42 @@ LogosSubscriptionState LogosAPIConsumer::eventSubscriptionState(quint64 subscrip
     return m_pendingSubs->state(subscriptionId);
 }
 
-bool LogosAPIConsumer::setSubscriptionStatusCallback(
-    quint64 subscriptionId,
-    std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
+void LogosAPIConsumer::ensureRegistry()
 {
-    if (!subscriptionId || !m_pendingSubs) return false;
-    return m_pendingSubs->setStatusCallback(subscriptionId, std::move(onStatus));
+    if (!m_pendingSubs)
+        m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
 }
 
-quint64 LogosAPIConsumer::subscriptionGeneration(quint64 subscriptionId) const
+void LogosAPIConsumer::setSubscriptionStatusCallback(
+    const QString& objectName,
+    std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
 {
-    if (!subscriptionId || !m_pendingSubs) return 0;
-    return m_pendingSubs->generation(subscriptionId);
+    if (objectName.isEmpty()) return;
+    // CREATES the registry rather than bailing: it is built lazily by
+    // onEventWhenAvailable(), so requiring it here would make
+    // configure-then-subscribe a silent no-op.
+    ensureRegistry();
+    m_pendingSubs->setStatusCallback(objectName, std::move(onStatus));
+}
+
+quint64 LogosAPIConsumer::subscriptionGeneration(const QString& objectName) const
+{
+    if (objectName.isEmpty() || !m_pendingSubs) return 0;
+    return m_pendingSubs->generation(objectName);
+}
+
+void LogosAPIConsumer::setSubscriptionRestartPolicy(const QString& objectName,
+                                                    LogosRestartPolicy policy)
+{
+    if (objectName.isEmpty()) return;
+    ensureRegistry();   // settable before the first subscribe — see above
+    m_pendingSubs->setRestartPolicy(objectName, policy);
+}
+
+bool LogosAPIConsumer::rearmSubscriptions(const QString& objectName)
+{
+    if (objectName.isEmpty() || !m_pendingSubs) return false;
+    return m_pendingSubs->rearm(objectName);
 }
 
 quint64 LogosAPIConsumer::whenObjectAvailable(const QString& objectName,
@@ -754,8 +957,7 @@ quint64 LogosAPIConsumer::whenObjectAvailable(const QString& objectName,
         if (onReady) onReady(false);
         return 0;
     }
-    if (!m_pendingSubs)
-        m_pendingSubs = new LogosPendingSubscriptions(this, m_transport.get());
+    ensureRegistry();
     return m_pendingSubs->add(objectName, QString(), {}, std::move(onReady),
                               /*readinessOnly=*/true);
 }

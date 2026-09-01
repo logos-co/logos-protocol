@@ -254,56 +254,104 @@ public:
     bool cancelEventSubscription(quint64 subscriptionId);
 
     /**
-     * @brief Watch a subscription's transitions, not just its arrival.
+     * @brief Watch a TARGET MODULE's subscription transitions.
      *
      * onEventWhenAvailable()'s `onArmed` answers a bool, which can say "live"
-     * and "given up" and nothing else. That was enough while the only question
-     * was whether a subscription had started; it cannot express the one that
-     * matters afterwards — the provider went away and came back, so this is a
-     * NEW subscription and the events in between are gone.
+     * and "given up" and nothing else. It cannot say the thing that matters
+     * afterwards: the provider went away and came back, so every subscription
+     * to it is new and the events in between are gone.
      *
-     * `onStatus` fires on every transition:
-     *   Armed(generation)     — live. `generation` is THIS arming's identity:
-     *                           1 for the first, N+1 for each re-establishment.
-     *   Lost(generation)      — the provider's handle stopped being valid.
-     *                           `generation` is the arming that just ended.
-     *                           NOT terminal: the registry re-arms as always.
-     *   Abandoned(generation) — terminal; it will never fire again.
+     * KEYED BY OBJECT, NOT BY SUBSCRIPTION. m_handles holds ONE handle per
+     * object name and every subscription to it attaches there, so a provider
+     * that dies takes all of them down together. A per-subscription callback
+     * reported one event N times; two tests in
+     * test_subscription_restart_policy.cpp pin that the halves cannot differ.
      *
-     * `reason` is a lowercase snake_case code on Lost/Abandoned
+     * Fires on every transition of the OBJECT:
+     *   Armed(generation)     — live; 1 for the first establishment, N+1 after.
+     *   Lost(generation)      — the handle stopped being valid. NOT terminal:
+     *                           the registry re-arms as always.
+     *   Held(generation)      — same loss under a Manual policy, so nothing is
+     *                           being chased. Reported INSTEAD OF Lost, never
+     *                           alongside it; rearmSubscriptions() revives it.
+     *   Abandoned(generation) — terminal.
+     *
+     * `reason` is a lowercase snake_case code on Lost/Held/Abandoned
      * ("provider_unavailable", "connection_reset", "object_unreachable"), empty
      * on Armed.
      *
-     * A SEPARATE installer rather than a fifth defaulted parameter on
-     * onEventWhenAvailable(), deliberately: logos-rust-sdk hand-declares that
-     * function's C-ABI twin inside an `extern "C"` block, and Rust does not
-     * check a hand-written declaration against the real symbol — an arity
-     * change would link against the same name and mis-call it with no
-     * diagnostic anywhere. Adding a function cannot do that. It also mirrors
-     * logos_module_set_unload_done_callback(), which installs a completion the
-     * same way for the same reason.
+     * Installable BEFORE any subscription to the object exists, and replays the
+     * current state if it is already armed or held — so no ordering misses the
+     * arm.
      *
-     * Replays the CURRENT state synchronously before returning, so a
-     * subscription that armed inside add() cannot be missed by a caller that
-     * installs its watcher immediately afterwards.
-     *
-     * @return true if the id was known.
+     * A separate installer rather than a parameter on onEventWhenAvailable():
+     * logos-rust-sdk hand-declares that function's C-ABI twin in an `extern "C"`
+     * block, and Rust does not check a hand-written declaration against the real
+     * symbol, so an arity change would mis-call it with no diagnostic.
      */
-    bool setSubscriptionStatusCallback(
-        quint64 subscriptionId,
+    void setSubscriptionStatusCallback(
+        const QString& objectName,
         std::function<void(LogosSubscriptionEvent, quint64 generation,
                            const QString& reason)> onStatus);
 
     /**
-     * @brief Which arming this subscription is currently on.
+     * @brief Which establishment this object's subscriptions are currently on.
      *
      * 0 = never armed, 1 = the first arming, N+1 after each re-establishment.
      * A caller that reads this alongside each delivered event and sees it
      * change has observed an unrecoverable gap — which makes gap DETECTION
      * available to every existing subscriber without changing how they
      * subscribe, even one that never installs a status callback.
+     *
+     * Per OBJECT for the same reason the callback is: a subscription taken
+     * after a restart shares its provider's history whether or not it watched
+     * it happen, and two subscriptions to one module cannot be on different
+     * establishments of it.
      */
-    quint64 subscriptionGeneration(quint64 subscriptionId) const;
+    quint64 subscriptionGeneration(const QString& objectName) const;
+
+    /**
+     * @brief Choose what happens when this object's provider goes away.
+     *
+     * Automatic (the default, and what every subscription has always done)
+     * re-arms and keeps delivering once the provider returns, with the gap
+     * reported as Lost -> Armed(generation+1).
+     *
+     * Manual holds them instead: the object reports Held, stops being chased,
+     * and stays that way until rearmSubscriptions(). Use it when resuming
+     * mid-stream is worse than not resuming — a consumer that has to refetch
+     * state before it can interpret the next event, say.
+     *
+     * ONE POLICY PER OBJECT, not per subscription. A per-subscription policy
+     * let an Automatic and a Manual subscription to the SAME module diverge
+     * permanently on the first loss — one revived, one held — over an event
+     * that is indivisibly per-module. There is no use for that, and it is
+     * pinned as impossible by MixedPoliciesOnOneModuleDiverge's replacement.
+     *
+     * Settable BEFORE any subscription to the object exists, and it never fails.
+     *
+     * MANUAL DOES NOT AFFECT THE FIRST ARM. A subscription taken during init(),
+     * before its provider has called listen(), is deferred and armed exactly as
+     * it always was under either policy; the policy only decides what happens
+     * to subscriptions that have ALREADY armed and then lost their provider.
+     *
+     * Takes effect on the next loss. Setting Automatic on a currently-held
+     * object does not revive it — call rearmSubscriptions().
+     */
+    void setSubscriptionRestartPolicy(const QString& objectName, LogosRestartPolicy policy);
+
+    /**
+     * @brief Revive an object's Held subscriptions.
+     *
+     * Puts them back in the pending set and chases the provider again, arming
+     * immediately if it is already back. The generation advances on the ARM, so
+     * a watcher still sees Held(N) -> Armed(N+1) and can tell the gap happened.
+     *
+     * @return false if the object has no held subscriptions — including one
+     *         whose subscriptions are still waiting for their FIRST arm, which
+     *         need no reviving because they were never held.
+     */
+    bool rearmSubscriptions(const QString& objectName);
 
     /**
      * @brief Whether a subscription id is still pending, armed, or forgotten.
@@ -362,6 +410,9 @@ private:
     // existed would pay the full probe budget on every single grant. Cleared by
     // clearObjectCache() so a reconnect or a reloaded module is re-probed.
     QSet<QString> m_noHandshakeSurface;
+
+    // Build the pending-subscription registry if it does not exist yet.
+    void ensureRegistry();
 
     // Deferred event subscriptions (onEventWhenAvailable). Appended LAST and
     // held by pointer on purpose: an opaque forward declaration keeps this

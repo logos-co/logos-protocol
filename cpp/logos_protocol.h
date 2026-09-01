@@ -194,47 +194,55 @@
 // remains the only gate that has to mean anything. token_manager.h's private
 // section carries the measurements; token_manager.cpp's static_assert is the
 // tripwire.
-// 0.9: subscription continuity -- lp_subscribe_ex() and
-// lp_subscription_generation(), plus the liveness watchdog that makes them mean
-// something (LogosPendingSubscriptions::checkLiveness, logos_api_consumer.cpp).
+// 0.9: subscription continuity -- a per-TARGET status callback, generation
+// counter and restart policy (lp_client_set_subscription_status_cb,
+// lp_client_subscription_generation, lp_client_set_subscription_options,
+// lp_client_rearm_subscriptions), plus the liveness watchdog that makes them
+// mean something (LogosPendingSubscriptions::checkLiveness).
 //
 // WHAT IT CLOSES. A provider that unloads and reloads drives its replica out of
 // Valid and back on the SAME node, and the event helper stays attached to that
 // replica -- so the subscription survives, and NOTHING said so. Events emitted
-// while the provider was down reached nobody, the stream resumed, and no
-// subscriber could tell that hole from a module that had simply gone quiet.
-// Worse, nothing was even LOOKING: reconnected() covers a torn-down connection
-// and reviveArmed() covers a handle being replaced, but neither observes a
-// provider dying underneath an already-armed subscription -- and the retry
-// timer stopped the moment everything armed, so there was no tick in which to
-// notice. Detection is the substance of this MINOR; the callback is the cheap
-// half.
+// while it was down reached nobody, the stream resumed, and no subscriber could
+// tell that hole from a module that had gone quiet. Nothing was even LOOKING:
+// reconnected() covers a torn-down connection and reviveArmed() a replaced
+// handle, but neither watches a provider die under an already-armed
+// subscription, and the retry timer stopped once everything armed. Detection is
+// the substance of this MINOR; the callback is the cheap half.
 //
-// WHY NOT JUST STOP RE-ARMING, which is the obvious reading of "a
-// re-established subscription is a new subscription". Because the re-arm is
-// load-bearing: a module subscribing to its dependency during init(), and a
-// ui_qml backend during onContextReady(), both run before the dependency calls
-// listen(), and the deferred arm is what makes those work at all. Removing it
-// would hand every consumer that has not adopted the new callback SILENT EVENT
-// LOSS on a provider restart -- strictly worse than the silent resume it
-// replaced. So the re-arm stays and becomes observable instead.
+// WHY THE RE-ARM STAYS, rather than "a re-established subscription is a new one,
+// so stop re-arming". It is load-bearing: a module subscribing during init(),
+// and a ui_qml backend during onContextReady(), both run before the dependency
+// calls listen(), and the deferred arm is what makes those work at all.
+// Removing it would hand every consumer that has not adopted the callback
+// SILENT EVENT LOSS -- strictly worse than the silent resume. So the re-arm
+// stays and becomes observable, and {"restart":"manual"} is there for a
+// consumer that would rather be told the stream ended than handed a
+// continuation of it (LP_SUB_HELD instead of LP_SUB_LOST, never both).
 //
-// ADDITIVE, and the additive spelling is not cosmetic here. logos-rust-sdk
-// hand-declares lp_subscribe inside an `extern "C"` block (src/ffi.rs), and
-// Rust does not check a hand-written declaration against the real symbol: an
-// arity change would link against the same symbol name and mis-call it with no
-// diagnostic anywhere, at any layer. Hence a new function rather than a fifth
-// parameter, and lp_subscribe retained verbatim as
-// lp_subscribe_ex(..., nullptr, ...).
+// EVERYTHING IS KEYED BY TARGET MODULE. m_handles holds ONE handle per object
+// name and every subscription to it attaches there, so a provider that dies
+// takes all of them down together; there is no state in which two subscriptions
+// to one module disagree. Keying per subscription reported one event N times
+// and admitted a combination that cannot occur -- an automatic and a manual
+// subscription to the SAME module diverging permanently on the first loss. Two
+// tests in test_subscription_restart_policy.cpp pin the coupling.
 //
-// AND THE HALF THAT IS NOT OPT-IN: the generation counter is maintained for
-// EVERY subscription, so lp_subscription_generation() gives an existing
-// consumer gap detection without it changing how it subscribes. The behaviour
-// change is fleet-wide; only the live callback is opt-in.
+// 0.9 WAS REVISED IN PLACE, which matters because this header promises MINORs
+// are additive. An earlier 0.9 landed on master with the same feature keyed per
+// subscription (lp_subscribe_ex, lp_subscription_generation); those symbols are
+// GONE. That is a removal from a MINOR, allowed exactly once, here, because 0.9
+// had not left the tree -- every consumer was in this repo, the three SDKs and
+// the json-rpc bridge, all moving in the same wave. A later MINOR does not get
+// this latitude.
 //
-// A CONSUMER BELOW 0.9 loses nothing and gains nothing: it never calls either
-// function, and the watchdog only ever re-arms a subscription that the old code
-// would have re-armed anyway. What it does NOT get is the ability to know.
+// ADDITIVE OTHERWISE: lp_subscribe is retained VERBATIM and everything new is a
+// separate function on lp_client. That spelling is not cosmetic -- logos-rust-sdk
+// hand-declares lp_subscribe in an `extern "C"` block, and Rust does not check
+// it against the real symbol, so an arity change would link against the same
+// name and mis-call it with no diagnostic. The generation counter is maintained
+// for EVERY client, so gap detection reaches a consumer that changes nothing;
+// only the live callback is opt-in.
 #define LOGOS_PROTOCOL_VERSION_MINOR 9
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
@@ -336,24 +344,32 @@ typedef void (*lp_result_cb)(int ok, const char* json, void* user_data);
 typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
                             void* user_data);
 
-/* Subscription status edges, for lp_subscribe_ex. Plain codes rather than an
- * enum so the set can grow the way logos_call_error.h's codes do. */
-#define LP_SUB_ARMED      1  /* live; `generation` is THIS arming's identity   */
+/* Subscription status edges, reported per TARGET MODULE. Plain codes rather
+ * than an enum so the set can grow the way logos_call_error.h's codes do. */
+#define LP_SUB_ARMED      1  /* live; `generation` is THIS establishment's id  */
 #define LP_SUB_LOST       2  /* the provider became unreachable. Events from   */
                              /* now until the next LP_SUB_ARMED are gone. NOT  */
                              /* terminal: the SDK re-arms, as it always has.   */
 #define LP_SUB_ABANDONED  3  /* terminal; it will never fire again             */
+#define LP_SUB_HELD       4  /* the provider became unreachable AND the        */
+                             /* target's restart policy is manual, so nothing  */
+                             /* will re-arm itself. Delivered INSTEAD OF       */
+                             /* LP_SUB_LOST, never alongside it, so "did it    */
+                             /* revive itself?" is answered by which code      */
+                             /* arrived. Not terminal:                         */
+                             /* lp_client_rearm_subscriptions() revives it.    */
 
-/** Status callback for lp_subscribe_ex.
+/** Status callback for lp_client_set_subscription_status_cb.
  *
- *  `generation` is which arming the subscription is on: 1 for the first, N+1
+ *  `generation` is which establishment the TARGET is on: 1 for the first, N+1
  *  for each re-establishment. A LP_SUB_LOST followed by LP_SUB_ARMED with a
  *  higher generation is the unrecoverable-gap marker — the pair a subscriber
  *  needs in order to tell "the provider restarted and I missed events" from
  *  "the module has been quiet".
  *
- *  `reason` is a lowercase snake_case code on LOST/ABANDONED
- *  ("provider_unavailable", "object_unreachable"), NULL on ARMED. Valid only
+ *  `reason` is a lowercase snake_case code on LOST/HELD/ABANDONED
+ *  ("provider_unavailable", "connection_reset", "object_unreachable"), NULL on
+ *  ARMED. Valid only
  *  for the duration of the callback.
  *
  *  Fires on the client's owner thread — the same thread as lp_event_cb.
@@ -471,42 +487,90 @@ LP_API lp_subscription* lp_subscribe(lp_client* client,
                               void* user_data);
 
 /**
- * lp_subscribe, plus a channel for the subscription's own transitions.
+ * Watch a TARGET MODULE's subscription transitions.
  *
- * Identical in every other respect; `status_cb == NULL` makes it byte-for-byte
- * lp_subscribe, which is exactly how lp_subscribe is now implemented.
+ * lp_subscribe tells you an event arrived and nothing else -- not that the
+ * provider died and came back, because the SDK re-arms silently and the stream
+ * resumes with a hole in it. This is how you find out:
  *
- * WHY IT EXISTS. lp_subscribe tells you an event arrived and nothing else. It
- * cannot tell you the provider died and came back — the SDK re-arms the
- * subscription silently, so the stream resumes with a hole in it that no
- * subscriber can see. That re-arm is deliberate and stays (a subscription made
- * during init(), before the provider calls listen(), depends on it), but a
- * re-established subscription is a NEW one and the events in between are
- * unrecoverable. `status_cb` is how you find out:
+ *     LP_SUB_ARMED(1) ... LP_SUB_LOST(1) ... LP_SUB_ARMED(2)
  *
- *     LP_SUB_ARMED(1)              first arming
- *     ... events ...
- *     LP_SUB_LOST(1)               provider gone; the gap starts here
- *     LP_SUB_ARMED(2)              back, as a NEW subscription
- *     ... events ...               everything emitted in between is lost
+ * where the gap between LOST and the next ARMED is unrecoverable.
  *
- * `status_cb` is called with the CURRENT state before this returns, so a
- * subscription that arms synchronously inside the call cannot be missed.
+ * PER CLIENT, WHICH IS PER TARGET MODULE: a client names one target and every
+ * lp_subscribe through it attaches to that module's single handle, so they are
+ * lost and re-established together. Installable BEFORE any subscription exists,
+ * and replays the current state, so no ordering can miss the arm.
+ *
+ * Passing NULL removes the watcher. Returns 1 on success, 0 for a NULL client.
  */
-LP_API lp_subscription* lp_subscribe_ex(lp_client* client,
-                                 const char* event_name,
-                                 lp_event_cb cb,
-                                 lp_subscription_status_cb status_cb,
-                                 void* user_data);
+LP_API int lp_client_set_subscription_status_cb(lp_client* client,
+                                         lp_subscription_status_cb status_cb,
+                                         void* user_data);
 
-/** Which arming this subscription is currently on: 0 = never armed, 1 = the
- *  first, N+1 after each re-establishment.
+/**
+ * Which establishment this client's target is on: 0 = never armed, 1 = the
+ * first, N+1 after each re-establishment.
  *
- *  Maintained for EVERY subscription, including one made with plain
- *  lp_subscribe — so an existing consumer gains gap detection by reading this
- *  next to each delivered event and noticing it change, without altering how it
- *  subscribes or adopting a callback. 0 for a null handle. */
-LP_API unsigned long long lp_subscription_generation(lp_subscription* sub);
+ * Maintained for EVERY client, including one that never installs a status
+ * callback — so an existing consumer gains gap detection by reading this next
+ * to each delivered event and noticing it change, without altering how it
+ * subscribes or adopting a callback at all. 0 for a null handle.
+ */
+LP_API unsigned long long lp_client_subscription_generation(lp_client* client);
+
+/**
+ * Set subscription options for this client's target module.
+ *
+ * `options_json` is a JSON object, or NULL/empty for defaults. Unknown keys are
+ * IGNORED, so a newer caller against an older runtime loses the OPTION, not its
+ * subscriptions.
+ *
+ *   {"restart": "automatic"}   the default: re-arm on provider loss and keep
+ *                              delivering, the gap visible as LP_SUB_LOST ->
+ *                              LP_SUB_ARMED(generation+1).
+ *   {"restart": "manual"}      hold instead: report LP_SUB_HELD, stop chasing,
+ *                              and stay down until
+ *                              lp_client_rearm_subscriptions(). For a consumer
+ *                              that must refetch state before the next event
+ *                              means anything.
+ *
+ * MANUAL DOES NOT AFFECT THE FIRST ARM. A subscription taken before its
+ * provider has called listen() -- a module's init(), a UI backend's
+ * onContextReady() -- is deferred and armed under either policy. That is why
+ * this is safe to adopt anywhere.
+ *
+ * One policy per target, for the same reason the status callback is per target.
+ * Takes effect on the next loss and never revives anything by itself: setting
+ * "automatic" on a held target does NOT re-arm it.
+ *
+ * JSON rather than a flags word so a future option is a new key, ignorable by
+ * an older runtime and omittable by an older caller.
+ *
+ * Returns 1 on success, 0 for a NULL client or unparseable JSON.
+ */
+LP_API int lp_client_set_subscription_options(lp_client* client,
+                                       const char* options_json);
+
+/**
+ * Revive this client's target if its subscriptions are HELD.
+ *
+ * Puts them back in the pending set and chases the provider again, arming
+ * immediately if it is already back. The generation advances on the ARM, so a
+ * watcher still sees LP_SUB_HELD(N) -> LP_SUB_ARMED(N+1) and can tell the gap
+ * happened.
+ *
+ * EVENTUAL, not immediate, and for the same reason lp_unsubscribe's de-tracking
+ * half is: it is posted to the client's owner thread rather than marshalled
+ * synchronously onto it. That is what makes it safe to call from INSIDE the
+ * status callback — which is the obvious place to call it from, and would
+ * otherwise be a lock-order inversion against the delivery guard.
+ *
+ * Returns 1 if the revive was accepted, 0 for a NULL client or a target with no
+ * held subscriptions — including one still waiting for its FIRST arm, which
+ * needs no reviving because it was never held.
+ */
+LP_API int lp_client_rearm_subscriptions(lp_client* client);
 
 /** Cancel a subscription. After this returns the callback will not fire again
  *  (already-running invocations are allowed to finish first) — that part is
