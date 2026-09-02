@@ -236,6 +236,30 @@
 // the json-rpc bridge, all moving in the same wave. A later MINOR does not get
 // this latitude.
 //
+// AND THE PRICE, which is worth knowing before you debug it: BOTH cuts report
+// LOGOS_PROTOCOL_VERSION_MINOR 9, so a VERSION guard cannot tell them apart. A
+// consumer still pinned to the first cut (48afc01) sees the removal as a
+// MISSING SYMBOL -- a compile error in C++, and a dlopen-time undefined symbol
+// in Rust, whose extern "C" declarations are unconditional and so link against
+// nothing until load.
+//
+// LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE exists for exactly this: a C++
+// consumer that must build against both cuts cannot use `MINOR >= 9`, which
+// compiles the new call sites against a protocol that does not export them.
+// Not hypothetical -- logos-cpp-sdk shipped that guard, and its doctests, which
+// build downstream modules from those modules' OWN older locks, caught it.
+//
+// NOTE FOR ANYONE ADOPTING IT: this macro POSTDATES the revision, so a consumer
+// that must also work against the merged 47d287c has to accept LP_SUB_HELD as
+// well -- that code arrived WITH the client-scoped surface and is absent from
+// every protocol without it. logos-cpp-sdk spells the condition
+// `defined(LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE) || defined(LP_SUB_HELD)`
+// for that reason. Guarding on this macro ALONE against 47d287c compiles the
+// feature out silently, which is worse than the build break it replaces.
+//
+// Rust gets no preprocessor and so cannot guard at all; its only defence is
+// closure discipline, one protocol per closure via `follows`.
+//
 // ADDITIVE OTHERWISE: lp_subscribe is retained VERBATIM and everything new is a
 // separate function on lp_client. That spelling is not cosmetic -- logos-rust-sdk
 // hand-declares lp_subscribe in an `extern "C"` block, and Rust does not check
@@ -246,6 +270,16 @@
 #define LOGOS_PROTOCOL_VERSION_MINOR 9
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
+
+// FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
+// cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
+// four symbols and of one that does not. Guard on this instead:
+//
+//     #if defined(LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE)
+//
+// Absent below the revision, including on the first cut of 0.9. Defined and
+// never undefined from here on, so a later MINOR keeps satisfying it.
+#define LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE 1
 
 /* ---------------------------------------------------------------------------
  * Export marking.

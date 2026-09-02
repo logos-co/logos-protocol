@@ -314,10 +314,10 @@ add_executable(protocol_tests
     # already-armed subscription. It re-arms on the same node with the event
     # helper still attached, so the stream resumed silently with a hole in it
     # and nothing was even polling for the death. Pins the generation counter
-    # (visible to a plain lp_subscribe caller) and the LOST -> ARMED pair
-    # lp_subscribe_ex delivers, with a provider-stays-up control.
+    # (visible to a plain lp_subscribe caller) and the LOST -> ARMED pair the
+    # client's status callback delivers, with a provider-stays-up control.
     test_subscription_continuity.cpp
-    # The other half of continuity: a per-subscription restart policy. The
+    # The other half of continuity: a per-module restart policy. The
     # load-bearing test is ManualStillArmsDeferred — manual must mean "do not
     # RE-arm", never "do not arm", or every subscription taken during init()
     # before its provider listens stops working.
