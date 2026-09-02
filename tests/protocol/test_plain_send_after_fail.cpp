@@ -449,9 +449,9 @@ TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswere
 //
 // PRE-FIX (cf1b9b0), 40 rounds: all 40 were answered only by the deadline —
 // worst 828ms, against the 800ms deadline that validation run used — with code
-// "timeout". POST-FIX: 0 reported as a timeout, worst latency 35ms idle and
-// 52ms under 8x CPU oversubscription, which is this test's own 30ms parking
-// sleep plus the hop through the Qt loop.
+// "timeout". POST-FIX: 0 reported as a timeout, worst latency 183ms on the
+// macos-latest runner and 35ms on an idle local box, which is this test's own
+// 30ms parking sleep plus the hop through the Qt loop.
 //
 // ── WHERE THE BARS ARE SET, after this failed once on a shared CI runner ─────
 //
@@ -467,18 +467,21 @@ TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswere
 //     two seconds, not eight hundred milliseconds, to manufacture the "timeout"
 //     verdict this test exists to forbid. Pre-fix every round still burns it in
 //     full, so re-validating against cf1b9b0 now costs ~80s here, not ~33s.
-//   * PROMPTNESS is an absolute 400ms, not half the deadline. It bounds a 30ms
-//     park plus a Qt hop, which the deadline has no bearing on; tied to the
-//     deadline it would have silently slackened to 1000ms just now.
+//   * PROMPTNESS is an absolute 800ms, set off what the mechanism costs on the
+//     SLOWEST box measured — worst 183ms on macos-latest, against 35ms locally
+//     — and not off the deadline, which has no bearing on it. A fraction of the
+//     deadline tracks the wrong quantity: the old kTimeoutMs / 2 left a healthy
+//     macos run only 2.2x of headroom, which is the likeliest thing that tripped,
+//     and raising the deadline would have loosened the bar for free.
 //   * Both bars tolerate 2 of 40 rounds, so one descheduled round is not a red
-//     suite. Pre-fix ALL 40 miss them, leaving a 20x margin. Zero tolerance is
+//     suite. Pre-fix 38-40 of 40 miss them, a ~19x margin. Zero tolerance is
 //     kept where it costs nothing: tests 1 and 4 assert unanswered/dropped == 0
 //     on counts with no clock in them, and they are the detectors of the drop
 //     itself.
 //
-// Measured under 8x oversubscription, none of the above is what moves: worst
-// latency held at 36-52ms and timedOut at 0, while answered-by-reclaim fell
-// from 40 to 18-31 as the mutex handoff lost more often. That counter is
+// Measured under 8x local oversubscription, none of the above is what moves:
+// worst latency held at 36-52ms and timedOut at 0, while answered-by-reclaim
+// fell from 40 to 18-31 as the mutex handoff lost more often. That counter is
 // asserted only to be non-zero — the weakest form that is still not vacuous.
 TEST_F(PlainSendAfterFailTest,
        TheCallerIsToldTheTransportClosedInsteadOfWaitingOutItsDeadline)
@@ -488,7 +491,7 @@ TEST_F(PlainSendAfterFailTest,
 
     constexpr int kRounds         = 40;
     constexpr int kTimeoutMs      = 2000;   // see WHERE THE BARS ARE SET, above
-    constexpr int kPromptMs       = 400;    // answered by the transport, not the clock
+    constexpr int kPromptMs       = 800;    // answered by the transport, not the clock
     constexpr int kStallTolerance = 2;      // rounds a contended runner may stall
 
     int reached  = 0;
