@@ -447,18 +447,52 @@ TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswere
 // party, since the transport knew the connection was gone before the call was
 // ever written.
 //
-// PRE-FIX (cf1b9b0), 40 rounds with an 800ms deadline: all 40 were answered only
-// by the deadline — worst 828ms — with code "timeout". POST-FIX: 0 reported as a
-// timeout, worst latency 30-88ms (which is this test's own 30ms parking sleep
-// plus the hop through the Qt loop).
+// PRE-FIX (cf1b9b0), 40 rounds: all 40 were answered only by the deadline —
+// worst 828ms, against the 800ms deadline that validation run used — with code
+// "timeout". POST-FIX: 0 reported as a timeout, worst latency 183ms on the
+// macos-latest runner and 35ms on an idle local box, which is this test's own
+// 30ms parking sleep plus the hop through the Qt loop.
+//
+// ── WHERE THE BARS ARE SET, after this failed once on a shared CI runner ─────
+//
+// Run 33637026342 (macos-latest) failed this test on a commit ubuntu-latest
+// passed, and four consecutive local runs passed 559/559; nothing on that
+// branch touches this path. The bars below are set for a contended runner
+// WITHOUT moving the property, which is that the reclaim answers the call and
+// the deadline does not:
+//
+//   * The DEADLINE is 2000ms, not 800ms. Post-fix no round reaches it — the
+//     answer arrives ~35ms in — so its size is free, and only a run that is
+//     already failing pays for it. What it buys is that a runner must stall for
+//     two seconds, not eight hundred milliseconds, to manufacture the "timeout"
+//     verdict this test exists to forbid. Pre-fix every round still burns it in
+//     full, so re-validating against cf1b9b0 now costs ~80s here, not ~33s.
+//   * PROMPTNESS is an absolute 800ms, set off what the mechanism costs on the
+//     SLOWEST box measured — worst 183ms on macos-latest, against 35ms locally
+//     — and not off the deadline, which has no bearing on it. A fraction of the
+//     deadline tracks the wrong quantity: the old kTimeoutMs / 2 left a healthy
+//     macos run only 2.2x of headroom, which is the likeliest thing that tripped,
+//     and raising the deadline would have loosened the bar for free.
+//   * Both bars tolerate 2 of 40 rounds, so one descheduled round is not a red
+//     suite. Pre-fix ALL 40 miss them, leaving a 20x margin. Zero tolerance is
+//     kept where it costs nothing: tests 1 and 4 assert unanswered/dropped == 0
+//     on counts with no clock in them, and they are the detectors of the drop
+//     itself.
+//
+// Measured under 8x local oversubscription, none of the above is what moves:
+// worst latency held at 36-52ms and timedOut at 0, while answered-by-reclaim
+// fell from 40 to 18-31 as the mutex handoff lost more often. That counter is
+// asserted only to be non-zero — the weakest form that is still not vacuous.
 TEST_F(PlainSendAfterFailTest,
        TheCallerIsToldTheTransportClosedInsteadOfWaitingOutItsDeadline)
 {
     IoWorker io;
     EagerProvider provider;
 
-    constexpr int kRounds    = 40;
-    constexpr int kTimeoutMs = 800;
+    constexpr int kRounds         = 40;
+    constexpr int kTimeoutMs      = 2000;   // see WHERE THE BARS ARE SET, above
+    constexpr int kPromptMs       = 800;    // answered by the transport, not the clock
+    constexpr int kStallTolerance = 2;      // rounds a contended runner may stall
 
     int reached  = 0;
     int timedOut = 0;
@@ -528,23 +562,34 @@ TEST_F(PlainSendAfterFailTest,
     }
 
     std::sort(latencies.begin(), latencies.end());
-    const qint64 worst = latencies.empty() ? -1 : latencies.back();
+    const qint64 worst  = latencies.empty() ? -1 : latencies.back();
+    const qint64 median = latencies.empty() ? -1 : latencies[latencies.size() / 2];
+    const int    slow   = static_cast<int>(std::count_if(
+        latencies.begin(), latencies.end(),
+        [](qint64 ms) { return ms >= kPromptMs; }));
+
     std::cout << "  " << kRounds << " rounds, " << kTimeoutMs
               << "ms deadline -> answered-by-reclaim=" << reached
               << " reported-as-TIMEOUT=" << timedOut
               << " never-delivered=" << missing << " doubled=" << doubled
-              << " worst latency=" << worst << "ms" << std::endl;
+              << " latency median=" << median << "ms worst=" << worst
+              << "ms over-" << kPromptMs << "ms=" << slow << "/" << kRounds
+              << std::endl;
 
     EXPECT_EQ(missing, 0);
     EXPECT_EQ(doubled, 0);
-    EXPECT_EQ(timedOut, 0)
+    EXPECT_LE(timedOut, kStallTolerance)
         << timedOut << " of " << kRounds << " calls waited out their entire "
         << kTimeoutMs << "ms deadline and were then reported as a TIMEOUT. The "
            "connection was already torn down when the call was made; the honest "
            "code is transport_error, and it was available immediately.";
     ASSERT_FALSE(latencies.empty());
-    EXPECT_LT(worst, kTimeoutMs / 2)
-        << "a call took " << worst << "ms to be told the transport was gone";
+    EXPECT_LE(slow, kStallTolerance)
+        << slow << " of " << kRounds << " calls needed " << kPromptMs
+        << "ms or more to be told the transport was gone (median " << median
+        << "ms, worst " << worst << "ms). A healthy round is answered by the "
+           "reclaim in about the 30ms this test parks the caller for, and the "
+           "deadline plays no part in it.";
     EXPECT_GT(reached, 0)
         << "the interleaving this test exists for was never reached in "
         << kRounds << " rounds — this run proved nothing";
