@@ -39,8 +39,16 @@ jobs:
           nix build ".#checks.$(nix eval --raw --impure --expr builtins.currentSystem).module-impl-abi-tests" \
             --no-link --print-build-logs
 
+      # --print-build-logs is load-bearing, not decoration. The suite RUNS in
+      # this derivation's checkPhase (nix/tests.nix), so a failing test fails
+      # this step — and without -L all nix reports is its own "Last 25 log
+      # lines" tail. Test #177 of 559 failing put its --output-on-failure block
+      # ~380 tests above that tail, so run 33637026342 named the test and
+      # nothing else: no assertion, no counters, not reachable via
+      # `gh run view --log-failed`. A race test that fails with no diagnostic
+      # costs a full local reproduction every time.
       - name: Build tests
-        run: nix build '.#tests'
+        run: nix build '.#tests' --print-build-logs
 
       - name: Run protocol tests
         run: ./result/bin/protocol_tests
