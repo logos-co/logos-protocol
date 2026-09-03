@@ -88,12 +88,19 @@ public:
         }
         return QVariant();
     }
-    bool informModuleToken(const QString&, const QString&) override { return true; }
+    bool informModuleToken(const QString& moduleName, const QString& token) override {
+        lastModule = moduleName;
+        lastToken = token;
+        return true;
+    }
     QJsonArray getMethods() override { return QJsonArray{}; }
     void setEventListener(EventCallback) override {}
     void init(void*) override {}
     QString providerName() const override { return QStringLiteral("capability_module"); }
     QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+
+    QString lastModule;
+    QString lastToken;
 private:
     ModuleProxy* m_targetProxy = nullptr;
 };
@@ -243,4 +250,64 @@ TEST_F(LpClientOwnerThreadTest, SecondWorkerThreadClientAlsoWorks)
 
     ASSERT_TRUE(finished) << "worker-thread clients did not complete within 15s";
     EXPECT_EQ(calls.load(), 2);
+}
+
+// The same contract, reached through the public C ABI's token handoff.
+// lp_inform_module_token lands on the 3-arg LogosAPIClient::informModuleToken,
+// which was the one client entry point with no marshal — so a worker acquired
+// capability_module's replica against a node owned by the main thread,
+// waitForSource burned its full 20s, and the grant came back as a refusal.
+// The header has promised the opposite all along (logos_protocol.h:29-31:
+// "the library marshals to the handle's owner thread internally where required").
+TEST_F(LpClientOwnerThreadTest, InformModuleTokenFromWorkerThreadReachesCapabilityModule)
+{
+    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+
+    CapabilityProvider capProvider;
+    ModuleProxy        capProxy(&capProvider);
+
+    // ModuleProxy::informModuleToken accepts only this store's credential,
+    // which TokenManager derives from the "capability_module" bootstrap key.
+    const QString bootstrapToken = QStringLiteral("bootstrap-tok-inform");
+    TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
+
+    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+
+    std::atomic<bool> done{false};
+    std::atomic<int> rc{-1};
+
+    const auto started = std::chrono::steady_clock::now();
+    std::thread worker([&]() {
+        lp_client* client = lp_client_create("capability_module", "worker_origin",
+                                             nullptr, nullptr);
+        if (!client) { done = true; return; }
+
+        rc = lp_inform_module_token(client,
+                                    bootstrapToken.toUtf8().constData(),
+                                    "granted_module", "granted-tok");
+        lp_client_destroy(client);
+        done = true;
+    });
+
+    const auto deadline = started + std::chrono::seconds(15);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline)
+        pumpEventLoop(10);
+
+    const bool finished = done.load();
+    worker.join();
+    pumpEventLoop(50);
+
+    ASSERT_TRUE(finished)
+        << "worker-thread lp_inform_module_token did not complete within 15s — "
+           "it is acquiring capability_module's replica on a thread that owns "
+           "neither the node nor an event loop";
+    EXPECT_EQ(rc.load(), LP_OK);
+    EXPECT_EQ(capProvider.lastModule, QStringLiteral("granted_module"));
+    EXPECT_EQ(capProvider.lastToken, QStringLiteral("granted-tok"));
+
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    EXPECT_LT(elapsedMs, 5000)
+        << "grant took " << elapsedMs << "ms; tens of ms is healthy, seconds "
+           "means the acquire fell out on a timeout";
 }

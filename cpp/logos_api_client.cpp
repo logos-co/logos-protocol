@@ -547,7 +547,12 @@ void LogosAPIClient::onEventResponse(QObject* object, const QString& eventName, 
 
 bool LogosAPIClient::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
-    return m_consumer->informModuleToken(authToken, moduleName, token);
+    // Marshal to the owner thread, as requestObject does. The handle here is
+    // uncached, which is not the same as thread-agnostic: it is still acquired
+    // from — and released back to — the owner's node.
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->informModuleToken(authToken, moduleName, token);
+    });
 }
 
 bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::string& moduleName, const std::string& token)
@@ -560,15 +565,8 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
 bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs)
 {
     // Marshal to the owner thread, exactly as requestObject/invokeRemoteMethod do.
-    // This path now goes through acquireCachedObject, so it reads and mutates
-    // m_objectCache — declared single-threaded, and holding thread-affine QtRO
-    // handles. Before the handshake surface existed this method used an
-    // uncached requestObject + release(), so it touched no shared state; routing
-    // it onto the cache is what made the missing marshal reachable.
-    //
-    // (LogosAPIClient::informModuleToken — the 3-arg form above — has the same
-    // missing marshal, but it still uses an uncached handle and predates this
-    // change, so it is left alone rather than widened into this fix.)
+    // This path goes through acquireCachedObject, so it also reads and mutates
+    // m_objectCache — single-threaded, and holding thread-affine QtRO handles.
     return logos::runOnOwnerThread(this, [&]() -> bool {
         return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token, timeoutMs);
     });
