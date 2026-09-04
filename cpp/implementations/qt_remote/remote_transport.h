@@ -25,7 +25,8 @@ private:
 };
 
 class RemoteTransportConnection : public LogosTransportConnection,
-                                  public LogosTransportAsyncAcquire {
+                                  public LogosTransportAsyncAcquire,
+                                  public LogosTransportPresence {
 public:
     explicit RemoteTransportConnection(const QString& registryUrl);
     ~RemoteTransportConnection() override;
@@ -42,6 +43,11 @@ public:
                                     AcquireCallback onReady) override;
 
     LogosObject* tryAcquireNow(const QString& objectName) override;
+
+    // See LogosTransportPresence. Reads the same parked probe tryAcquireNow
+    // uses without consuming it. Never answers Absent: QtRO cannot tell a
+    // module that is gone from one that has not published yet.
+    TargetPresence targetPresence(const QString& objectName) override;
 
     // Test hook: how many times requestObject() acquired a fresh replica
     // (process-wide). Lets a test assert the consumer's handle cache reuses one

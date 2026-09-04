@@ -232,4 +232,14 @@ LogosObject* LocalTransportConnection::requestObject(const QString& objectName, 
     return new LocalLogosObject(proxy, objectName);
 }
 
+TargetPresence LocalTransportConnection::targetPresence(const QString& objectName)
+{
+    if (objectName.isEmpty()) return TargetPresence::Unknown;
+    QObject* plugin = PluginRegistry::getPlugin<QObject>(objectName);
+    // A registered object that is not a ModuleProxy is not callable through
+    // this transport, so it is absent for the caller's purposes.
+    return (plugin && qobject_cast<ModuleProxy*>(plugin)) ? TargetPresence::Present
+                                                          : TargetPresence::Absent;
+}
+
 #include "local_transport.moc"

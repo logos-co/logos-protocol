@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 
 class LogosAPI;
+#include "logos_transport.h"
+
 class LogosAPIConsumer;
 class LogosObject;
 class TokenManager;
@@ -77,6 +79,13 @@ public:
      * @return LogosObject* handle, or nullptr if failed
      */
     LogosObject* requestObject(const QString& objectName, Timeout timeout = Timeout());
+
+    /**
+     * Is `objectName` reachable right now? Local, no round trip, no blocking.
+     * See LogosAPIConsumer::targetPresence — in particular that Unknown means
+     * "try the call", never "absent".
+     */
+    TargetPresence targetPresence(const QString& objectName);
 
     bool isConnected() const;
     QString registryUrl() const;

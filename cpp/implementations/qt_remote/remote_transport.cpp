@@ -887,6 +887,36 @@ LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
     return new RemoteLogosObject(replica, objectName);
 }
 
+TargetPresence RemoteTransportConnection::targetPresence(const QString& objectName)
+{
+    if (objectName.isEmpty() || !m_node || !m_connected)
+        return TargetPresence::Unknown;
+
+    // Park a probe exactly as tryAcquireNow does, and for the same
+    // use-after-free reason documented there — but never hand it over. Parking
+    // is also what makes this cheap on repeat and self-correcting: the node
+    // retries the endpoint every 250 ms for the life of the process, so a probe
+    // for a module that arrives later goes Valid on its own.
+    QPointer<QRemoteObjectReplica>& probe = m_probes[objectName];
+    if (!probe) {
+        QRemoteObjectReplica* fresh = m_node->acquireDynamic(objectName);
+        if (!fresh) {
+            m_probes.remove(objectName);
+            return TargetPresence::Unknown;
+        }
+        if (m_pendingAcquires) fresh->setParent(m_pendingAcquires);
+        probe = fresh;
+    }
+
+    // Valid means the source published and the metaobject arrived. Anything
+    // else is "would have to be waited on", which is NOT the same as absent —
+    // a module whose host is still starting looks identical to one that was
+    // never installed, so answering Absent here would be a guess.
+    return probe->state() == QRemoteObjectReplica::Valid
+               ? TargetPresence::Present
+               : TargetPresence::Unknown;
+}
+
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }
 void RemoteTransportConnection::resetAcquireCount() { g_acquireCount.store(0, std::memory_order_relaxed); }
 

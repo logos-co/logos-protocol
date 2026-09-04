@@ -1011,6 +1011,18 @@ bool LogosAPIConsumer::reconnect()
     return ok;
 }
 
+TargetPresence LogosAPIConsumer::targetPresence(const QString& objectName)
+{
+    if (!m_transport) return TargetPresence::Unknown;
+    // A cached handle proves the target published at least once on this
+    // connection, which is the one thing every transport can agree on --
+    // including plain, whose requestObject cannot answer presence at all.
+    if (m_objectCache.contains(objectName)) return TargetPresence::Present;
+    if (auto* presence = dynamic_cast<LogosTransportPresence*>(m_transport.get()))
+        return presence->targetPresence(objectName);
+    return TargetPresence::Unknown;
+}
+
 QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
                                    const QVariantList& args, Timeout timeout)
 {

@@ -724,6 +724,17 @@ char* lp_get_methods(lp_client* client)
                                 static_cast<size_t>(json.size())));
 }
 
+int lp_target_presence(lp_client* client)
+{
+    if (!client || !client->client) return LP_PRESENCE_UNKNOWN;
+    switch (client->client->targetPresence(client->target)) {
+        case TargetPresence::Present: return LP_PRESENCE_PRESENT;
+        case TargetPresence::Absent:  return LP_PRESENCE_ABSENT;
+        case TargetPresence::Unknown: break;
+    }
+    return LP_PRESENCE_UNKNOWN;
+}
+
 /* ----------------------------------------------------------------- tokens */
 
 char* lp_token_get(const char* module_name)

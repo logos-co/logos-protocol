@@ -201,4 +201,52 @@ public:
     virtual LogosObject* tryAcquireNow(const QString& /*objectName*/) { return nullptr; }
 };
 
+/**
+ * @brief What a transport can say about a target WITHOUT calling it.
+ *
+ * Three values because two would be a lie. No transport can answer "absent"
+ * everywhere, so a bool would have to fold "not there" together with either
+ * "there" or "cannot tell", and both folds are wrong in a way that fails
+ * silently — one skips a live module, the other reports a call that was never
+ * made.
+ */
+enum class TargetPresence {
+    Present,   ///< reachable right now, on this connection
+    Absent,    ///< provably not there. Only a transport that OWNS the registry
+               ///< can say this; a timeout or a dropped link never can.
+    Unknown,   ///< cannot be answered without a round trip. The caller must
+               ///< treat it as "try the call", never as absent.
+};
+
+/**
+ * @brief Optional extension: answer whether a target is reachable, for free.
+ *
+ * A sibling interface reached with dynamic_cast, NOT a virtual on
+ * LogosTransportConnection, for the reason spelled out on
+ * LogosTransportAsyncAcquire above: logos_transport.h is an installed header
+ * whose vtable is baked into every statically-linked copy of
+ * liblogos_protocol in a process, one per loaded module. Appending a slot is
+ * undefined behaviour for a caller compiled against the new header.
+ *
+ * A transport that does not implement it answers Unknown by failing the cast,
+ * which is exactly the right default: silence is not evidence of absence.
+ *
+ * This exists for `metadata.json#optional_dependencies` — a concrete
+ * dependency that may not be running. Without it, the only way to learn a
+ * target is missing is to call it and wait out the deadline.
+ */
+class LogosTransportPresence {
+public:
+    virtual ~LogosTransportPresence() = default;
+
+    /**
+     * @brief Is `objectName` reachable right now?
+     *
+     * MUST NOT block, spin a nested event loop, wait on a peer, or consume a
+     * handle the caller would otherwise acquire. An implementation that cannot
+     * meet that answers Unknown.
+     */
+    virtual TargetPresence targetPresence(const QString& objectName) = 0;
+};
+
 #endif // LOGOS_TRANSPORT_H

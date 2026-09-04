@@ -80,6 +80,12 @@ LogosAPIClient::~LogosAPIClient()
 {
 }
 
+TargetPresence LogosAPIClient::targetPresence(const QString& objectName)
+{
+    if (!m_consumer) return TargetPresence::Unknown;
+    return m_consumer->targetPresence(objectName);
+}
+
 LogosObject* LogosAPIClient::requestObject(const QString& objectName, Timeout timeout)
 {
     // Marshal to the owner thread: the replica is acquired and lives there.

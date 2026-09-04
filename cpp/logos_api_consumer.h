@@ -14,6 +14,7 @@
 #include <string>
 
 #include "logos_call_error.h"
+#include "logos_transport.h"
 #include "logos_mode.h"
 #include "logos_subscription_state.h"
 #include "logos_transport_config.h"
@@ -78,6 +79,13 @@ public:
     LogosObject* requestObject(const QString& objectName, Timeout timeout = Timeout());
 
     bool isConnected() const;
+
+    // Is `objectName` reachable right now, without calling it?
+    //
+    // Answers Unknown when the transport cannot say cheaply — see
+    // LogosTransportPresence. Unknown means TRY THE CALL; a caller that treats
+    // it as absent skips live modules on every transport but qt_local.
+    TargetPresence targetPresence(const QString& objectName);
     QString registryUrl() const;
     bool reconnect();
 

@@ -267,9 +267,14 @@
 // name and mis-call it with no diagnostic. The generation counter is maintained
 // for EVERY client, so gap detection reaches a consumer that changes nothing;
 // only the live callback is opt-in.
-#define LOGOS_PROTOCOL_VERSION_MINOR 9
+// 0.10: lp_target_presence() — local, no-round-trip presence of a client's
+// target. Additive: an older runtime exports no such symbol, and the only
+// callers are gated on the feature macro below. It exists for
+// `metadata.json#optional_dependencies`, where the target may legitimately not
+// be running and the alternative is discovering that by waiting out a deadline.
+#define LOGOS_PROTOCOL_VERSION_MINOR 10
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.10.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -280,6 +285,12 @@
 // Absent below the revision, including on the first cut of 0.9. Defined and
 // never undefined from here on, so a later MINOR keeps satisfying it.
 #define LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE 1
+
+// lp_target_presence(). A feature macro as well as a MINOR because that is now
+// the house rule for an added symbol — a MINOR comparison told 0.9's two cuts
+// apart from neither, and the fix was to stop asking the version. Defined from
+// 0.10 on and never undefined.
+#define LOGOS_PROTOCOL_HAS_TARGET_PRESENCE 1
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -639,6 +650,26 @@ LP_API char* lp_pending_subscriptions(lp_client* client);
  *  same shape `lm` prints). Caller frees via lp_string_free. NULL on
  *  failure. */
 LP_API char* lp_get_methods(lp_client* client);
+
+/** Presence of this client's target, answered LOCALLY: no round trip, no
+ *  blocking, no event loop.
+ *
+ *  Exists for `metadata.json#optional_dependencies` — a concrete dependency
+ *  that may not be running. Without it the only way to learn a target is
+ *  missing is to call it and wait out the deadline.
+ *
+ *  Returns one of LP_PRESENCE_*. THREE values, not a bool, because no
+ *  transport can answer "absent" everywhere: a registry-backed one can, a
+ *  Qt Remote Objects node cannot tell "gone" from "not published yet", and the
+ *  plain wire learns nothing until a reply arrives.
+ *
+ *  LP_PRESENCE_UNKNOWN THEREFORE MEANS "TRY THE CALL", never "absent". A caller
+ *  that treats it as absent silently skips live modules. Used the right way
+ *  round this can only ever save a deadline, never cost a call. */
+#define LP_PRESENCE_UNKNOWN 0
+#define LP_PRESENCE_PRESENT 1
+#define LP_PRESENCE_ABSENT  2
+LP_API int lp_target_presence(lp_client* client);
 
 /* ---------------------------------------------------------------------------
  * Tokens

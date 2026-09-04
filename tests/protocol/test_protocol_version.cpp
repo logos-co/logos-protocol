@@ -38,3 +38,34 @@ TEST(ProtocolVersion, StringFreeAcceptsNull)
 {
     lp_string_free(nullptr);  // must be a no-op, not a crash
 }
+
+// A symbol added at a MINOR gets a feature macro as well as the bump. Guarding
+// on `MINOR >= n` is what could not tell 0.9's two cuts apart, so the macro is
+// the thing consumers are told to test — and it has to actually be there.
+TEST(ProtocolVersion, TargetPresenceFeatureMacroIsDefined)
+{
+#if !defined(LOGOS_PROTOCOL_HAS_TARGET_PRESENCE)
+    FAIL() << "LOGOS_PROTOCOL_HAS_TARGET_PRESENCE must be defined from 0.10 on";
+#else
+    SUCCEED();
+#endif
+}
+
+// The tri-state values are ABI, not an enum: Rust, JS and the generated C++
+// wrappers all hard-code them. Renumbering one silently inverts a caller's
+// answer, and UNKNOWN==0 is what makes a zeroed/failed read mean "try the call"
+// rather than "absent".
+TEST(ProtocolVersion, PresenceCodesArePinned)
+{
+    EXPECT_EQ(LP_PRESENCE_UNKNOWN, 0);
+    EXPECT_EQ(LP_PRESENCE_PRESENT, 1);
+    EXPECT_EQ(LP_PRESENCE_ABSENT, 2);
+}
+
+// A null client is UNKNOWN, never ABSENT. The distinction is the whole safety
+// property: a caller folding UNKNOWN to "skip the call" would silently stop
+// talking to modules that are running.
+TEST(ProtocolVersion, NullClientPresenceIsUnknown)
+{
+    EXPECT_EQ(lp_target_presence(nullptr), LP_PRESENCE_UNKNOWN);
+}
