@@ -400,7 +400,10 @@ private:
     // surface refused the push because the target is still initializing.
     // Deliberately NOT a slot: it is an internal step of informModuleToken_module,
     // not a separate remote entry point.
-    bool informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs);
+    // `reachedModule`, when given, reports whether the business object was ACQUIRABLE —
+    // which is the only evidence that distinguishes a module with no handshake surface from
+    // one that had simply not published yet. See the negative cache in informModuleToken.
+    bool informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs, bool* reachedModule = nullptr);
 
     // Get a cached remote-object handle for objectName, (re)acquiring via the
     // transport if absent or stale. Acquiring a QtRO replica (acquireDynamic +
@@ -417,10 +420,15 @@ private:
     // Object-handle cache keyed by object name. Single-threaded: touched only on
     // the consumer's event-loop thread.
     QHash<QString, LogosObject*> m_objectCache;
-    // Handshake object names known to be absent. acquireCachedObject caches only
-    // successes, so without this a module built before the handshake surface
-    // existed would pay the full probe budget on every single grant. Cleared by
-    // clearObjectCache() so a reconnect or a reloaded module is re-probed.
+    // Handshake object names PROVEN absent — the module answered on its business object
+    // and had no such surface. acquireCachedObject caches only successes, so without this
+    // a module built before the handshake surface existed would pay the full probe budget
+    // on every single grant.
+    //
+    // Proven, not merely observed: a probe also misses when the module has not published
+    // yet, and entering that here would write a late module off for the life of the
+    // process. `clearObjectCache()` covers destroy and registry reconnect, and a module
+    // that was simply slow is neither.
     QSet<QString> m_noHandshakeSurface;
 
     // Build the pending-subscription registry if it does not exist yet.

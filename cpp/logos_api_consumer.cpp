@@ -1226,19 +1226,20 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
     // below a module built before this surface existed would pay the full probe
     // budget on EVERY grant — on QtRO that is a blocking waitForSource, i.e.
     // kHandshakeProbeTimeoutMs of dead time per token, forever. Remember the
-    // absence instead and go straight to the business object. Cleared with the
-    // handle cache on reconnect/destroy, so a module that comes back with a
-    // handshake surface is re-probed rather than written off permanently.
+    // absence instead and go straight to the business object.
+    //
+    // But remember it only once the BUSINESS object proves the module is up (below).
+    // A probe misses for two different reasons — the module has no such surface, or it
+    // had not published yet — and only the first is a property of the build. Caching the
+    // second writes a merely-slow module off for the life of the process, because nothing
+    // re-probes it: `clearObjectCache` runs on destroy and on registry reconnect, and a
+    // late module is neither. That would blind us to exactly the module the handshake
+    // surface exists to serve, and on every later grant, not just the one that raced.
     const QString handshake = logos::handshakeObjectName(originModule);
     if (m_noHandshakeSurface.contains(handshake)) {
         return informModuleTokenViaBusinessObject(authToken, originModule, moduleName, token, timeoutMs);
     }
     LogosObject* early = acquireCachedObject(handshake, kHandshakeProbeTimeoutMs);
-    if (!early) {
-        m_noHandshakeSurface.insert(handshake);
-        qDebug() << "LogosAPIConsumer:" << originModule << "publishes no handshake surface"
-                 << "- not probing again until the handle cache is cleared";
-    }
     if (early) {
         qDebug() << "[LogosObject] LogosAPIConsumer: delivering token for" << moduleName
                  << "via the handshake surface of" << originModule;
@@ -1265,14 +1266,25 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
                    << "- it is probably still initializing; retrying on the business object";
     }
 
-    return informModuleTokenViaBusinessObject(authToken, originModule, moduleName, token, timeoutMs);
+    bool reachedModule = false;
+    const bool delivered = informModuleTokenViaBusinessObject(
+        authToken, originModule, moduleName, token, timeoutMs, &reachedModule);
+    if (!early && reachedModule) {
+        // The module answered on its business object and still had no handshake surface, so
+        // the absence is real rather than a race. Now it is worth not probing again.
+        m_noHandshakeSurface.insert(handshake);
+        qDebug() << "LogosAPIConsumer:" << originModule << "publishes no handshake surface"
+                 << "- not probing again until the handle cache is cleared";
+    }
+    return delivered;
 }
 
 // Fall back to the business object: modules built before the handshake surface
 // existed are reached exactly as they always were. Also the landing place for a
 // handshake surface that refused the push (target still initializing).
-bool LogosAPIConsumer::informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs)
+bool LogosAPIConsumer::informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs, bool* reachedModule)
 {
+    if (reachedModule) *reachedModule = false;
     LogosObject* plugin = acquireCachedObject(originModule, timeoutMs);
     if (!plugin) {
         qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << originModule
@@ -1280,6 +1292,7 @@ bool LogosAPIConsumer::informModuleTokenViaBusinessObject(const QString& authTok
                    << "(waited" << timeoutMs << "ms; it may still be initializing)";
         return false;
     }
+    if (reachedModule) *reachedModule = true;
 
     qDebug() << "[LogosObject] LogosAPIConsumer: calling LogosObject::informModuleToken for" << moduleName << "on" << originModule;
     bool result = plugin->informModuleToken(authToken, moduleName, token, timeoutMs);

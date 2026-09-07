@@ -336,6 +336,11 @@ add_executable(protocol_tests
     # ORDER (wait, then mint) and both ways of getting it wrong: minting early costs a
     # wasted unauthorized round, waiting twice is a fleet-wide latency regression.
     test_readiness_gated_exchange.cpp
+    # The handshake negative cache: an absence is remembered only once the business object
+    # has PROVEN the module is up. A probe also misses when the module has not published
+    # yet, and nothing re-probes an entry — so caching that reason writes a merely-late
+    # module off for the life of the process.
+    test_handshake_negative_cache.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
