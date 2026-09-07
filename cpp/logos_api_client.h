@@ -18,7 +18,10 @@
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
 
+#include <memory>
+
 class LogosAPI;
+class QTimer;
 class LogosAPIConsumer;
 class LogosObject;
 class TokenManager;
@@ -410,6 +413,15 @@ private:
                                      const QVariantList& args, AsyncResultErrorCallback callback,
                                      Timeout timeout, int retriesLeft);
 
+    // The async twin of the sync readiness gate. Same rule — wait for the target on the
+    // CALLER's budget, then mint against a target that is provably up — expressed with the
+    // deferral the consumer already provides, so nothing blocks the owner thread.
+    void beginReadinessGatedHandshake(const QString& objectName, Timeout timeout);
+    void startCapabilityHandshake(const QString& objectName, Timeout timeout);
+    void drainPendingHandshakes(const QString& objectName, const QString& token,
+                                bool targetReachable);
+    void finishReadiness(const QString& objectName);
+
     // ABI note: this private layout is consumed by every plugin that
     // statically links libsdk. Adding a new field in the middle of
     // this section shifts the offsets of subsequent fields and
@@ -441,13 +453,22 @@ private:
     // calls carry a superseded token and get rejected. Touched only on the
     // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
     // lock. Appended last per the ABI note above; defaults to empty.
-    QMap<QString, std::vector<std::function<void(const QString&)>>> m_pendingHandshakes;
+    // The bool is "the target is reachable". The queue is drained by exactly ONE of three
+    // edges — ready, deadline, or client destroyed — and never twice.
+    QMap<QString, std::vector<std::function<void(const QString&, bool)>>> m_pendingHandshakes;
 
     // One-shot latch for the "isolated store with no credential" warning in
     // mintAndCacheToken(). The condition repeats on every call and the message
     // is about the HOST's wiring, so it is worth saying once and not N times.
     // Appended last per the ABI note above; defaults to false.
     bool m_warnedNoCredential = false;
+
+    // Per-target readiness wait guarding the async first exchange. `done` is the single
+    // latch: ready and deadline are mutually exclusive, so a deadline can never answer
+    // callers while an exchange is in flight and leave a token at the target that nobody
+    // holds. Appended last per the ABI note above.
+    struct PendingReadiness { quint64 id = 0; QTimer* timer = nullptr; bool done = false; };
+    QMap<QString, std::shared_ptr<PendingReadiness>> m_pendingReadiness;
 };
 
 #endif // LOGOS_API_CLIENT_H

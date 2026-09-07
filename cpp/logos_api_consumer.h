@@ -77,6 +77,18 @@ public:
      */
     LogosObject* requestObject(const QString& objectName, Timeout timeout = Timeout());
 
+    /**
+     * @brief Acquire `objectName` into the handle cache, waiting up to `timeoutMs`,
+     *        and report whether it is now reachable.
+     *
+     * The question `invokeRemoteMethod` asks first anyway, asked separately so a caller
+     * can order something else against it. The handle is LEFT IN THE CACHE, so the
+     * acquire inside a later `invokeRemoteMethod` on this consumer is a hit rather than
+     * a second wait — that coupling is load-bearing, and a caller routing around
+     * `acquireCachedObject` would pay this budget twice.
+     */
+    bool ensureTargetAcquirable(const QString& objectName, int timeoutMs);
+
     bool isConnected() const;
     QString registryUrl() const;
     bool reconnect();

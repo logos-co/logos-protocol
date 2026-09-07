@@ -1058,6 +1058,16 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
 }
 
 // Get-or-acquire a remote-object handle, transparently refreshing a stale one.
+bool LogosAPIConsumer::ensureTargetAcquirable(const QString& objectName, int timeoutMs)
+{
+    if (objectName.isEmpty())
+        return false;
+    // acquireCachedObject, NOT the public requestObject: that one additionally gates on
+    // `m_transport->isConnected()`, which invokeRemoteMethod does not. Matching what the
+    // call itself does is what makes this gate free rather than a second, stricter wait.
+    return acquireCachedObject(objectName, timeoutMs) != nullptr;
+}
+
 LogosObject* LogosAPIConsumer::acquireCachedObject(const QString& objectName, int timeoutMs)
 {
     if (LogosObject* cached = m_objectCache.value(objectName, nullptr)) {

@@ -329,6 +329,13 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
+    # Readiness-gated exchange: the token exchange used to ask "is the target there?"
+    # on capability_module's own budget while the call about to follow asked the same
+    # question on the caller's, much longer, one — so a module that had not finished
+    # publishing lost its grant to a wait its caller never agreed to. These pin the
+    # ORDER (wait, then mint) and both ways of getting it wrong: minting early costs a
+    # wasted unauthorized round, waiting twice is a fleet-wide latency regression.
+    test_readiness_gated_exchange.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
