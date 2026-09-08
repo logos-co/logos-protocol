@@ -31,6 +31,10 @@
           # themselves against. See nix/module-impl-abi.nix.
           module-impl-abi = import ./nix/module-impl-abi.nix { inherit pkgs common src; };
 
+          # The qt-host/protocol pairing rule, for consumers to run against
+          # their own closure. See nix/abi-closure-check.nix.
+          abi-closure-check = import ./nix/abi-closure-check.nix { inherit pkgs common src; };
+
           # Combined package: static lib + cmake config + source-export
           # headers. propagatedBuildInputs re-declared on the join because
           # symlinkJoin doesn't forward propagation from `paths`. Qt is
@@ -46,7 +50,7 @@
         {
           logos-protocol-lib = lib;
           logos-protocol-include = include;
-          inherit tests module-impl-abi;
+          inherit tests module-impl-abi abi-closure-check;
 
           logos-protocol = protocol;
           default = protocol;
@@ -59,6 +63,7 @@
           src = ./.;
           tests = import ./nix/tests.nix { inherit pkgs common src; };
           module-impl-abi = import ./nix/module-impl-abi.nix { inherit pkgs common src; };
+          abi-closure-check = import ./nix/abi-closure-check.nix { inherit pkgs common src; };
         in
         {
           inherit tests;
@@ -66,6 +71,12 @@
           # still fail. See nix/tests-module-impl-abi.nix.
           module-impl-abi-tests = import ./nix/tests-module-impl-abi.nix {
             inherit pkgs common src module-impl-abi;
+          };
+
+          # Proves the qt-host/protocol pairing rule can still fail.
+          # See nix/tests-abi-closure-check.nix.
+          abi-closure-check-tests = import ./nix/tests-abi-closure-check.nix {
+            inherit pkgs common src abi-closure-check;
           };
         }
       );
