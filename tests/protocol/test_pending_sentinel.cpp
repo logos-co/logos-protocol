@@ -7,6 +7,7 @@
 #include <QVariantMap>
 
 #include "logos_async_dispatch.h"
+#include "logos_protocol.h"
 
 // ---------------------------------------------------------------------------
 // The pending-call sentinel is in-band: a "multi" provider returns a QVariantMap
@@ -39,6 +40,18 @@ QVariant canonical(const QString& id)
 // The reserved name is spelled twice — once as a QStringLiteral for producers,
 // once as a Qt-free char* the plain transport can compare against without
 // linking Qt. Cheap to keep, worthless if they ever drift.
+// A consumer cannot feature-detect the reservation from the version macros —
+// this is the third cut reporting MINOR 9 — so the macro is the contract.
+TEST(ReservedEventNames, TheFeatureMacroIsDefined)
+{
+#if !defined(LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES)
+    FAIL() << "LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES is how a consumer asks "
+              "whether the completion channel is reserved; MINOR cannot answer it";
+#else
+    EXPECT_EQ(LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES, 1);
+#endif
+}
+
 TEST(ReservedEventNames, BothSpellingsOfTheCompletionEventAgree)
 {
     EXPECT_EQ(logos::callCompleteEvent(), QLatin1String(logos::kCallCompleteEvent));

@@ -1,0 +1,583 @@
+ProtocolVersion.VersionStringMatchesMacros 1 0.0421666
+ProtocolVersion.AbiMajorMatchesMacro 1 0.0341015
+ProtocolVersion.VersionStringIsStatic 1 0.032274
+ProtocolVersion.StringFreeAcceptsNull 1 0.0329271
+JsonConvertBytes.ByteArrayEncodesAsTaggedObject 1 0.0338195
+JsonConvertBytes.NulByteRoundTripPreservesSize 1 0.0337958
+JsonConvertBytes.AllByteValuesRoundTrip 1 0.0334399
+JsonConvertBytes.EmptyByteArrayRoundTrips 1 0.0341231
+JsonConvertBytes.ArgsListDecodesTaggedBytes 1 0.0351114
+JsonConvertBytes.LogosResultValueBytesAreTagged 1 0.0318306
+JsonConvertBytes.NestedByteArrayInListStaysTagged 1 0.0329379
+JsonConvertBytes.NestedByteArrayInMapStaysTagged 1 0.0322352
+JsonConvertBytes.ByteArrayArgInListSurvivesBridgeConversion 1 0.0325668
+JsonConvertBytes.OrdinaryObjectsAreNotMistakenForBytes 1 0.0317708
+JsonConvertBytes.IntegersStayIntegersNotDoubles 1 0.0322123
+JsonConvertArrays.StringArrayRoundTripsToQStringList 1 0.0337734
+JsonConvertArrays.MixedArrayRoundTripsToQVariantList 1 0.0352987
+JsonConvertArrays.ObjectRoundTripsToQVariantMap 1 0.0324942
+JsonConvertArrays.NestedArrayInsideObjectIsAlsoConverted 1 0.0330456
+JsonConvertArgs.NestedStringArrayArgRoundTripsToQStringList 1 0.0327128
+JsonConvertArgs.NestedObjectArgRoundTripsToQVariantMap 1 0.0330361
+JsonConvertInts.IntListElementsStayIntegers 1 0.0333472
+JsonConvertInts.LongLongListElementsStayIntegers 1 0.0317756
+JsonConvertInts.NestedMapIntValueStaysInteger 1 0.0327648
+JsonConvertInts.StringListStillDecodesAsStrings 1 0.0341261
+JsonConvertResult.RoundTripsSuccessWithAbsentError 1 0.0340468
+JsonConvertResult.RoundTripsFailureWithErrorString 1 0.0417573
+JsonConvertResult.ValueKeepsBytesAndUint64 1 0.035011
+JsonConvertResult.NonObjectDecodesToFailure 1 0.0349579
+UniversalProviderDispatchTest.ReturnBool 1 0.032956
+UniversalProviderDispatchTest.ReturnInt 1 0.0327198
+UniversalProviderDispatchTest.ReturnUint 1 0.0334578
+UniversalProviderDispatchTest.ReturnDouble 1 0.0331665
+UniversalProviderDispatchTest.ReturnString 1 0.0335804
+UniversalProviderDispatchTest.ReturnEmptyString 1 0.0323163
+UniversalProviderDispatchTest.ReturnBytes 1 0.0343307
+UniversalProviderDispatchTest.ReturnNull 1 0.0324603
+UniversalProviderDispatchTest.ReturnStringList 1 0.0319857
+UniversalProviderDispatchTest.ReturnEmptyStringList 1 0.0346461
+UniversalProviderDispatchTest.ReturnMixedList 1 0.032378
+UniversalProviderDispatchTest.ReturnNumericList 1 0.032087
+UniversalProviderDispatchTest.ReturnMap 1 0.0318325
+UniversalProviderDispatchTest.ReturnEmptyMap 1 0.0331732
+UniversalProviderDispatchTest.ReturnArrayOfMaps 1 0.0335494
+UniversalProviderDispatchTest.ReturnMapWithListInside 1 0.0338378
+UniversalProviderDispatchTest.ReturnDeepNesting 1 0.0329646
+UniversalProviderDispatchTest.ArgBoolRoundTrip 1 0.0320606
+UniversalProviderDispatchTest.ArgIntRoundTrip 1 0.0321679
+UniversalProviderDispatchTest.ArgUintRoundTrip 1 0.0336146
+UniversalProviderDispatchTest.ArgDoubleRoundTrip 1 0.0327365
+UniversalProviderDispatchTest.ArgStringRoundTrip 1 0.0333117
+UniversalProviderDispatchTest.ArgBytesRoundTrip 1 0.0339489
+UniversalProviderDispatchTest.ArgStringListRoundTrip 1 0.030548
+UniversalProviderDispatchTest.ArgEmptyStringListRoundTrip 1 0.0361438
+UniversalProviderDispatchTest.ArgVariantListRoundTrip 1 0.0332304
+UniversalProviderDispatchTest.ArgVariantMapRoundTrip 1 0.0331147
+UniversalProviderDispatchTest.ArgEmptyVariantMapRoundTrip 1 0.0327038
+UniversalProviderDispatchTest.ArgNestedMapWithListRoundTrip 1 0.0340967
+UniversalProviderDispatchTest.ArgNullRoundTrip 1 0.0326238
+EventPayloadFidelity.Uint64AboveInt64MaxSurvives 1 0.0331033
+EventPayloadFidelity.IntegerPast2Pow53IsNotRounded 1 0.0325303
+EventPayloadFidelity.NegativeInt64MinSurvives 1 0.0328222
+EventPayloadFidelity.LargeIntegerNestedInContainersSurvives 1 0.0340879
+EventPayloadFidelity.TaggedBytesDecodeToByteArray 1 0.0320196
+EventPayloadFidelity.TaggedBytesNestedInContainerDecode 1 0.033498
+EventPayloadFidelity.MultipleParametersKeepOrderAndTypes 1 0.0324473
+EventPayloadFidelity.NonNegativeIntegerCarriesUnsignedMetatype 1 0.0328382
+EventPayloadFidelity.NegativeIntegerCarriesSignedMetatype 1 0.0333506
+EventPayloadFidelity.DoubleStaysDouble 1 0.0330406
+EventPayloadFidelity.EmptyPayloadYieldsNoArguments 1 0.0337116
+EventPayloadFidelity.NullElementSurvivesAsAnElement 1 0.032396
+EventPayloadFidelity.NonArrayPayloadFallsBackToSingleStringArgument 1 0.0336515
+LpClientTest.ModeRoundTrip 1 0.0334153
+LpClientTest.InvokeReturnsMockedValue 1 0.0329075
+LpClientTest.InvokePassesJsonArgs 1 0.0321558
+LpClientTest.BytesRoundTripThroughTheCAbi 1 0.0339942
+LpClientTest.InvokeAsyncDeliversResult 1 0.0336718
+LpClientTest.DestroyFromWorkerThreadIsSafe 1 0.0334345
+LpClientTest.InvalidArgsJsonIsRejected 1 0.033294
+LpClientTest.NullArgumentsAreRejected 1 0.0328651
+LpClientTest.MalformedTransportJsonFailsCreate 1 0.0351518
+LpClientTest.TokenStoreRoundTrip 1 0.0332843
+LpClientTest.ProviderGroundworkSurface 1 0.0312883
+EventDeliveryMock.SubscriptionArmsImmediatelyAndDoesNotLinger 1 0.032985
+EventDeliveryNonBlocking.SubscribingToAnAbsentModuleReturnsImmediately 1 3.04402
+Codec.ScalarsRoundTrip 1 0.0537045
+Codec.CodecItselfIsWidthAgnostic 1 0.0364106
+Codec.LargeUnsignedSurvives 1 0.0338763
+Codec.IntegralJsonNumberDecodesAsFloat64 1 0.0320226
+Codec.BytesUseTheTaggedForm 1 0.0378622
+Codec.EmptyBytesRoundTrip 1 0.0842569
+Codec.MultiKeyObjectIsNotBytes 1 0.0337398
+Codec.PaddedBase64Decodes 1 0.0317001
+Codec.LenientBytesAcceptsWhatOtherLayersProduce 1 0.051385
+Codec.TypedScalarArraysRoundTripIncludingEmpty 1 0.0441818
+Codec.ListOfBytesTagsEachElement 1 0.0335159
+Codec.ListOfListOfBytesTagsAtDepth 1 0.0334141
+Codec.MapOfBytesAndMapOfListsCompose 1 0.0317777
+Codec.AnyPassesThroughVerbatim 1 0.0340945
+Codec.MismatchThrowsWithPath 1 0.0325509
+Codec.CheckedDecodeRejectsCorruptInput 1 0.0344357
+CodecOptional.AbsentAndExplicitNullBothDecodeToEmpty 1 0.0338278
+CodecOptional.EmptyEncodesAsNullAndRoundTripIsCanonicalising 1 0.0343963
+CodecOptional.PresentValueRoundTripsUnchanged 1 0.0336558
+CodecOptional.PresentButWrongTypedStillThrows 1 0.0352036
+CodecOptional.RequiredSlotStillRejectsNull 1 0.034584
+CodecOptional.OptionalOfBytes 1 0.0346807
+CodecOptional.OptionalOfContainerSeparatesEmptyFromMissing 1 0.0346773
+CodecOptional.OptionalInsideContainersKeepsPositionAndKey 1 0.0331628
+CodecOptional.NestedOptionalCollapses 1 0.0329804
+CodecOptional.JsonArgCannotDeliverOptionalsNameTheTypeInstead 1 0.0329711
+CodecBytes.RoundTripsEveryByteValue 1 0.0331495
+CodecBytes.UsesTheUrlSafeAlphabetAndOmitsPadding 1 0.0327175
+CodecBytes.TailGroupsOfEveryLengthSurvive 1 0.03285
+CodecBytes.EmbeddedNulSurvives 1 0.0326327
+CodecBytes.BytesToJsonEmitsTheCanonicalTag 1 0.0328222
+CodecBytes.DecodeAcceptsPaddedInput 1 0.0328224
+LpClientOwnerThreadTest.ClientCreatedOnWorkerThreadCallsOverQtRemote 1 0.0963724
+LpClientOwnerThreadTest.SecondWorkerThreadClientAlsoWorks 1 0.108603
+LpClientOwnerThreadTest.InformModuleTokenFromWorkerThreadReachesCapabilityModule 1 0.0984155
+CallErrorChannel.UnreachableTargetYieldsCanonicalError 1 10.0749
+LpInvokeAsyncErrorTest.UnreachableTargetDeliversTheErrorToTheCallback 1 10.0664
+LpInvokeAsyncErrorTest.LiveTargetStillReportsOkWithItsValue 1 0.0435715
+CallErrorAfterAcquireTest.AsyncSuccessStillReportsTheValue 1 0.0352111
+CallErrorAfterAcquireTest.AsyncTimeoutReportsTheError 1 4.13412
+CallErrorAfterAcquireTest.AsyncModuleNotLoadedOnALiveHostReportsTheError 1 0.0331462
+CallErrorAfterAcquireTest.SyncSuccessStillReportsTheValue 1 0.0329611
+CallErrorAfterAcquireTest.SyncTimeoutReportsTheError 1 4.14349
+CallErrorAfterAcquireTest.SyncModuleNotLoadedOnALiveHostReportsTheError 1 0.033402
+CallErrorAfterAcquireTest.UnknownMethodStaysIndistinguishableFromANullReturn 1 0.0338635
+QtRemoteCallErrorTest.AsyncSuccessCarriesAnEmptyError 1 0.0898302
+QtRemoteCallErrorTest.AsyncTimeoutCarriesTheCanonicalError 1 0.525029
+PlainObjectTeardownTest.ReleaseWithACallInFlightDoesNotWaitOutTheTimeout 1 0.436001
+PlainObjectTeardownTest.NormalCompletionFiresTheCallbackExactlyOnce 1 0.336977
+PlainObjectTeardownTest.TimeoutFiresTheCallbackExactlyOnce 1 1.0352
+PlainObjectTeardownTest.CancellationByTeardownFiresTheCallbackExactlyOnce 1 0.835276
+PlainObjectTeardownTest.ReleaseDuringADeferredCompletionCancelsThatWaitToo 1 0.634676
+PlainObjectTeardownTest.ReleaseImmediatelyAfterTheCallStillDeliversOnce 1 0.534124
+PlainObjectTeardownTest.ReleaseRacingTheWaiterIsSafeAndDeliversOnce 1 1.48068
+PlainWaiterReapingTest.SequentialCompletedCallsDoNotAccumulateWaiters 1 0.116381
+PlainWaiterReapingTest.ConcurrentCompletedCallsStayBoundedByInFlight 1 0.320274
+PlainWaiterReapingTest.BurstThatGoesIdleDrainsWithoutAnotherCall 1 0.610844
+PlainWaiterReapingTest.ReapingRacesPublishingWithoutDeadlocking 1 0.374691
+PlainWaiterReapingTest.TeardownAfterReapingStillJoinsAndDeliversOnce 1 0.5506
+IoFoldTest.PendingCallsDoNotCostThreads 1 0.986306
+IoFoldTest.NormalAndDeferredCompletionsDeliverExactlyOnceAtVolume 1 0.689228
+IoFoldTest.TimeoutAndCancellationDeliverExactlyOnce 1 10.7565
+IoFoldTest.ATimedOutCallThatIsLaterAnsweredStillDeliversOnce 1 1.1347
+IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce 1 1.32823
+IoFoldTest.DeadlineFiresOnTimeWhileTheIoThreadIsBusy 1 2.43695
+IoFoldTest.DeadlineFiresWhileTheIoThreadIsBlockedForever 1 0.685276
+IoFoldTest.DeadlineAccuracyWhenIdle 1 2.54041
+IoFoldTest.CallsResolvedByTheirDeadlineLeaveNothingBehind 1 0.6947
+IoFoldTest.ASentinelArrivingAfterItsDeadlineDoesNotLeakARegistryEntry 1 3.23319
+IoFoldTest.ReleaseRacingAnInFlightCompletionIsSafe 1 1.89496
+IoFoldTest.ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge 1 0.832342
+PlainCompletionSubLifetimeTest.CompletionEventDispatchedAcrossReleaseIsSafe 1 2.35533
+PlainCompletionSubLifetimeTest.NoReleaseIsCleanUnderTheSameStorm 1 0.824107
+PlainCompletionSubOrderTest.AConcurrentFirstCallCannotOutrunTheSubscription 1 0.0951417
+PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost 1 0.143034
+PlainEventSubSharingTest.ASecondHandleDoesNotStealTheFirstsCompletionChannel 1 0.0441996
+PlainEventSubSharingTest.TheSameTheftThroughTheRealHost 1 0.041465
+PlainEventSubSharingTest.EveryHandleGetsEveryEmission 1 0.0354894
+PlainEventSubSharingTest.ANamedAndAWildcardSubscriberEachGetOneCopy 1 0.335426
+PlainEventSubSharingTest.ReleasingOneHandleLeavesTheOtherSubscribed 1 0.0341216
+PlainEventSubSharingTest.TeardownRemovesEverySubscription 1 0.0342687
+PlainEventSubSharingTest.SubscriptionsSurviveChurn 1 0.0454856
+PlainEventSubSharingTest.ACompletionThatOvertakesItsOwnResultIsStillDelivered 1 0.0352608
+PlainEventSubSharingTest.ANewConsumerAgainstAnOldHost 1 0.0331355
+PlainEventSubSharingTest.AnOldConsumersFrameSequenceAgainstTheNewHost 1 0.3148
+PlainParkedCompletionGateTest.ParkingIsGatedOnHavingSomethingOutstanding 1 0.032803
+PlainParkedCompletionGateTest.TheStagingAreaIsCappedAndEvictsOldestFirst 1 0.0355921
+PlainCancelPendingRaceTest.CancelPendingCannotStopAnAlreadyExtractedHandler 1 0.0827194
+PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce 1 0.182832
+PlainCancelPendingRaceTest.ThePromiseShapedHandlerSurvivesTheSameGap 1 0.0333598
+PlainCancelPendingRaceTest.ARealConnectionDropsAReplyThatArrivesAfterCancel 1 0.346991
+PlainSendAfterFailTest.ACallRegisteredAsTheConnectionFailsIsStillAnswered 1 2.35674
+PlainSendAfterFailTest.TheCallerIsToldTheTransportClosedInsteadOfWaitingOutItsDeadline 1 4.57121
+PlainSendAfterFailTest.GetMethodsDoesNotWaitOutItsFiveSecondFutureWhenTheConnectionFails 1 0.876814
+PlainSendAfterFailTest.AStopRacingABurstOfRegistrationsAnswersEveryCallExactlyOnce 1 0.384872
+SyncCallReleaseRaceTest.AParkedSyncCallSurvivesReleaseFromAnotherThread 1 0.371042
+SyncCallReleaseRaceTest.ReleaseDefersDestructionToTheLastCallInFlight 1 0.649596
+SyncCallReleaseRaceTest.TheReleaseWakeRaceIsSafeEveryTime 1 0.665499
+SyncCallReleaseRaceTest.DeletingTheHandleWithACallInFlightIsReportedAndFatal 1 0.0873387
+SyncCallReleaseRaceTest.StartingACallAfterReleaseIsReportedAndFatal 1 0.067881
+SyncCallReleaseRaceTest.EveryEntryPointLeavesTheCountAtZero 1 0.591731
+SyncCallReleaseRaceTest.ConcurrentCallersThatHaveReturnedAreNotAccused 1 0.15226
+SyncCallReleaseRaceTest.ReleaseFromInsideAnEventCallbackIsNotAccused 1 0.28607
+PlainHostEventTeardownTest.QueuedEmissionsNeverOutliveTheHost 1 2.66967
+PlainHostEventTeardownTest.TheSharedHelperTearsDownUnderTheSameLoad 1 0.685577
+TokenManagerTest.SaveAndGetToken 1 0.0357049
+TokenManagerTest.GetMissingTokenReturnsEmpty 1 0.0325771
+TokenManagerTest.HasToken 1 0.0323458
+TokenManagerTest.RemoveToken 1 0.0408031
+TokenManagerTest.RemoveNonexistentTokenReturnsFalse 1 0.0342556
+TokenManagerTest.ClearAllTokens 1 0.0332417
+TokenManagerTest.TokenCount 1 0.0329422
+TokenManagerTest.GetTokenKeys 1 0.0330008
+TokenManagerTest.OverwriteToken 1 0.0325842
+TokenManagerTest.SignalTokenSaved 1 0.0331862
+TokenManagerTest.SignalTokenRemoved 1 0.0341086
+TokenManagerTest.SignalAllTokensCleared 1 0.0321368
+TokenManagerTest.TheInboundOverloadsAllReachTheSameMap 1 0.0331426
+TokenManagerTest.RemovingABootstrapKeyDoesNotStrandTheCredential 1 0.0437599
+TokenManagerTest.ClearAllTokensClearsAllThree 1 0.0342883
+RedactTokenTest.NeverContainsRawTokenValue 1 0.0348318
+RedactTokenTest.EmptyTokenRendersAsNone 1 0.0332285
+RedactTokenTest.IsDeterministicForCorrelation 1 0.0339167
+RedactTokenTest.DistinctTokensProduceDistinctFingerprints 1 0.0330615
+RedactTokenTest.HasStableFingerprintShape 1 0.0399417
+MockStoreTest.WhenThenReturn 1 0.0358023
+MockStoreTest.WithArgsMatching 1 0.0344562
+MockStoreTest.MatchAnyArgsByDefault 1 0.033109
+MockStoreTest.LIFOOrder 1 0.0328692
+MockStoreTest.NoMatchReturnsInvalid 1 0.0330816
+MockStoreTest.WasCalled 1 0.031734
+MockStoreTest.WasCalledWith 1 0.0326175
+MockStoreTest.CallCount 1 0.0332115
+MockStoreTest.LastArgs 1 0.0327429
+MockStoreTest.AllCalls 1 0.033543
+MockStoreTest.ResetClearsEverything 1 0.0327987
+MockTransportTest.HostPublishObjectIsNoOp 1 0.0337974
+MockTransportTest.HostUnpublishObjectIsNoOp 1 0.0330571
+MockTransportTest.ConnectionAlwaysConnected 1 0.0327159
+MockTransportTest.ConnectToHostReturnsTrue 1 0.0335226
+MockTransportTest.ReconnectReturnsTrue 1 0.033273
+MockTransportTest.RequestObjectReturnsMockObject 1 0.0322972
+MockTransportTest.CallMethodDelegatesToMockStore 1 0.0332055
+MockTransportTest.CallMethodRecordsArgs 1 0.0328484
+MockTransportTest.InformModuleTokenReturnsTrue 1 0.0320969
+MockTransportTest.EventOperationsAreNoOps 1 0.0348067
+MockTransportTest.GetMethodsReturnsEmptyArray 1 0.0331607
+MockTransportTest.IdReturnsNonZero 1 0.0329639
+MockTransportTest.ModuleName 1 0.0324579
+LogosModeTest.DefaultIsRemote 1 0.0328954
+LogosModeTest.SetLocal 1 0.032119
+LogosModeTest.SetMock 1 0.0335123
+LogosModeTest.SwitchBetweenModes 1 0.0334727
+LogosInstanceTest.IdReturnsNonEmpty 1 0.0330165
+LogosInstanceTest.IdIs12Chars 1 0.0329019
+LogosInstanceTest.IdIsStableAcrossCalls 1 0.0334682
+LogosInstanceTest.IdSetsEnvVar 1 0.0340562
+LogosInstanceTest.IdRespectsExistingEnvVar 1 0.0323375
+LogosInstanceTest.RegistryUrlFormat 1 0.0334773
+PluginRegistryTest.RegisterAndHasPlugin 1 0.0327206
+PluginRegistryTest.UnregisterPlugin 1 0.0326276
+PluginRegistryTest.GetPluginReturnsCorrectObject 1 0.033705
+PluginRegistryTest.GetPluginReturnsNullForMissing 1 0.0322264
+PluginRegistryTest.HasPluginReturnsFalseForMissing 1 0.0324222
+PluginRegistryTest.EmptyNameGuards 1 0.0334785
+PluginRegistryTest.KeyNormalization 1 0.0369025
+PluginRegistryTest.MultiplePlugins 1 0.0331222
+PluginRegistryTest.OverwritePlugin 1 0.0378635
+TransportFactoryTest.MockModeCreatesHost 1 0.0334095
+TransportFactoryTest.MockModeCreatesConnection 1 0.032808
+TransportFactoryTest.MockConnectionRequestObject 1 0.0359744
+TransportFactoryTest.LocalModeCreatesHost 1 0.0332605
+TransportFactoryTest.LocalModeCreatesConnection 1 0.0335022
+TransportFactoryTest.NeedsQtEventLoopFollowsTheResolutionRule 1 0.0330265
+TransportFactoryTest.ModeSwitchChangesTransportType 1 0.0368374
+RegistryFactoryTest.MockModeCreatesInitializedRegistry 1 0.0332563
+RegistryFactoryTest.LocalModeCreatesInitializedRegistry 1 0.0334212
+RegistryFactoryTest.ModeSwitchProducesDifferentRegistries 1 0.0338029
+RpcFramingTest.RoundTripCallMessage 1 0.0326593
+RpcFramingTest.PartialReadsCoalesce 1 0.0327931
+RpcFramingTest.ConcatenatedFrames 1 0.032304
+RpcFramingTest.RejectsOversizedFrame 1 0.0331885
+RpcFramingTest.RejectsZeroLength 1 0.0334456
+JsonCodecTest.CallMessage 1 0.0328843
+JsonCodecTest.ResultOk 1 0.0327475
+JsonCodecTest.ResultError 1 0.0330193
+JsonCodecTest.EventWithNestedData 1 0.0321999
+JsonCodecTest.BytesRoundTrip 1 0.0334408
+JsonCodecTest.SubscribeUnsubscribe 1 0.0344607
+JsonCodecTest.TokenMessage 1 0.0337251
+JsonCodecTest.MethodsRequestAndResult 1 0.0333148
+JsonCodecTest.NullAndDoubleRoundTrip 1 0.0324195
+CborCodecTest.CallMessage 1 0.0325227
+CborCodecTest.ResultOkWithNestedMap 1 0.0324758
+CborCodecTest.EventWithBytesPayload 1 0.0342854
+CborCodecTest.TokenMessage 1 0.0340021
+CborCodecTest.SmallerOnWireThanJsonForTypicalMessage 1 0.0420543
+PlainUint64.MakeIntegerUsesSignedAlternativeWhenItFits 1 0.0346458
+PlainUint64.MakeIntegerUsesUnsignedAlternativeOnlyPastInt64Max 1 0.03392
+PlainUint64.IsIntegralCoversBothAlternatives 1 0.0330028
+PlainUint64.JsonCodecRoundTripsUint64Max 1 0.0346559
+PlainUint64.JsonCodecRoundTripsUint64NestedInContainers 1 0.0335938
+PlainUint64.JsonCodecKeepsNegativeIntegersSigned 1 0.0326716
+PlainUint64.CborCodecRoundTripsUint64Max 1 0.0325641
+PlainUint64.CborCodecRoundTripsUint64NestedInContainers 1 0.0332416
+PlainUint64.QVariantToRpcValuePreservesUint64 1 0.0333307
+PlainUint64.RpcValueToQVariantPreservesUint64 1 0.0336743
+PlainUint64.QtBoundaryRoundTripIsExact 1 0.0328726
+PlainUint64.SmallUnsignedStillCrossesAsSigned 1 0.0337802
+PlainUint64.DoubleAtTwoPow63DoesNotEnterTheIntegerBranch 1 0.0328606
+PlainUint64.DoubleAtInt64MinStillTakesTheIntegerBranch 1 0.0328764
+SocketPaths.AppliesModeFromEnv 1 0.0332045
+SocketPaths.AppliesGroupFromEnv 1 0.0319926
+SocketPaths.NoEnvIsNoOp 1 0.0333412
+SocketPaths.RefusesNonSocketPath 1 0.033391
+SocketPaths.RejectsBadMode 1 0.0325849
+SocketPaths.LiveSocketIsNotDead 1 0.0327418
+SocketPaths.ClosedSocketIsDead 1 0.0356068
+SocketPaths.RegularFileIsNeverDead 1 0.0338296
+SocketPaths.ReaperRemovesOnlyDeadSockets 1 0.0346727
+ConcurrentDispatchTest.MultiProviderOverlaps 1 0.368514
+ConcurrentDispatchTest.SingleProviderSerializes 1 0.670398
+ConcurrentDispatchTest.MultiProviderOverlapsAsync 1 0.391202
+ConcurrentDispatchTest.SingleProviderSerializesAsync 1 1.28992
+HandshakeSurfaceTest.HandshakeNameIsDerivedFromTheModuleName 1 0.0389343
+HandshakeSurfaceTest.TokenDeliveredEarlyAuthorizesLaterBusinessCalls 1 0.0346451
+HandshakeSurfaceTest.PushIsRefusedWhileTheTrustAnchorIsUnseeded 1 0.0349965
+HandshakeSurfaceTest.HandshakeSurfaceExposesOnlyTokenDelivery 1 0.0381577
+HandshakeSurfaceTest.HandshakeSurfaceStillAuthorizes 1 0.0336792
+HandshakeTransportTest.TokenReachesAModuleWhoseBusinessObjectIsNotPublishedYet 1 0.0356879
+HandshakeTransportTest.AnUnseededAnchorRefusesEvenThoughTheSurfaceIsReachable 1 0.349666
+HandshakeTransportTest.ALegacyModuleFallsBackAndIsNotReProbed 1 0.30488
+HostServicesGrantTest.TokenRegistryIsClosedUntilGranted 1 0.0408046
+HostServicesGrantTest.GrantedRegistryAnswersEmptyRatherThanRefusing 1 0.0344852
+HostServicesGrantTest.TokenDeliveryIsClosedUntilGranted 1 0.0339649
+HostServicesGrantTest.GrantedDeliveryReachesAModuleThatIsNotCapabilityModule 1 0.0364809
+HostServicesGrantTest.ClearingTheGrantReclosesBothGates 1 0.0333512
+HostServicesGrantTest.UnknownServiceIsRejectedAndLeavesTheGrantIntact 1 0.0335626
+ReservedEventNames.BothSpellingsOfTheCompletionEventAgree 1 0.0340382
+PendingSentinel.CanonicalShapeIsRecognisedAndYieldsTheCallId 1 0.0433706
+PendingSentinel.CallIdOutParamIsOptional 1 0.0316595
+PendingSentinel.ExtraKeysMeanItIsOrdinaryUserData 1 0.0317412
+PendingSentinel.MatrixPayloadIsNotASentinel 1 0.0324921
+PendingSentinel.NonStringValueIsNotASentinel 1 0.0314842
+PendingSentinel.EmptyCallIdIsNotASentinel 1 0.032229
+PendingSentinel.WrongKeyIsNotASentinel 1 0.0336858
+PendingSentinel.NonMapValuesAreNotSentinels 1 0.0336608
+PendingSentinel.QJsonObjectArmBehavesTheSame 1 0.0330308
+PendingSentinel.CanonicalShapeForgeryIsStillIndistinguishable 1 0.0333499
+RpcConnectionTeardownTest.StopWhileWritesAreInFlight 1 0.725071
+RpcServerTeardownTest.StopWhileAcceptsAreInFlight 1 0.888276
+RpcServerTeardownTest.ServesAClientThatConnectsTheInstantStartReturns 1 0.0462725
+RemoteEventTest.EventDeliveredToSubscriberOverLocalSocket 1 0.293999
+RemoteEventTest.ProviderEmittedEventReachesSubscriberOverLocalSocket 1 0.292405
+RemoteEventTest.ReservedEventCannotBeSubscribedButStillCompletesTheCall 1 0.605663
+RemoteEventTest.ReleaseFromAsyncCompletionCallbackDoesNotCrash 1 0.612764
+RemoteEventTest.ConsumerReusesCachedHandleAcrossSyncAndAsyncCalls 1 0.0897918
+DeferredSubscriptionTest.RequestObjectWhenAvailable_AbsentModule_DoesNotBlock 1 0.0365743
+DeferredSubscriptionTest.RequestObjectWhenAvailable_ArmsAfterPublish 1 0.668367
+DeferredSubscriptionTest.RequestObjectWhenAvailable_AlreadyPublished_Control 1 0.0988925
+DeferredSubscriptionTest.OnEventWhenAvailable_SubscribeBeforePublish_Delivers 1 0.714401
+DeferredSubscriptionTest.OnEventWhenAvailable_PublishBeforeSubscribe_Control 1 0.151069
+DeferredSubscriptionTest.OnEventWhenAvailable_Wildcard_SubscribeBeforePublish_Delivers 1 0.684128
+DeferredSubscriptionTest.OnEventWhenAvailable_Wildcard_PublishBeforeSubscribe_Control 1 0.157736
+DeferredSubscriptionTest.OnEventWhenAvailable_StillRefusesUnusableArguments 1 0.0379246
+DeferredSubscriptionTest.LpSubscribe_BeforePublish_Delivers 1 0.664022
+DeferredSubscriptionTest.LpSubscribe_AfterPublish_Control 1 0.145264
+DeferredSubscriptionTest.ManySubscriptionsBeforeArm_DoNotFreeAReplicaQtRoStillHolds 1 0.145131
+DeferredSubscriptionTest.OneSubscriptionBeforeArm_Control 1 0.143476
+SubscriptionContinuityTest.ProviderRestart_ReportsLostThenArmedWithNewGeneration 1 0.380926
+SubscriptionContinuityTest.ProviderStaysUp_NoLostAndGenerationStaysOne 1 5.0934
+SubscriptionContinuityTest.LpSubscribe_GenerationAdvancesAcrossRestart 1 0.400066
+SubscriptionContinuityTest.LpClientStatusCb_DeliversLostThenArmed 1 0.421771
+SubscriptionContinuityTest.NoStatusCb_IsStillPlainSubscribe 1 0.101502
+SubscriptionRestartPolicyTest.ManualStillArmsDeferred 1 0.623931
+SubscriptionRestartPolicyTest.ManualHoldsInsteadOfReArming 1 4.33942
+SubscriptionRestartPolicyTest.RearmRevivesAHeldSubscription 1 1.94299
+SubscriptionRestartPolicyTest.RearmRefusesWhatIsNotHeld 1 0.0971141
+SubscriptionRestartPolicyTest.AHeldSubscriptionCanBeCancelled 1 0.349674
+SubscriptionRestartPolicyTest.AutomaticIsUnchanged 1 0.405903
+SubscriptionRestartPolicyTest.SubscriptionsToOneModuleTransitionTogether 1 3.1479
+SubscriptionRestartPolicyTest.ThePolicyAppliesToEverySubscriptionOnTheModule 1 3.37481
+SubscriptionRestartPolicyTest.InstallingAWatcherReplaysTheCurrentState 1 0.0981453
+SubscriptionRestartPolicyTest.PolicySetBeforeAnySubscriptionStillApplies 1 0.35762
+SubscriptionRestartPolicyTest.ALossWithNothingArmedReportsNothing 1 4.10585
+SubscriptionRestartPolicyTest.LpClientOptionsCarryTheManualPolicy 1 0.412786
+SubscriptionRestartPolicyTest.OptionsDegradeToDefaultsRatherThanFailing 1 0.0471431
+SubscriptionRestartPolicyTest.AClientWithNoOptionsStaysAutomatic 1 0.333745
+TokenCacheTest.SyncCallsToSameTargetHandshakeOnce 1 0.0542975
+TokenCacheTest.AsyncCallsToSameTargetHandshakeOnceAcrossBursts 1 0.21222
+TokenCacheTest.UnTokenedCallBoundsTheHandshakeByTheCallersBudget 1 3.18242
+ReadinessGatedExchangeTest.TheExchangeIsNotAttemptedUntilTheTargetHasPublished 1 0.762333
+ReadinessGatedExchangeTest.AFirstCallToAnAbsentTargetPaysTheAcquireBudgetOnlyOnce 1 0.682943
+ReadinessGatedExchangeTest.ACallToATargetThatIsAlreadyUpIsNotDelayedByTheGate 1 0.0516389
+ReadinessGatedExchangeTest.AnAsyncCallToATargetThatNeverAppearsStillAnswersItsCaller 1 2.53887
+ReadinessGatedExchangeTest.AnAsyncBurstToALateTargetMintsOnceAndCompletesWhenItAppears 1 3.04642
+ReadinessGatedExchangeTest.AnAsyncCallToAWarmTargetIsNotDelayedByTheGate 1 0.174245
+HandshakeNegativeCacheTest.AModuleThatWasMerelyLateIsProbedAgainRatherThanWrittenOff 1 0.761343
+HandshakeNegativeCacheTest.AModuleWithNoHandshakeSurfaceIsStillRememberedOnceProven 1 0.282047
+TokenReexchangeTest.ProviderReturnsSentinelOnUnauthorizedCall 1 0.0332575
+TokenReexchangeTest.SentinelDecodesLikeEmptyForOldConsumers 1 0.0324068
+TokenReexchangeTest.SyncRejectionReexchangesAndRetriesOnce 1 0.0356578
+TokenReexchangeTest.SyncPersistentRejectionRetriesOnceThenGivesUp 1 0.0384812
+TokenReexchangeTest.SyncEmptyResultDoesNotReexchange 1 0.0347617
+TokenReexchangeTest.AsyncRejectionReexchangesAndRetriesOnce 1 0.236009
+TokenStoreIdentityTest.ANeverIsolatedIdentityGetsTheImageStoreItself 1 0.0372234
+TokenStoreIdentityTest.EveryNonIsolatedIdentitySharesTheOneStore 1 0.033375
+TokenStoreIdentityTest.WritesThroughTheImageStoreAreVisibleThroughForIdentity 1 0.0325079
+TokenStoreIdentityTest.TheEmptyIdentityIsTheImageStoreAndCannotBeIsolated 1 0.0338947
+TokenStoreIdentityTest.AnIsolatedIdentityGetsAStoreOfItsOwn 1 0.0324298
+TokenStoreIdentityTest.TheStoreAddressIsStableAcrossLookups 1 0.0320483
+TokenStoreIdentityTest.TwoIsolatedIdentitiesDoNotSeeEachOthersTokens 1 0.033809
+TokenStoreIdentityTest.AnIsolatedIdentityCannotReachTheAmbientRing 1 0.0324625
+TokenStoreIdentityTest.TokensAddedToTheRingLaterStayInvisible 1 0.0317148
+TokenStoreIdentityTest.IsolationIsIdempotent 1 0.032338
+TokenStoreIdentityTest.IsolationIsRefusedOnceTheSharedStoreWasVended 1 0.0341206
+TokenStoreIdentityTest.IsolatedIdentitiesAreListedForDiagnostics 1 0.0332695
+TokenStoreIdentityTest.APrivateStoreIsBornEmpty 1 0.0337659
+TokenStoreIdentityTest.AdoptingWritesTheCredentialUnderEveryBootstrapKey 1 0.0333232
+TokenStoreIdentityTest.AdoptingTheHostAnchorIsRefusedAndWritesNothing 1 0.032402
+TokenStoreIdentityTest.ACredentialCanBeAdoptedAfterTheStoreExists 1 0.0338748
+TokenStoreIdentityTest.AdoptingANonIsolatedIdentityIsRefusedAndDoesNotBlockLaterIsolation 1 0.0327087
+TokenStoreIdentityTest.ResetClearsTheIssuedTokensAndTheCredentialWithThem 1 0.0342693
+TokenStoreIdentityTest.ResetRefusesANonIsolatedIdentityAndTouchesNothing 1 0.0345002
+TokenStoreClientTest.AnIsolatedClientCannotPresentAnotherModulesRootToken 1 0.0354964
+TokenStoreClientTest.ANullStoreResolvesToTheOriginsStore 1 0.0340921
+TokenStoreClientTest.EachIsolatedIdentityMintsAndCachesItsOwnToken 1 0.0333152
+TokenStoreClientTest.ANonIsolatedIdentityStillShortCircuitsOnTheAmbientToken 1 0.0331147
+TokenStoreAbiTest.IsolateAndQueryRoundTrip 1 0.0330273
+TokenStoreAbiTest.PerIdentityGetAndSaveDoNotTouchTheImageStore 1 0.0326753
+TokenStoreAbiTest.ResetIdentityClearsTheStoreIncludingTheCredential 1 0.0322871
+TokenStoreAbiTest.AdoptCredentialInstallsTheIdentitysOwnCredential 1 0.0334496
+TokenStoreAbiTest.IsolationIsRefusedOnceAClientForThatOriginExists 1 0.0335646
+TokenStoreAbiTest.AnLpClientForAnIsolatedOriginUsesThatIdentitysStore 1 0.0336583
+TokenStoreAbiTest.AnLpClientForANonIsolatedOriginKeepsUsingTheImageStore 1 0.0330225
+TokenStoreTrustRootTest.TheKnownCallerGateStillSeesEveryHostWrittenName 1 0.0335719
+TokenStoreIdentityVersion.TheAdditiveSurfaceMovedMinorNotMajor 1 0.0332913
+ModuleIdentity.ALegacyProviderAnswersNameAndVersion 1 0.0319793
+ModuleIdentity.TheProvidersOwnAnswerWins 1 0.0330503
+ModuleIdentity.IntrospectionAndDispatchAgree 1 0.0339378
+ModuleIdentity.TheListingDoesNotDuplicateWhatTheProviderAlreadyLists 1 0.0329502
+ModuleIdentity.ASameNamedMethodTakingArgumentsIsUntouched 1 0.0323593
+ModuleIdentity.IdentityIsStillGatedOnAuthorization 1 0.0326277
+InboundTokenStore.AnInformedTokenLandsInTheProxysOwnStore 1 0.0440481
+InboundTokenStore.ARefusedPushGrantsNothing 1 0.0675574
+InboundTokenStore.AnUntrustedPushGrantsNothing 1 0.0518262
+InboundTokenStore.AnIsolatedProviderIdentityStillAuthorizesInboundCalls 1 0.0338685
+InboundTokenStore.AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy 1 0.0327759
+InboundTokenStore.TheDefaultStoreIsStillTheAmbientRing 1 0.0323827
+InboundTokenStore.AnEmptyTokenIsRefusedEvenAgainstAnEmptyStoredValue 1 0.0341109
+InboundTokenStore.TheTrustAnchorIsReadFromTheProxysOwnStore 1 0.0328408
+InboundTokenStore.TheComparisonCountDependsOnStoreSizeOnly 1 0.0342331
+CallCaller.AnInboundTokenNamesTheCallerItWasIssuedTo 1 0.0320773
+CallCaller.TheHostAnchorNamesTheHostAndCarriesNoName 1 0.0323823
+CallCaller.AnOutboundTokenNeitherAuthorizesNorNames 1 0.034139
+CallCaller.AValidatorAcceptedTokenNamesNobody 1 0.0352257
+CallCaller.TwoCallersSharingATokenValueNameNeither 1 0.0345354
+CallCaller.TheHostAnchorWinsATieAgainstAnInboundKey 1 0.0359255
+CallCaller.AnOverlongCallerKeyStillAuthorizesAndNamesNobody 1 0.0344309
+CallCaller.ThereIsNoCallerOutsideADispatchAndTheScopePops 1 0.0335624
+CallCaller.ANestedInboundCallRestoresTheOuterCaller 1 0.0334653
+CallCaller.AnUnauthorizedCallOpensNoScope 1 0.0326976
+CallCaller.TheProducedDocumentsMatchTheDeclaredWireShape 1 0.0323689
+CallCaller.AnInboundKeySpelledAsAnAnchorNamesNobody 1 0.0327085
+CallCaller.AnAnchorKeyInTheStoreDoesNotSuppressOtherNames 1 0.0325846
+CallCaller.RefusingToNameAnAnchorKeyCostsNoComparison 1 0.0318179
+ConsumerCredential.AnIsolatedIdentityHoldsNoValueOfTheHosts 1 0.0318596
+ConsumerCredential.TheHostAnchorDiagnosticSeesAHandCopiedAnchor 1 0.0319968
+ConsumerCredential.AdoptingTheHostsOwnAnchorIsRefused 1 0.0322262
+ConsumerCredential.AnAdmittedConsumerIsNamedAsItselfAndNotAsTheHost 1 0.031832
+ConsumerCredential.AnIsolatedIdentityWithNoCredentialIsRefusedEverywhere 1 0.0374648
+ConsumerCredential.AnAdmittedConsumerCompletesTheHandshakeAndReachesAnOrdinaryModule 1 0.0338812
+ConsumerCredential.AnAdmittedProviderIdentityStillAcceptsAPushFromCapability 1 0.0318237
+ConsumerCredential.AReloadRotatesTheCredentialAndTheOldOneStopsWorking 1 0.032812
+ConsumerCredential.AHostThatNeverIsolatesSeesNoChangeAtAll 1 0.0320639
+TokenDirection.AnOutboundTokenDoesNotAuthorizeAnInboundCall 1 0.0328221
+TokenDirection.TheSameNameInBothDirectionsKeepsBothValues 1 0.0325689
+TokenDirection.AnInboundPushDoesNotClobberTheOutboundCache 1 0.0327919
+TokenDirection.TheOwnCredentialStillAuthorizesAndStillGatesPushes 1 0.0320754
+TokenDirection.AnInboundTokenStillAuthorizes 1 0.0311301
+TokenDirection.TheOutboundCacheStillReadsBack 1 0.0323542
+TokenDirection.AGrantOneWayIsNotAGrantTheOtherWay 1 0.0320735
+TokenDirection.NeitherHalfAnswersForTheOther 1 0.0316294
+TokenManagerAbi.TheObjectIsTheSizeEveryShippedModuleWasCompiledAgainst 1 0.03214
+TokenManagerAbi.TheTokenMapIsAtTheOffsetEveryShippedModuleReadsItFrom 1 0.034542
+TokenManagerAbi.BothDirectionsLiveInTheSameMember 1 0.0323416
+TokenManagerAbi.TheOutboundDoorRefusesAKeyThatForgesTheInboundNamespace 1 0.032661
+TokenManagerAbi.TheInboundDoorRefusesACallerNameThatCarriesTheNamespace 1 0.0320379
+TokenManagerAbi.TheOutboundRosterNeverPublishesInboundKeys 1 0.0321955
+TokenManagerAbi.AnInboundEntryIsNotReadableOrRemovableThroughTheOutboundDoor 1 0.0311075
+TokenManagerAbi.TheCredentialIsWhateverIsUnderTheBootstrapKeys 1 0.030688
+TokenManagerAbi.ClearingTakesBothNamespacesAndTheCredential 1 0.0328512
+InboundDoor.AnInboundPushIsNotAnOutboundCredential 1 0.0312242
+InboundDoor.AnInboundPushDoesNotClobberAnExistingOutboundCache 1 0.032055
+InboundDoor.TheOutboundDoorIsStillTheAnchorSeedingDoor 1 0.032648
+InboundDoor.ATokenRegistryStillGetsItsOutboundRoster 1 0.0310895
+InboundDoor.AnUngrantedImageGetsNoOutboundEntry 1 0.034505
+InboundDoor.RevokingTheGrantStopsTheCarveOut 1 0.0311791
+InboundDoor.RefusesNullEmptyAndForgedNames 1 0.0309456
+InboundDoor.TheOutboundDoorReportsARefusedForgedNameToo 1 0.0317901
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.134613
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.151249
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.0904232
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.091665
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.149037
+AllTransportsAndProviders/EventDeliveryMatrix.PublishThenSubscribe_Delivers/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.0963419
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.710986
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.68361
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.886161
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.938813
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.41366
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeThenPublish_Delivers/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.401698
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.156353
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.160035
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.090679
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.0871779
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.141622
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.142859
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.65883
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.722627
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.900601
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.84854
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.398436
+AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_SubscribeThenPublish_Delivers/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.404826
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.794447
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.802017
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.457962
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.459515
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.521355
+AllTransportsAndProviders/EventDeliveryMatrix.SubscriptionSurvivesUnloadAndReload/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.527496
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.0482437
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.035399
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.0318956
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.0323626
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.0330488
+AllTransportsAndProviders/EventDeliveryMatrix.CancelWhilePending_LeavesTheRegistry/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.0328313
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.638916
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.621556
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.631391
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.62528
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.612199
+AllTransportsAndProviders/EventDeliveryMatrix.LpUnsubscribeWhilePending_LeavesTheRegistry/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.648189
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.26654
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.271198
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.156373
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.150173
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.255718
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectReArmsAnArmedSubscription/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.266654
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.783751
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.742932
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.669298
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.627702
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.625334
+AllTransportsAndProviders/EventDeliveryMatrix.ReconnectWhileModuleIsDown_StillReArmsWhenItReturns/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.63679
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.604184
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.60337
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.573948
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.589333
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.182048
+AllTransportsAndProviders/EventDeliveryMatrix.SubscribeRightAfterACall_DeliversImmediately/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.186671
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.0970463
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.0895086
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.0355982
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.0321721
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.0339624
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAlreadyUp_FiresTrue/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.0323874
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 1.09617
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 1.14357
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 1.30343
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 1.32787
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.548516
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.551821
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 1.11443
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 1.10675
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 1.05226
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 1.05201
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 1.0515
+AllTransportsAndProviders/EventDeliveryMatrix.WhenObjectAvailable_NotReArmedOnReconnect/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 1.05684
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.310082
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.292367
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.244752
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.245113
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.294984
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_NamedSubscriptionIsRefused/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.291614
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/qt_remote_QtProvider  # GetParam() = 8-byte object <00-00 00-00 00-00 00-00> 1 0.343734
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/qt_remote_UniversalProvider  # GetParam() = 8-byte object <00-00 00-00 01-00 00-00> 1 0.321751
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/qt_local_QtProvider  # GetParam() = 8-byte object <01-00 00-00 00-00 00-00> 1 0.241581
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/qt_local_UniversalProvider  # GetParam() = 8-byte object <01-00 00-00 01-00 00-00> 1 0.240252
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/plain_tcp_QtProvider  # GetParam() = 8-byte object <02-00 00-00 00-00 00-00> 1 0.31477
+AllTransportsAndProviders/EventDeliveryMatrix.ReservedEvent_WildcardDoesNotCarryIt/plain_tcp_UniversalProvider  # GetParam() = 8-byte object <02-00 00-00 01-00 00-00> 1 0.302404
+NoQtLoopTest.AFailedCallDeliversItsCallbackWithNoQtLoop 1 0.111795
+NoQtLoopTest.RepliesDeliverExactlyOnceWithNoQtLoop 1 0.314362
+NoQtLoopTest.DeferredCompletionsDeliverWithNoQtLoop 1 0.319019
+NoQtLoopTest.TimeoutsDeliverWithNoQtLoop 1 0.505988
+NoQtLoopTest.CancelledCallsDeliverWithNoQtLoopAndNotInsideRelease 1 0.554511
+NoQtLoopTest.ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop 1 1.23082
+NoQtLoopTest.TheVehicleOutlivesStaticDestructors 1 0.0383273
+---

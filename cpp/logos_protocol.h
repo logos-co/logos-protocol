@@ -281,6 +281,16 @@
 // never undefined from here on, so a later MINOR keeps satisfying it.
 #define LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE 1
 
+// FEATURE MACRO, same reason as the one above, and a THIRD revision reporting
+// MINOR 9. Defined where __logos_call_complete__ became a RESERVED name: a
+// public onEvent() refuses it and wildcard fan-out skips it, so a subscriber
+// that used to receive every deferred call's return value now receives none.
+// That is a behaviour change with no symbol attached, which is precisely what a
+// version guard cannot see. A consumer that read completions off the wildcard
+// — `logosctl watch <module>` with no --event did — guards on this to know
+// whether it still can. Absent before the reservation, never undefined after.
+#define LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES 1
+
 /* ---------------------------------------------------------------------------
  * Export marking.
  *
