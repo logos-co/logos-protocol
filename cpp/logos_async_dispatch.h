@@ -1,6 +1,7 @@
 #ifndef LOGOS_ASYNC_DISPATCH_H
 #define LOGOS_ASYNC_DISPATCH_H
 
+#include "logos_reserved_events.h"
 #include <QJsonObject>
 #include <QMetaType>
 #include <QString>
@@ -30,6 +31,14 @@ namespace logos {
 
 inline QString pendingCallKey()   { return QStringLiteral("__logos_pending_call__"); }
 inline QString callCompleteEvent() { return QStringLiteral("__logos_call_complete__"); }
+
+// See logos_reserved_events.h. Compares against QLatin1String so the hot path —
+// one check per event dispatch — does not build a QString to throw away;
+// test_pending_sentinel.cpp pins it against callCompleteEvent().
+inline bool isReservedEventName(const QString& name)
+{
+    return name == QLatin1String(kCallCompleteEvent);
+}
 
 // True only for the exact pending-call sentinel, writing the call id to `callId`.
 //

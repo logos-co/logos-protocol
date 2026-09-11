@@ -36,6 +36,20 @@ QVariant canonical(const QString& id)
 
 } // namespace
 
+// The reserved name is spelled twice — once as a QStringLiteral for producers,
+// once as a Qt-free char* the plain transport can compare against without
+// linking Qt. Cheap to keep, worthless if they ever drift.
+TEST(ReservedEventNames, BothSpellingsOfTheCompletionEventAgree)
+{
+    EXPECT_EQ(logos::callCompleteEvent(), QLatin1String(logos::kCallCompleteEvent));
+    EXPECT_TRUE(logos::isReservedEventName(logos::callCompleteEvent()));
+    EXPECT_TRUE(logos::isReservedEventName(std::string(logos::kCallCompleteEvent)));
+    // The wildcard is not reserved: an empty name means "every event", and
+    // reserving it by accident would silence every wildcard subscriber.
+    EXPECT_FALSE(logos::isReservedEventName(QString()));
+    EXPECT_FALSE(logos::isReservedEventName(logos::pendingCallKey()));
+}
+
 TEST(PendingSentinel, CanonicalShapeIsRecognisedAndYieldsTheCallId)
 {
     QString id;

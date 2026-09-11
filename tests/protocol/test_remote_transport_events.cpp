@@ -205,6 +205,53 @@ public:
 };
 } // anonymous namespace
 
+// The gate one layer below LogosAPIConsumer: a raw LogosObject handle, the
+// interface every consumer path bottoms out in.
+//
+// The control is the whole point. Refusing the subscription is easy; refusing it
+// WITHOUT breaking the transport's own completion callback — registered on the
+// same helper, for the same name, from RemoteLogosObject's constructor — is the
+// part that can regress. So this asserts the outside subscriber gets nothing and
+// the deferred call still returns its result.
+TEST_F(RemoteEventTest, ReservedEventCannotBeSubscribedButStillCompletesTheCall)
+{
+    const QString registryUrl = LogosInstance::id("async_module");
+
+    RemoteTransportHost host(registryUrl);
+    DeferredProvider provider;
+    ModuleProxy proxy(&provider);
+    ASSERT_TRUE(proxy.saveToken(QStringLiteral("test_caller"), QStringLiteral("tok-1")));
+    ASSERT_TRUE(host.publishObject("async_module", &proxy));
+
+    RemoteTransportConnection conn(registryUrl);
+    ASSERT_TRUE(conn.connectToHost());
+
+    LogosObject* obj = conn.requestObject("async_module", 5000);
+    ASSERT_NE(obj, nullptr);
+
+    std::atomic<int> leaked{0};
+    obj->onEvent(logos::callCompleteEvent(),
+                 [&](const QString&, const QVariantList&) { leaked.fetch_add(1); });
+
+    std::atomic<int> delivered{0};
+    QVariant got;
+    obj->callMethodAsync(QStringLiteral("tok-1"), QStringLiteral("asyncWork"),
+                         QVariantList{}, 5000,
+        [&](QVariant result) { got = result; delivered.fetch_add(1); });
+
+    pumpEventLoop(300);
+    emit proxy.eventResponse(logos::callCompleteEvent(),
+                             QVariantList{ provider.m_callId, QVariant(123) });
+    for (int i = 0; i < 60 && delivered.load() == 0; ++i) pumpEventLoop(50);
+
+    EXPECT_EQ(leaked.load(), 0) << "onEvent handed out the completion channel";
+    EXPECT_EQ(delivered.load(), 1) << "the refusal took the transport's own completion with it";
+    EXPECT_EQ(got.toInt(), 123);
+
+    obj->release();
+    pumpEventLoop(200);
+}
+
 // Regression test for the refresh_balances SIGSEGV.
 //
 // The deferred-completion result is delivered by RemoteEventHelper::onEventResponse

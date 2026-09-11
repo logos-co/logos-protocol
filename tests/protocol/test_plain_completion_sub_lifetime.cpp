@@ -38,13 +38,14 @@
 //     that sits between the handler copy and the handler's touch of `this` takes
 //     milliseconds instead of nanoseconds.
 //
-//   * AIMED. A wildcard subscriber on a SECOND handle observes the connection's
-//     dispatch loop: dispatchIncoming copies the named handler and the wildcard
-//     handler out together and invokes the named one FIRST, so an observation is
-//     the trailing edge of one completion dispatch and the io thread starts the
-//     next one immediately after. The round waits for an observation and only
-//     then releases, at an offset swept across rounds — so release() lands
-//     INSIDE a dispatch instead of before the burst has even been read.
+//   * AIMED. A second handle subscribed to the completion channel observes the
+//     connection's dispatch loop: dispatchIncoming copies every handler for the
+//     event out together and invokes them in registration order, and the
+//     observer registers before the first round, so an observation is the
+//     LEADING edge of a completion dispatch — the victim's handler runs
+//     immediately after it. The round waits for an observation and only then
+//     releases, at an offset swept across rounds — so release() lands INSIDE a
+//     dispatch instead of before the burst has even been read.
 //
 //   * MEASURED. The round records the dispatch cadence and the observations that
 //     land after release() returned; both are printed and asserted on, so a
@@ -69,6 +70,7 @@
 #include "logos_transport_config.h"
 #include "module_proxy.h"
 
+#include "plain_logos_object.h"
 #include "plain_transport_connection.h"
 #include "plain_transport_host.h"
 
@@ -246,11 +248,11 @@ QVariantList completionData(const QVariantList& bulk)
     return QVariantList{ QVariant(bulk), QVariant(1) };
 }
 
-// Wildcard ("" event name) subscriber on a second handle, used as an OBSERVER of
-// the connection's dispatch loop. dispatchIncoming copies both the named handler
-// and the wildcard handler out under one lock and invokes the named one FIRST,
-// so an observation at time T is the trailing edge of a completion dispatch, and
-// the io thread begins the next one immediately after T.
+// A second handle's completion subscription, used as an OBSERVER of the
+// connection's dispatch loop. dispatchIncoming copies every handler for the
+// event out under one lock and invokes them in registration order; this one is
+// registered first, so an observation at time T is the LEADING edge of a
+// completion dispatch and the victim's handler runs from T onwards.
 struct DispatchObserver {
     std::atomic<int>      total{0};
     std::atomic<int>      straddles{0};
@@ -363,6 +365,18 @@ uint64_t calibrate(DispatchObserver& observer, CompletionPusher& pusher,
     return gap;
 }
 
+// The observer subscribes to the completion channel BY NAME, through the test
+// seam, because onEvent() refuses a reserved name and a wildcard no longer
+// carries one (logos_reserved_events.h). Same frames as before the reservation;
+// see the phase diagram in the test for the one thing that did change.
+void observeCompletions(LogosObject* watcher, DispatchObserver& observer)
+{
+    logos::plain::subscribeReservedEventForTest(
+        static_cast<logos::plain::PlainLogosObject*>(watcher),
+        logos::callCompleteEvent(),
+        [&observer](const QString&, const QVariantList&) { observer.observe(); });
+}
+
 LogosObjectErrorChannel* channelFor(LogosObject* obj)
 {
     return dynamic_cast<LogosObjectErrorChannel*>(obj);
@@ -389,15 +403,13 @@ TEST_F(PlainCompletionSubLifetimeTest, CompletionEventDispatchedAcrossReleaseIsS
     auto conn = connectTo(host.port());
     ASSERT_NE(conn, nullptr);
 
-    // A second handle on the SAME connection, holding the wildcard
-    // subscription. Never released inside the loop, so the observer survives
-    // every round — and, being a different key, release() does not erase it.
+    // A second handle on the SAME connection, holding a completion-channel
+    // subscription of its own. Never released inside the loop, so the observer
+    // survives every round; release() only withdraws the victim's registration.
     LogosObject* watcher = conn->requestObject(QStringLiteral("pusher_module"), 5000);
     ASSERT_NE(watcher, nullptr);
     DispatchObserver observer;
-    watcher->onEvent(QString(), [&observer](const QString&, const QVariantList&) {
-        observer.observe();
-    });
+    observeCompletions(watcher, observer);
 
     const QVariantList data = completionData(makePayload());
 
@@ -412,16 +424,17 @@ TEST_F(PlainCompletionSubLifetimeTest, CompletionEventDispatchedAcrossReleaseIsS
     //
     // One dispatch of a completion event has three phases, in this order:
     //
-    //     [ read + decode ][ named handler ][ wildcard handler ]
-    //                      ^ copy           ^ object touched in here
+    //     [ read + decode ][ observer ][ victim's handler ]
+    //                        ^ stamped    ^ object touched in here
     //
-    // Only the named-handler phase is dangerous, and the only edge this test can
-    // see is the END of the wildcard phase. Measured with a temporary probe
-    // inside dispatchIncoming, under Guard Malloc: read+decode 62ms, named 59ms,
-    // wildcard 59ms, and the touch 27ms into the named phase. So the target is
-    // roughly 34-50% of a dispatch past an observation — but the split moves with
-    // the allocator, and sizing it live from two calibration bursts proved too
-    // noisy to trust (gap1 < gap0 on 2 plain runs in 5).
+    // Only the victim's phase is dangerous, and it begins where the observation
+    // lands — the observer is a timestamp, so it costs nothing between the two.
+    // (Before the completion channel was reserved the observer rode the wildcard
+    // and ran LAST, which put the danger a frame away instead of directly after;
+    // both layouts are inside the comb's sweep, and the straddle counter below
+    // reports 24/24 either way.) The split still moves with the allocator, and
+    // sizing it live from two calibration bursts proved too noisy to trust
+    // (gap1 < gap0 on 2 plain runs in 5).
     //
     // So: a COMB, at 8% of a dispatch, swept across two whole dispatches. Blunt,
     // but it needs no model of the split, and the straddle counter below reports
@@ -516,9 +529,7 @@ TEST_F(PlainCompletionSubLifetimeTest, NoReleaseIsCleanUnderTheSameStorm)
     LogosObject* watcher = conn->requestObject(QStringLiteral("pusher_module"), 5000);
     ASSERT_NE(watcher, nullptr);
     DispatchObserver observer;
-    watcher->onEvent(QString(), [&observer](const QString&, const QVariantList&) {
-        observer.observe();
-    });
+    observeCompletions(watcher, observer);
 
     LogosObject* obj = conn->requestObject(QStringLiteral("pusher_module"), 5000);
     ASSERT_NE(obj, nullptr);

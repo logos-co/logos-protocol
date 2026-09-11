@@ -41,6 +41,7 @@
 #include <gtest/gtest.h>
 
 #include "logos_api_client.h"
+#include "logos_async_dispatch.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
 #include "logos_object.h"
@@ -851,6 +852,68 @@ TEST_P(EventDeliveryMatrix, WhenObjectAvailable_NotReArmedOnReconnect)
     ASSERT_TRUE(client->reconnect());
     pump(1000);
     EXPECT_EQ(fired.load(), 1) << "a spent readiness answer was re-delivered by reconnect";
+}
+
+// ── The completion channel is not part of the event surface ─────────────────
+//
+// __logos_call_complete__ carries a deferred call's RETURN VALUE and rides the
+// same channel a module uses for its own events. Before the reservation a
+// subscriber could ask for it by name, and a wildcard subscriber got every one
+// of them — `logosctl watch <module>` with no --event was reading every
+// method's result, recovery phrases included. Both halves are pinned here, on
+// every transport, because each enforces the rule in a different place: the two
+// Qt helpers filter their own dispatch, plain withholds it at the host.
+TEST_P(EventDeliveryMatrix, ReservedEvent_NamedSubscriptionIsRefused)
+{
+    Module mod = makeModule("resvname");
+    ASSERT_TRUE(mod.hostReady());
+    mod.bringUp();
+
+    auto client = makeClient(mod);
+
+    // Control: an ordinary name on the same client is accepted and delivers, so
+    // the zero below is the reservation and not a fixture that cannot subscribe.
+    std::atomic<int> control{0};
+    ASSERT_NE(client->onEventWhenAvailable(mod.name(), QStringLiteral("ev"),
+        [&](const QString&, const QVariantList&) { control.fetch_add(1); }), 0u);
+
+    std::atomic<int> got{0};
+    EXPECT_EQ(client->onEventWhenAvailable(mod.name(), logos::callCompleteEvent(),
+        [&](const QString&, const QVariantList&) { got.fetch_add(1); }), 0u)
+        << "a subscriber asked for the completion channel by name and was handed it";
+
+    ASSERT_TRUE(pumpUntil([&] { return mod.canEmit(); }, 5000)) << "provider never got its listener";
+    ASSERT_TRUE(fireUntilDelivered(mod, QStringLiteral("ev"), 1, control, 10000))
+        << "control leg never delivered -- nothing below is evidence";
+
+    // Emitted by the module itself, which is the strongest form of the claim:
+    // the name reaches no subscriber even when it really is on the wire.
+    for (int i = 0; i < 5; ++i) { mod.emitEvent(logos::callCompleteEvent(), 7); pump(25); }
+    EXPECT_EQ(got.load(), 0);
+}
+
+TEST_P(EventDeliveryMatrix, ReservedEvent_WildcardDoesNotCarryIt)
+{
+    Module mod = makeModule("resvwild");
+    ASSERT_TRUE(mod.hostReady());
+    mod.bringUp();
+
+    auto client = makeClient(mod);
+    std::atomic<int> ordinary{0};
+    std::atomic<int> reserved{0};
+    ASSERT_NE(client->onEventWhenAvailable(mod.name(), QString(),
+        [&](const QString& name, const QVariantList&) {
+            if (logos::isReservedEventName(name)) reserved.fetch_add(1);
+            else                                  ordinary.fetch_add(1);
+        }), 0u) << "the wildcard subscription itself was refused";
+
+    ASSERT_TRUE(pumpUntil([&] { return mod.canEmit(); }, 5000)) << "provider never got its listener";
+    ASSERT_TRUE(fireUntilDelivered(mod, QStringLiteral("ev"), 3, ordinary, 10000))
+        << "the wildcard delivered nothing at all -- nothing below is evidence";
+
+    for (int i = 0; i < 5; ++i) { mod.emitEvent(logos::callCompleteEvent(), 9); pump(25); }
+    EXPECT_EQ(reserved.load(), 0)
+        << "a wildcard subscriber is still being handed every method's return value";
 }
 
 INSTANTIATE_TEST_SUITE_P(

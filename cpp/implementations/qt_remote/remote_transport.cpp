@@ -41,10 +41,14 @@ public slots:
     void onEventResponse(const QString& eventName, const QVariantList& data) {
         // Dispatch to callbacks registered for this specific event name,
         // plus any wildcard subscribers (callbacks registered with an
-        // empty event name, meaning "receive every event").
+        // empty event name, meaning "receive every event") — except for a
+        // reserved name, which no wildcard carries and which only the
+        // completion callback wired up in the constructor ever asked for. It
+        // also dispatches without a log line, being one per deferred call.
         auto cbs = m_callbacks.value(eventName);
-        cbs.append(m_callbacks.value(QString()));
-        if (!cbs.isEmpty()) {
+        const bool reserved = logos::isReservedEventName(eventName);
+        if (!reserved) cbs.append(m_callbacks.value(QString()));
+        if (!cbs.isEmpty() && !reserved) {
             qDebug() << "[LogosObject] Remote EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s) (via IPC)";
         }
         for (const auto& cb : cbs) {
@@ -373,6 +377,10 @@ public:
     void onEvent(const QString& eventName, EventCallback callback) override
     {
         if (!m_replica) return;
+        if (logos::isReservedEventName(eventName)) {
+            qWarning() << "[LogosObject] RemoteLogosObject::onEvent: refusing to subscribe to reserved event" << eventName;
+            return;
+        }
 
         qDebug() << "[LogosObject] RemoteLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {

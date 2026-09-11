@@ -5,6 +5,7 @@
 #include "json_codec.h"
 #include "qvariant_rpc_value.h"
 
+#include "../../logos_reserved_events.h"
 #include "../../module_proxy.h"
 
 #include <QDebug>
@@ -365,13 +366,19 @@ void PlainTransportHost::fanOutEvent(const std::string& name, EventMessage msg)
         auto it = m_sinks.find(name);
         if (it == m_sinks.end()) return;
         std::set<const void*> seen;
-        // Named subscribers + wildcard ("") subscribers get the event.
+        // Named subscribers + wildcard ("") subscribers get the event. A
+        // reserved name is the exception: it reaches the transport that
+        // subscribed to it by name and nobody else (logos_reserved_events.h).
+        // The break has to be unconditional on the key MISSING, not folded into
+        // the `continue` below it — a reserved event with no named subscriber
+        // would otherwise fall straight through to the wildcard.
+        const bool reserved = logos::isReservedEventName(msg.eventName);
         for (auto which : {msg.eventName, std::string{}}) {
             auto evtIt = it->second.find(which);
-            if (evtIt == it->second.end()) continue;
-            for (auto& [key, sink] : evtIt->second)
-                if (seen.insert(key).second) sinks.push_back(sink);
-            if (msg.eventName.empty()) break;  // named IS wildcard here
+            if (evtIt != it->second.end())
+                for (auto& [key, sink] : evtIt->second)
+                    if (seen.insert(key).second) sinks.push_back(sink);
+            if (msg.eventName.empty() || reserved) break;  // named IS wildcard here
         }
     }
     for (auto& sink : sinks) {

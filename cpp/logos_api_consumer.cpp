@@ -1,4 +1,5 @@
 #include "logos_api_consumer.h"
+#include "logos_async_dispatch.h"
 #include "logos_object.h"
 #include "module_proxy.h"
 #include "token_manager.h"
@@ -888,9 +889,9 @@ quint64 LogosAPIConsumer::onEventWhenAvailable(const QString& objectName,
     // the two arguments that really are unusable, which silently denied every
     // hand-rolled wildcard subscriber the deferred path -- logoscore's
     // `watch <module>` with no --event is one.
-    if (objectName.isEmpty() || !callback) {
-        qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object name "
-                      "or null callback -- refusing" << objectName << eventName;
+    if (objectName.isEmpty() || !callback || logos::isReservedEventName(eventName)) {
+        qWarning() << "LogosAPIConsumer::onEventWhenAvailable: empty object name, "
+                      "null callback or reserved event -- refusing" << objectName << eventName;
         if (onArmed) onArmed(false);
         return 0;
     }

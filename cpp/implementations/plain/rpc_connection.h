@@ -1,6 +1,8 @@
 #ifndef LOGOS_PLAIN_RPC_CONNECTION_H
 #define LOGOS_PLAIN_RPC_CONNECTION_H
 
+#include "../../logos_reserved_events.h"
+
 #include "incoming_call_handler.h"
 #include "rpc_framing.h"
 #include "rpc_message.h"
@@ -398,8 +400,12 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                 };
                 collect({m.object, m.eventName});
                 // The wildcard key IS the named key for an event whose name is
-                // empty; visiting it twice would deliver that event twice.
-                if (!m.eventName.empty()) collect({m.object, std::string{}});
+                // empty; visiting it twice would deliver that event twice. A
+                // reserved name skips the wildcard outright — the host already
+                // withholds it, and this is the half that holds when the frame
+                // came from somewhere else.
+                if (!m.eventName.empty() && !logos::isReservedEventName(m.eventName))
+                    collect({m.object, std::string{}});
             }
             for (auto& cb : cbs) cb(m);
 

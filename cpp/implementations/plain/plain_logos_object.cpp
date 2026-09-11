@@ -1023,7 +1023,7 @@ void PlainLogosObject::subscribeToCompletions()
     // that outlives its owner — for this reason or any future one — a no-op
     // instead of an append to a map nobody will ever drain.
     std::weak_ptr<CallState> weak = m_state;
-    onEvent(logos::callCompleteEvent(), [weak](const QString&, const QVariantList& data) {
+    subscribeEvent(logos::callCompleteEvent(), [weak](const QString&, const QVariantList& data) {
         if (data.size() != 2) return;
         const std::shared_ptr<CallState> st = weak.lock();
         if (!st) return;              // the handle and its state are both gone
@@ -1283,6 +1283,15 @@ bool PlainLogosObject::informModuleToken(const QString& authToken,
 
 void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 {
+    if (logos::isReservedEventName(eventName)) {
+        qWarning() << "[LogosObject] PlainLogosObject::onEvent: refusing to subscribe to reserved event" << eventName;
+        return;
+    }
+    subscribeEvent(eventName, std::move(callback));
+}
+
+void PlainLogosObject::subscribeEvent(const QString& eventName, EventCallback callback)
+{
     EntryGuard guard(this, "onEvent()");
     if (!m_conn || !m_conn->isOpen() || !callback) return;
 
@@ -1305,6 +1314,12 @@ void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
                  rpcListToQVariantList(evt.data));
     });
     m_subs.push_back(sid);
+}
+
+void subscribeReservedEventForTest(PlainLogosObject* obj, const QString& eventName,
+                                   LogosObject::EventCallback callback)
+{
+    if (obj) obj->subscribeEvent(eventName, std::move(callback));
 }
 
 void PlainLogosObject::disconnectEvents()

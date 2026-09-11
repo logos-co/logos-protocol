@@ -315,6 +315,14 @@ private:
     // `delete this` from inside `delete this`.
     void disconnectEventsImpl();
 
+    // onEvent() without the reserved-name refusal. ensureCompletionSub() is the
+    // one subscriber a reserved name has, and it registers by exact name — the
+    // refusal exists to keep everyone ELSE off the completion channel.
+    void subscribeEvent(const QString& eventName, EventCallback callback);
+
+    friend void subscribeReservedEventForTest(PlainLogosObject*, const QString&,
+                                              EventCallback);
+
     // Raise the stop flag, then cancel every outstanding async call — each of
     // which delivers its callback, once, with callErrorReleased — and wake the
     // synchronous caller if one is parked.
@@ -352,6 +360,14 @@ private:
     // that has been raised but not yet honoured. The whole fix is this member.
     std::once_flag                       m_completionSubOnce;
 };
+
+// The completion channel, subscribable. onEvent() refuses a reserved name, and
+// test_plain_completion_sub_lifetime.cpp's dispatch probe has to ride the very
+// frames the completion handler does — an ordinary event lands in a different
+// frame and measures a different thing. Deliberately NOT #ifdef'd: the gate the
+// tests exercise has to be the gate that ships. Nothing in the product calls it.
+void subscribeReservedEventForTest(PlainLogosObject* obj, const QString& eventName,
+                                   LogosObject::EventCallback callback);
 
 } // namespace logos::plain
 

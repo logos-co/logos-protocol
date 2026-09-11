@@ -1,6 +1,7 @@
 #include "local_transport.h"
 #include "../../plugin_registry.h"
 #include "../../module_proxy.h"
+#include "../../logos_async_dispatch.h"
 #include <QDebug>
 #include <QMetaObject>
 #include <QTimer>
@@ -20,12 +21,12 @@ public:
 
 public slots:
     void onEventResponse(const QString& eventName, const QVariantList& data) {
-        // Dispatch to callbacks registered for this specific event name,
-        // plus any wildcard subscribers (callbacks registered with an
-        // empty event name, meaning "receive every event").
+        // Same shape as the remote helper: a reserved name reaches neither a
+        // wildcard subscriber nor the log.
         auto cbs = m_callbacks.value(eventName);
-        cbs.append(m_callbacks.value(QString()));
-        if (!cbs.isEmpty()) {
+        const bool reserved = logos::isReservedEventName(eventName);
+        if (!reserved) cbs.append(m_callbacks.value(QString()));
+        if (!cbs.isEmpty() && !reserved) {
             qDebug() << "[LogosObject] Local EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s)";
         }
         for (const auto& cb : cbs) {
@@ -125,6 +126,10 @@ public:
     void onEvent(const QString& eventName, EventCallback callback) override
     {
         if (!m_proxy) return;
+        if (logos::isReservedEventName(eventName)) {
+            qWarning() << "[LogosObject] LocalLogosObject::onEvent: refusing to subscribe to reserved event" << eventName;
+            return;
+        }
 
         qDebug() << "[LogosObject] LocalLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {
