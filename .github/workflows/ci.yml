@@ -39,6 +39,11 @@ jobs:
           nix build ".#checks.$(nix eval --raw --impure --expr builtins.currentSystem).module-impl-abi-tests" \
             --no-link --print-build-logs
 
+      - name: qt-host/protocol ABI closure check
+        run: |
+          nix build ".#checks.$(nix eval --raw --impure --expr builtins.currentSystem).abi-closure-check-tests" \
+            --no-link --print-build-logs
+
       # --print-build-logs is load-bearing, not decoration. The suite RUNS in
       # this derivation's checkPhase (nix/tests.nix), so a failing test fails
       # this step — and without -L all nix reports is its own "Last 25 log
