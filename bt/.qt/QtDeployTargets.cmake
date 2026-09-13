@@ -1,8 +1,0 @@
-set(__QT_DEPLOY_TARGET_logos_protocol_FILE /private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/lib/liblogos_protocol.a)
-set(__QT_DEPLOY_TARGET_logos_protocol_TYPE STATIC_LIBRARY)
-set(__QT_DEPLOY_TARGET_logos_protocol_shared_FILE /private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/lib/liblogos_protocol.dylib)
-set(__QT_DEPLOY_TARGET_logos_protocol_shared_TYPE SHARED_LIBRARY)
-set(__QT_DEPLOY_TARGET_protocol_tests_FILE /private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/protocol/protocol_tests)
-set(__QT_DEPLOY_TARGET_protocol_tests_TYPE EXECUTABLE)
-set(__QT_DEPLOY_TARGET_protocol_noqt_tests_FILE /private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/protocol/protocol_noqt_tests)
-set(__QT_DEPLOY_TARGET_protocol_noqt_tests_TYPE EXECUTABLE)

@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/cmake_install.cmake",
-		"/private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/logos_protocol/cmake_install.cmake",
-		"/private/tmp/claude-501/-Users-dlipicar-repos-logos-workspace/3967c77d-93dd-4877-b52f-2cb26918787b/scratchpad/lp/bt/protocol/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
