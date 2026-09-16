@@ -322,8 +322,8 @@ add_executable(protocol_tests
     # RE-arm", never "do not arm", or every subscription taken during init()
     # before its provider listens stops working.
     test_subscription_restart_policy.cpp
-    # A provider replaced faster than the 1 s liveness poll. Detectors: four RED on 9e29120 and with the registry's
-    # bindToSource call removed; ABoundHandleStops... RED with the helper's gate removed. ChurnOnAHealthyModule is a control.
+    # Provider swapped faster than the 1 s poll. Detectors: four RED on 9e29120 (and without bindToSource), the gate one RED without
+    # the helper's gate, the late-subscriber/rearm three RED on 4ceea79 (rearm also without its replay). Churn* is a control.
     test_subscription_fast_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod

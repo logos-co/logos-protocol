@@ -171,10 +171,13 @@ public:
         if (!any) return false;
         m_held = std::move(keep);
 
-        if (LogosObject* obj = liveHandle(objectName))
-            armAgainst(objectName, obj);   // provider already back
-        else
+        if (LogosObject* obj = liveHandle(objectName)) {
+            // Provider already back and re-established by another subscriber: the revive joins it, but owes an ARMED.
+            if (!armAgainst(objectName, obj))
+                reportTarget(objectName, LogosSubscriptionEvent::Armed, QString());
+        } else {
             beginAcquire(objectName);
+        }
         ensureTimer();
         return true;
     }
@@ -277,6 +280,8 @@ private:
         // How many times this provider has been established. 0 until the first
         // arm, then +1 on each one.
         quint64 generation = 0;
+        // The current handle has already made its establishment; reset whenever a new handle is adopted.
+        bool established = false;
         std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus;
     };
 
@@ -538,7 +543,8 @@ private:
     }
 
     // A handle arrived: attach every pending subscription for that object.
-    void armAgainst(const QString& objectName, LogosObject* obj)
+    // Returns whether this arm established the target, i.e. reported ARMED with a new generation.
+    bool armAgainst(const QString& objectName, LogosObject* obj)
     {
         LogosObject* handle = m_handles.value(objectName, nullptr);
         if (handle && handle != obj && isDead(handle)) {
@@ -549,6 +555,7 @@ private:
         }
         if (!handle) {
             m_handles.insert(objectName, obj);
+            m_targets[objectName].established = false;
             handle = obj;
             watchSource(obj);
         } else if (handle != obj) {
@@ -560,15 +567,18 @@ private:
         // while iterating it would be a use-after-free.
         QVector<Entry> matched = takeMatching(objectName);
 
-        // The generation belongs to the OBJECT, so it advances once here, not
-        // once per subscription. Readiness-only entries do not count: a
-        // whenObjectAvailable() probe attaches nothing and must not look like a
-        // re-establishment.
+        // One establishment per handle: its first real arm advances the generation and reports ARMED, and a
+        // later subscriber joins silently. A readiness-only probe attaches nothing, so it never counts.
         bool anyReal = false;
         for (const Entry& e : matched)
             if (!e.readinessOnly) { anyReal = true; break; }
-        if (anyReal) ++m_targets[objectName].generation;
-        const quint64 gen = m_targets.value(objectName).generation;
+        Target& target = m_targets[objectName];
+        const bool establishes = anyReal && !target.established;
+        if (establishes) {
+            ++target.generation;
+            target.established = true;
+        }
+        const quint64 gen = target.generation;   // `target` may dangle once callbacks run
 
         for (Entry& e : matched) {
             if (e.readinessOnly) {
@@ -608,12 +618,13 @@ private:
         // ONE edge for the object, and only after every entry is in m_armed: a
         // watcher may re-enter to read state or subscribe, and it must not see
         // half a transition.
-        if (anyReal) reportTarget(objectName, LogosSubscriptionEvent::Armed, QString());
+        if (establishes) reportTarget(objectName, LogosSubscriptionEvent::Armed, QString());
 
         // The armed set is now non-empty, so the liveness watchdog has work
         // even though nothing is pending. takeMatching() above stopped the
         // timer on exactly that condition; restart it.
         ensureTimer();
+        return establishes;
     }
 
     // Move every ARMED subscription for an object back into the pending set,

@@ -21,6 +21,7 @@
 #include <QUrl>
 #include <QVariantList>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -367,6 +368,126 @@ TEST_F(FastProviderRestartTest, ABoundHandleStopsAtTheLossAnUnboundOneDoesNot)
     bound->release();
     unbound->release();
     pump(50);
+}
+
+// DETECTOR: a subscriber joining an established module gets its own onArmed, but no target edge or generation.
+TEST_F(FastProviderRestartTest, ALateSubscriberJoinsTheCurrentGeneration)
+{
+    const QString mod = QStringLiteral("fast_restart_late_joiner_module");
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+
+    Provider p1(QStringLiteral("p1")), p2(QStringLiteral("p2"));
+    SwappableHost host(mod);
+    host.publish(p1);
+
+    LogosAPIClient client(mod, QStringLiteral("caller"), &TokenManager::instance());
+    Log log;
+    client.setSubscriptionStatusCallback(mod, log.status());
+    ASSERT_NE(client.onEventWhenAvailable(mod, QStringLiteral("ev"), log.events(&client, mod)), 0u);
+    ASSERT_TRUE(pumpUntil([&] { return client.subscriptionGeneration(mod) == 1; }, kBudgetMs));
+
+    int lateArmed = 0;
+    QStringList lateSeen;
+    const quint64 late = client.onEventWhenAvailable(
+        mod, QStringLiteral("ev"),
+        [&](const QString&, const QVariantList& d) { lateSeen << d.value(0).toString(); },
+        [&](bool ok) { lateArmed += ok ? 1 : 0; });
+    for (int i = 0; i < 3; ++i) {
+        const quint64 extra = client.onEventWhenAvailable(
+            mod, QStringLiteral("other"), [](const QString&, const QVariantList&) {});
+        pump(20);
+        EXPECT_TRUE(client.cancelEventSubscription(extra));
+    }
+    ASSERT_TRUE(emitUntil(p1, [&] { return lateSeen.contains(p1.tag); }, kBudgetMs));
+    EXPECT_EQ(lateArmed, 1);
+    EXPECT_EQ(client.eventSubscriptionState(late), LogosSubscriptionState::Armed);
+    EXPECT_EQ(client.subscriptionGeneration(mod), 1u) << "a late subscriber looked like a restart";
+    EXPECT_EQ(log.countEdges(LogosSubscriptionEvent::Armed), 1);
+
+    // A real restart still advances once, for everything armed on the module.
+    host.replace(p1, p2);
+    ASSERT_TRUE(emitUntil(p2, [&] {
+        return lateSeen.contains(p2.tag) && log.firstEvent(p2.tag) >= 0;
+    }, kBudgetMs));
+    expectRestartBracketsEvents(log, p2.tag, 2);
+    EXPECT_EQ(log.countEdges(LogosSubscriptionEvent::Armed), 2);
+}
+
+// DETECTOR: the same through the C ABI, whose generation the header tells plain lp_subscribe callers to watch.
+TEST_F(FastProviderRestartTest, LpSubscribeOnAnArmedClientKeepsTheGeneration)
+{
+    const QString mod = QStringLiteral("fast_restart_abi_late_module");
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+
+    Provider p1(QStringLiteral("p1"));
+    SwappableHost host(mod);
+    host.publish(p1);
+
+    lp_client* client = lp_client_create(mod.toUtf8().constData(), "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    std::vector<int> states;
+    ASSERT_EQ(lp_client_set_subscription_status_cb(
+        client,
+        [](int state, unsigned long long, const char*, void* ud) {
+            static_cast<std::vector<int>*>(ud)->push_back(state);
+        }, &states), 1);
+    auto noop = [](const char*, const char*, void*) {};
+    lp_subscription* first = lp_subscribe(client, "ev", noop, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_TRUE(pumpUntil([&] { return lp_client_subscription_generation(client) == 1; }, kBudgetMs));
+
+    lp_subscription* second = lp_subscribe(client, "ev", noop, nullptr);
+    lp_subscription* third = lp_subscribe(client, "other", noop, nullptr);
+    ASSERT_NE(second, nullptr);
+    ASSERT_NE(third, nullptr);
+    pump(300);
+    EXPECT_EQ(lp_client_subscription_generation(client), 1ull)
+        << "a second lp_subscribe read as a provider restart";
+    EXPECT_EQ(std::count(states.begin(), states.end(), LP_SUB_ARMED), 1);
+
+    lp_unsubscribe(third);
+    lp_unsubscribe(second);
+    lp_unsubscribe(first);
+    lp_client_destroy(client);
+}
+
+// DETECTOR for rearm()'s replay: reviving onto a target another subscriber already re-established still answers ARMED.
+TEST_F(FastProviderRestartTest, RearmOntoAReestablishedTargetStillReportsArmed)
+{
+    const QString mod = QStringLiteral("fast_restart_rearm_join_module");
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+
+    Provider p1(QStringLiteral("p1")), p2(QStringLiteral("p2"));
+    SwappableHost host(mod);
+    host.publish(p1);
+
+    LogosAPIClient client(mod, QStringLiteral("caller"), &TokenManager::instance());
+    client.setSubscriptionRestartPolicy(mod, LogosRestartPolicy::Manual);
+    Log log;
+    client.setSubscriptionStatusCallback(mod, log.status());
+    const quint64 held = client.onEventWhenAvailable(mod, QStringLiteral("ev"),
+                                                     log.events(&client, mod));
+    ASSERT_TRUE(pumpUntil([&] { return client.subscriptionGeneration(mod) == 1; }, kBudgetMs));
+
+    host.replace(p1, p2);
+    ASSERT_TRUE(pumpUntil([&] {
+        return client.eventSubscriptionState(held) == LogosSubscriptionState::Held;
+    }, kBudgetMs));
+
+    // A new subscriber re-establishes the target while the first one stays held.
+    ASSERT_NE(client.onEventWhenAvailable(mod, QStringLiteral("other"),
+                                          [](const QString&, const QVariantList&) {}), 0u);
+    ASSERT_TRUE(pumpUntil([&] { return client.subscriptionGeneration(mod) == 2; }, kBudgetMs));
+    EXPECT_EQ(client.eventSubscriptionState(held), LogosSubscriptionState::Held);
+
+    const int armedBefore = log.countEdges(LogosSubscriptionEvent::Armed);
+    ASSERT_TRUE(client.rearmSubscriptions(mod));
+    EXPECT_EQ(log.countEdges(LogosSubscriptionEvent::Armed), armedBefore + 1)
+        << "rearm() revived the subscription without answering ARMED";
+    EXPECT_EQ(log.items.back().gen, 2u);
+    EXPECT_EQ(client.subscriptionGeneration(mod), 2u);
+    EXPECT_EQ(client.eventSubscriptionState(held), LogosSubscriptionState::Armed);
+    ASSERT_TRUE(emitUntil(p2, [&] { return log.firstEvent(p2.tag) >= 0; }, kBudgetMs));
 }
 
 // CONTROL: calls and extra handles on the same module are not a restart.
