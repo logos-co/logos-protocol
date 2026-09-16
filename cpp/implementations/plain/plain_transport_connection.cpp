@@ -27,11 +27,13 @@ namespace logos::plain {
 
 namespace {
 
-// A redial gives up after this; a failed one is not retried sooner than kRedialInterval.
+// A dial gives up after this; a failed redial is not retried sooner than kRedialInterval.
 constexpr std::chrono::milliseconds kDialDeadline{5000};
 constexpr std::chrono::milliseconds kRedialInterval{250};
 // What a zero-timeout caller (the subscription retry tick) waits for a fresh dial: enough for loopback.
 constexpr int kFreshDialWaitMs = 20;
+// connectToHost() gives up after this even if the deadline has not fired (a busy io thread, a hung DNS lookup).
+constexpr std::chrono::milliseconds kConnectWait = kDialDeadline + std::chrono::milliseconds(500);
 
 std::shared_ptr<IWireCodec> makeCodec(LogosWireCodec kind)
 {
@@ -79,10 +81,44 @@ void configureTlsClient(SslStream& stream, const LogosTransportConfig& cfg)
 
 boost::asio::io_context& sharedIo() { return IoContextPool::shared().ioContext(); }
 
+// True inside a handler on the shared io thread, e.g. a user event callback.
+bool onIoThread() { return sharedIo().get_executor().running_in_this_thread(); }
+
+// A blocking connect on the calling thread, with no deadline. Only for the io thread.
+std::shared_ptr<RpcConnectionBase> connectInline(const LogosTransportConfig& cfg, std::string& why)
+{
+    auto& ioc = sharedIo();
+    try {
+        boost::asio::ip::tcp::resolver resolver(ioc);
+        const auto endpoints = resolver.resolve(cfg.host, std::to_string(cfg.port));
+        if (cfg.protocol == LogosProtocol::Tcp) {
+            TcpStream socket(ioc);
+            boost::asio::connect(socket, endpoints);
+            auto conn = std::make_shared<TcpConnection>(std::move(socket), makeCodec(cfg.codec), nullptr);
+            conn->start();
+            return conn;
+        }
+        if (cfg.protocol == LogosProtocol::TcpSsl) {
+            auto ctx = buildClientSslCtx(cfg);
+            SslStream stream(ioc, ctx);
+            configureTlsClient(stream, cfg);
+            boost::asio::connect(stream.lowest_layer(), endpoints);
+            stream.handshake(boost::asio::ssl::stream_base::client);
+            auto conn = std::make_shared<SslConnection>(std::move(stream), makeCodec(cfg.codec), nullptr);
+            conn->start();
+            return conn;
+        }
+        why = "unsupported protocol";
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    return nullptr;
+}
+
 } // anonymous namespace
 
-// One background connection attempt, run entirely on the io thread. Its handlers own it, so it
-// outlives a transport that abandons it; cancel() makes sure nobody inherits what it connected.
+// One connection attempt, run entirely on the io thread. Its handlers own it, so it outlives
+// a transport that abandons it; cancel() makes sure nobody inherits what it connected.
 struct PlainTransportConnection::Dial : std::enable_shared_from_this<Dial> {
     explicit Dial(LogosTransportConfig c)
         : cfg(std::move(c)), startedAt(std::chrono::steady_clock::now()) {}
@@ -93,20 +129,26 @@ struct PlainTransportConnection::Dial : std::enable_shared_from_this<Dial> {
         boost::asio::post(sharedIo(), [self] { self->resolve(); });
     }
 
-    void cancel()
+    // Finishes the attempt now, as a failure; the io thread closes what it opened later.
+    void cancel(std::string why = "abandoned")
     {
         std::shared_ptr<RpcConnectionBase> orphan;
         {
             std::lock_guard<std::mutex> g(mu);
             cancelled = true;
+            done = true;
+            if (error.empty()) error = std::move(why);
             orphan = std::move(conn);
         }
-        if (orphan) orphan->stop("redial abandoned");
+        cv.notify_all();
+        if (orphan) orphan->stop("dial abandoned");
         auto self = shared_from_this();
         boost::asio::post(sharedIo(), [self] { self->abortIo(); });
     }
 
     bool finished() const { std::lock_guard<std::mutex> g(mu); return done; }
+    bool failed() const { std::lock_guard<std::mutex> g(mu); return done && !conn; }
+    std::string failure() const { std::lock_guard<std::mutex> g(mu); return error; }
 
     bool mayRetry() const
     {
@@ -130,13 +172,15 @@ private:
         auto self = shared_from_this();
         deadline = std::make_shared<boost::asio::steady_timer>(sharedIo(), kDialDeadline);
         deadline->async_wait([self](const boost::system::error_code& ec) {
-            if (!ec) self->abortIo();
+            if (ec) return;
+            self->noteFailure("timed out after " + std::to_string(kDialDeadline.count()) + " ms");
+            self->abortIo();
         });
         resolver = std::make_shared<boost::asio::ip::tcp::resolver>(sharedIo());
         resolver->async_resolve(cfg.host, std::to_string(cfg.port),
             [self](const boost::system::error_code& ec,
                    boost::asio::ip::tcp::resolver::results_type endpoints) {
-                if (ec || self->isCancelled()) { self->finish(nullptr); return; }
+                if (ec || self->isCancelled()) { self->fail("resolve", ec); return; }
                 self->connect(endpoints);
             });
     }
@@ -148,7 +192,7 @@ private:
             tcp = std::make_shared<TcpStream>(sharedIo());
             boost::asio::async_connect(*tcp, endpoints,
                 [self](const boost::system::error_code& ec, const boost::asio::ip::tcp::endpoint&) {
-                    if (ec) { self->finish(nullptr); return; }
+                    if (ec) { self->fail("connect", ec); return; }
                     auto c = std::make_shared<TcpConnection>(
                         std::move(*self->tcp), makeCodec(self->cfg.codec), nullptr);
                     c->start();
@@ -162,16 +206,16 @@ private:
                 ssl = std::make_shared<SslStream>(sharedIo(), ctx);
                 configureTlsClient(*ssl, cfg);
             } catch (const std::exception& e) {
-                qWarning() << "PlainTransportConnection: redial TLS setup failed:" << e.what();
+                noteFailure(std::string("TLS setup: ") + e.what());
                 finish(nullptr);
                 return;
             }
             boost::asio::async_connect(ssl->lowest_layer(), endpoints,
                 [self](const boost::system::error_code& ec, const boost::asio::ip::tcp::endpoint&) {
-                    if (ec) { self->finish(nullptr); return; }
+                    if (ec) { self->fail("connect", ec); return; }
                     self->ssl->async_handshake(boost::asio::ssl::stream_base::client,
                         [self](const boost::system::error_code& hec) {
-                            if (hec) { self->finish(nullptr); return; }
+                            if (hec) { self->fail("handshake", hec); return; }
                             auto c = std::make_shared<SslConnection>(
                                 std::move(*self->ssl), makeCodec(self->cfg.codec), nullptr);
                             c->start();
@@ -180,6 +224,20 @@ private:
                 });
             return;
         }
+        noteFailure("unsupported protocol");
+        finish(nullptr);
+    }
+
+    // The first reason wins: a deadline or a cancel explains the aborted operation that follows.
+    void noteFailure(std::string why)
+    {
+        std::lock_guard<std::mutex> g(mu);
+        if (error.empty()) error = std::move(why);
+    }
+
+    void fail(const char* phase, const boost::system::error_code& ec)
+    {
+        noteFailure(std::string(phase) + ": " + ec.message());
         finish(nullptr);
     }
 
@@ -193,7 +251,7 @@ private:
             done = true;
         }
         cv.notify_all();
-        if (orphan) orphan->stop("redial abandoned");
+        if (orphan) orphan->stop("dial abandoned");
         if (deadline) deadline->cancel();
     }
 
@@ -216,6 +274,7 @@ private:
     bool                               done = false;
     bool                               cancelled = false;
     std::shared_ptr<RpcConnectionBase> conn;
+    std::string                        error;   // why it produced nothing
 
     std::shared_ptr<boost::asio::ip::tcp::resolver> resolver;
     std::shared_ptr<TcpStream>                      tcp;
@@ -247,47 +306,45 @@ bool PlainTransportConnection::connectToHost()
         std::lock_guard<std::mutex> g(m_mu);
         if (m_connected) return true;
     }
-
-    auto& ioc = sharedIo();
-    auto codec = makeCodec(m_cfg.codec);
-    std::shared_ptr<RpcConnectionBase> conn;
-
-    try {
-        boost::asio::ip::tcp::resolver resolver(ioc);
-        auto endpoints = resolver.resolve(m_cfg.host, std::to_string(m_cfg.port));
-
-        if (m_cfg.protocol == LogosProtocol::Tcp) {
-            boost::asio::ip::tcp::socket socket(ioc);
-            boost::asio::connect(socket, endpoints);
-            auto tcpConn = std::make_shared<TcpConnection>(std::move(socket), codec, nullptr);
-            tcpConn->start();
-            conn = tcpConn;
-        } else if (m_cfg.protocol == LogosProtocol::TcpSsl) {
-            auto ctx = buildClientSslCtx(m_cfg);
-            SslStream stream(ioc, ctx);
-            configureTlsClient(stream, m_cfg);
-            boost::asio::connect(stream.lowest_layer(), endpoints);
-            stream.handshake(boost::asio::ssl::stream_base::client);
-            auto sslConn = std::make_shared<SslConnection>(std::move(stream), codec, nullptr);
-            sslConn->start();
-            conn = sslConn;
-        } else {
-            qCritical() << "PlainTransportConnection: unsupported protocol";
-            return false;
-        }
-    } catch (const std::exception& e) {
-        qWarning() << "PlainTransportConnection::connectToHost failed:" << e.what();
-        return false;
-    }
+    // The io thread cannot wait on a Dial it has to run itself, so it connects inline, unbounded as before.
+    std::string why;
+    auto conn = onIoThread() ? connectInline(m_cfg, why) : awaitDial(why);
 
     std::shared_ptr<RpcConnectionBase> previous;
+    bool connected = false;
     {
         std::lock_guard<std::mutex> g(m_mu);
-        previous = std::exchange(m_conn, conn);
-        m_connected = true;
+        if (conn) {
+            previous = std::exchange(m_conn, std::move(conn));
+            m_connected = true;
+        }
+        connected = m_connected;
     }
     if (previous) previous->stop("replaced by a new connection");
-    return true;
+    if (!connected) qWarning() << "PlainTransportConnection::connectToHost failed:" << why.c_str();
+    return connected;
+}
+
+std::shared_ptr<RpcConnectionBase> PlainTransportConnection::awaitDial(std::string& why)
+{
+    std::shared_ptr<Dial> dial;
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        // A failed dial is replaced at once: this caller paces its own retries.
+        if (!m_dial || m_dial->failed()) {
+            m_dial = std::make_shared<Dial>(m_cfg);
+            m_dial->start();
+        }
+        dial = m_dial;
+    }
+    if (!dial->waitFinished(static_cast<int>(kConnectWait.count())))
+        dial->cancel("unfinished after " + std::to_string(kConnectWait.count()) + " ms");
+
+    std::lock_guard<std::mutex> g(m_mu);
+    auto conn = dial->take();
+    if (conn && m_dial == dial) m_dial.reset();
+    if (!conn) why = dial->failure();
+    return conn;
 }
 
 bool PlainTransportConnection::isConnected() const

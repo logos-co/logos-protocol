@@ -1,11 +1,14 @@
 // A provider served over plain TCP that dies and comes back on the same port: the consumer must
 // report the loss, re-arm on a new connection, and count it as a new establishment.
+// The first connect is bounded by the same dial deadline as the redial.
 
 #include <gtest/gtest.h>
 
+#include "io_context_pool.h"
 #include "logos_api_client.h"
 #include "logos_api_consumer.h"
 #include "logos_mode.h"
+#include "logos_object.h"
 #include "logos_protocol.h"
 #include "logos_provider_interface.h"
 #include "logos_subscription_state.h"
@@ -23,6 +26,7 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -34,6 +38,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -188,6 +193,63 @@ private:
     std::atomic<int> m_closed{0};
 };
 
+// A listener whose accept queue is full and never drained, so the kernel drops every further SYN.
+class SynDroppingListener {
+public:
+    SynDroppingListener()
+        : m_acceptor(m_ioc)
+    {
+        using boost::asio::ip::tcp;
+        m_acceptor.open(tcp::v4());
+        m_acceptor.bind({boost::asio::ip::address_v4::loopback(), 0});
+        m_acceptor.listen(1);   // not 0: macOS reads a zero backlog as SOMAXCONN
+        // Connect until one stalls: that stall is the drop (Linux queues two first, macOS one).
+        for (int i = 0; i < 16; ++i) {
+            auto s = std::make_unique<tcp::socket>(m_ioc);
+            auto state = std::make_shared<int>(0);   // 0 pending, 1 connected, 2 failed
+            s->async_connect(m_acceptor.local_endpoint(),
+                             [state](const boost::system::error_code& ec) { *state = ec ? 2 : 1; });
+            m_ioc.restart();
+            m_ioc.run_for(std::chrono::milliseconds(300));
+            if (*state != 1) { m_dropping = *state == 0; break; }
+            m_fillers.push_back(std::move(s));
+        }
+    }
+    uint16_t port() const { return m_acceptor.local_endpoint().port(); }
+    bool dropsSyns() const { return m_dropping; }
+
+private:
+    boost::asio::io_context m_ioc;
+    boost::asio::ip::tcp::acceptor m_acceptor;
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> m_fillers;
+    bool m_dropping = false;
+};
+
+long long elapsedMs(std::chrono::steady_clock::time_point since)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - since).count();
+}
+
+// connectToHost() on its own thread, so a hang fails the test instead of the suite. Returns its
+// duration in ms, or -1 if it is still running after `watchdogMs` (the thread is then left behind).
+long long timedConnect(std::shared_ptr<logos::plain::PlainTransportConnection> conn, bool& connected,
+                       int watchdogMs)
+{
+    auto result = std::make_shared<std::promise<bool>>();
+    auto answer = result->get_future();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread dialer([conn, result] { result->set_value(conn->connectToHost()); });
+    if (answer.wait_for(std::chrono::milliseconds(watchdogMs)) != std::future_status::ready) {
+        dialer.detach();   // it owns what it touches
+        return -1;
+    }
+    const long long took = elapsedMs(t0);
+    dialer.join();
+    connected = answer.get();
+    return took;
+}
+
 template <typename Fn>
 bool pumpUntil(Fn done, int budgetMs) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
@@ -255,6 +317,9 @@ struct Log {
 };
 
 constexpr int kBudgetMs = 15000;
+// The dial deadline is 5 s; a connect still running at the watchdog is a hang.
+constexpr long long kConnectBoundMs = 6000;
+constexpr int kConnectWatchdogMs = 10000;
 
 } // anonymous namespace
 
@@ -468,7 +533,7 @@ TEST_F(PlainProviderRestartTest, ATlsRestartIsReportedAndReArmed)
 TEST_F(PlainProviderRestartTest, AStuckRedialNeverBlocksAndTimesOut)
 {
     SilentListener silent;
-    // No connectToHost(): its blocking handshake would hang on this listener.
+    // No connectToHost(): this is the dial requestObject() starts on its own.
     logos::plain::PlainTransportConnection conn(tlsConfig(silent.port()));
     using clock = std::chrono::steady_clock;
     const auto ms = [](clock::duration d) {
@@ -490,6 +555,121 @@ TEST_F(PlainProviderRestartTest, AStuckRedialNeverBlocksAndTimesOut)
     EXPECT_TRUE(pumpUntil([&] { conn.isConnected(); return silent.accepted() >= 2; }, 10000))
         << "the stuck redial was never abandoned, so no new attempt started";
     EXPECT_GE(silent.closed(), 1) << "the abandoned attempt left its socket open";
+}
+
+// DETECTOR: the first connect has the same deadline, so a peer that never answers the TLS handshake cannot hang it.
+TEST_F(PlainProviderRestartTest, AFirstConnectToASilentTlsPeerTimesOut)
+{
+    SilentListener silent;
+    auto conn = std::make_shared<logos::plain::PlainTransportConnection>(tlsConfig(silent.port()));
+    bool connected = true;
+    const long long took = timedConnect(conn, connected, kConnectWatchdogMs);
+    ASSERT_GE(took, 0) << "connectToHost() was still in a handshake the peer never answers after "
+                       << kConnectWatchdogMs << " ms";
+    EXPECT_FALSE(connected);
+    EXPECT_LE(took, kConnectBoundMs) << "connectToHost() outlived the dial deadline";
+    EXPECT_EQ(silent.accepted(), 1) << "the attempt never reached the listener, so no handshake was bounded";
+    EXPECT_TRUE(pumpUntil([&] { return silent.closed() >= 1; }, 5000))
+        << "the abandoned attempt left its socket open";
+}
+
+// DETECTOR: LogosAPIConsumer's constructor retries connectToHost() for 5 s, which must still end against a silent peer.
+TEST_F(PlainProviderRestartTest, AConsumerOfASilentTlsPeerIsConstructedInTime)
+{
+    SilentListener silent;
+    const LogosTransportConfig cfg = tlsConfig(silent.port());
+    auto result = std::make_shared<std::promise<long long>>();
+    auto took = result->get_future();
+    std::thread builder([cfg, result] {
+        const auto t0 = std::chrono::steady_clock::now();
+        LogosAPIConsumer consumer(QStringLiteral("plain_silent_module"), QStringLiteral("caller"),
+                                  &TokenManager::instance(), cfg);
+        result->set_value(elapsedMs(t0));
+    });
+    if (took.wait_for(std::chrono::milliseconds(kConnectWatchdogMs)) != std::future_status::ready) {
+        builder.detach();
+        FAIL() << "LogosAPIConsumer's constructor was still connecting after " << kConnectWatchdogMs << " ms";
+    }
+    builder.join();
+    EXPECT_LE(took.get(), kConnectBoundMs) << "the constructor outlived its own 5 s retry budget";
+    EXPECT_EQ(silent.accepted(), 1) << "the budget was not spent on one stalled handshake, so this proves nothing";
+}
+
+// DETECTOR: the deadline covers the TCP connect too, when the host drops the SYN instead of refusing it.
+TEST_F(PlainProviderRestartTest, AFirstConnectToAHostThatDropsSynsTimesOut)
+{
+    SynDroppingListener dropping;
+    ASSERT_TRUE(dropping.dropsSyns()) << "precondition: a full accept queue did not make this kernel drop SYNs";
+    auto conn = std::make_shared<logos::plain::PlainTransportConnection>(tcpConfig(dropping.port()));
+    bool connected = true;
+    const long long took = timedConnect(conn, connected, kConnectWatchdogMs);
+    ASSERT_GE(took, 0) << "connectToHost() was still waiting for an unanswered SYN after "
+                       << kConnectWatchdogMs << " ms";
+    EXPECT_FALSE(connected);
+    EXPECT_LE(took, kConnectBoundMs) << "connectToHost() waited for the OS connect timeout";
+    EXPECT_GE(took, 1000) << "the connect failed fast, so the SYN was not dropped and nothing was bounded";
+}
+
+// DETECTOR: a held io thread cannot run the dial or its deadline, and connectToHost() still returns on time.
+TEST_F(PlainProviderRestartTest, AFirstConnectReturnsOnTimeWhileTheIoThreadIsHeld)
+{
+    SilentListener silent;
+    auto conn = std::make_shared<logos::plain::PlainTransportConnection>(tlsConfig(silent.port()));
+    auto holding = std::make_shared<std::atomic<bool>>(false);
+    auto released = std::make_shared<std::atomic<bool>>(false);
+    boost::asio::post(logos::plain::IoContextPool::shared().ioContext(), [holding, released] {
+        holding->store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kConnectBoundMs + 500));
+        released->store(true);
+    });
+    ASSERT_TRUE(pumpUntil([&] { return holding->load(); }, 5000)) << "the io thread never picked up the hold";
+
+    bool connected = true;
+    const long long took = timedConnect(conn, connected, kConnectWatchdogMs);
+    ASSERT_GE(took, 0) << "connectToHost() was still waiting for the held io thread after "
+                       << kConnectWatchdogMs << " ms";
+    EXPECT_FALSE(connected);
+    EXPECT_LE(took, kConnectBoundMs) << "connectToHost() waited for the io thread to be released";
+    pumpUntil([&] { return released->load(); }, kBudgetMs);   // hand the next test a free io thread
+}
+
+// CONTROL: an event handler runs on the io thread, which cannot also run a dial it waits on. Its connect still works.
+TEST_F(PlainProviderRestartTest, AConnectFromAnEventHandlerStillConnects)
+{
+    const QString mod = QStringLiteral("plain_handler_module");
+    Provider p(QStringLiteral("p")), other(QStringLiteral("o"));
+    Host host(mod, p, 0);
+    Host target(QStringLiteral("plain_handler_target"), other, 0);
+
+    logos::plain::PlainTransportConnection conn(tcpConfig(host.port));
+    ASSERT_TRUE(conn.connectToHost());
+    LogosObject* obj = conn.requestObject(mod, 1000);
+    ASSERT_NE(obj, nullptr);
+
+    struct Outcome {
+        std::atomic<bool> started{false}, onIoThread{false}, connected{false};
+        std::atomic<long long> tookMs{-1};
+        std::shared_ptr<logos::plain::PlainTransportConnection> inner;   // destroyed off the io thread
+    };
+    auto out = std::make_shared<Outcome>();
+    const std::thread::id testThread = std::this_thread::get_id();
+    const uint16_t targetPort = target.port;
+    obj->onEvent(QStringLiteral("ev"), [out, testThread, targetPort](const QString&, const QVariantList&) {
+        if (out->started.exchange(true)) return;
+        out->onIoThread = std::this_thread::get_id() != testThread;
+        out->inner = std::make_shared<logos::plain::PlainTransportConnection>(tcpConfig(targetPort));
+        const auto t0 = std::chrono::steady_clock::now();
+        out->connected = out->inner->connectToHost();
+        out->tookMs = elapsedMs(t0);
+    });
+
+    ASSERT_TRUE(emitUntil(p, [&] { return out->tookMs.load() >= 0; }, kBudgetMs)) << "the handler never finished";
+    const long long took = out->tookMs.load();
+    EXPECT_TRUE(out->onIoThread.load()) << "the event did not arrive on the io thread, so this proves nothing";
+    EXPECT_TRUE(out->connected.load()) << "a connect from the io thread failed after " << took << " ms";
+    EXPECT_LT(took, 1000) << "a connect from the io thread waited on work only that thread can do";
+    obj->release();
+    out->inner.reset();
 }
 
 // CONTROL: a healthy connection is never a restart.

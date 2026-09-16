@@ -327,6 +327,8 @@ add_executable(protocol_tests
     test_subscription_fast_restart.cpp
     # A provider served over plain TCP/TLS that dies and returns on its port. Seven detectors, RED on 5e7d0ec and each
     # with its mechanism removed (isValid, the redial, its 20 ms cap, its deadline); AHealthyConnection* is a control.
+    # AFirstConnect*/AConsumer* are RED while connectToHost() is unbounded, *WhileTheIoThreadIsHeld also without its own
+    # cap; the AConnectFromAnEventHandler* control is RED if connectToHost() waits on a dial from the io thread.
     test_plain_provider_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
