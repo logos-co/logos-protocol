@@ -325,6 +325,9 @@ add_executable(protocol_tests
     # Provider swapped faster than the 1 s poll. Detectors: four RED on 9e29120 (and without bindToSource), the gate one RED without
     # the helper's gate, the late-subscriber/rearm three RED on 4ceea79 (rearm also without its replay). Churn* is a control.
     test_subscription_fast_restart.cpp
+    # A provider served over plain TCP/TLS that dies and returns on its port. Seven detectors, RED on 5e7d0ec and each
+    # with its mechanism removed (isValid, the redial, its 20 ms cap, its deadline); AHealthyConnection* is a control.
+    test_plain_provider_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller

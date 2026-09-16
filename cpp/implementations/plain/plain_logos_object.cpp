@@ -1483,4 +1483,9 @@ quintptr PlainLogosObject::id() const
     return reinterpret_cast<quintptr>(m_conn.get());
 }
 
+bool PlainLogosObject::isValid() const
+{
+    return m_conn && m_conn->isOpen();
+}
+
 } // namespace logos::plain

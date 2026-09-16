@@ -364,7 +364,8 @@ private:
     //
     // It is confined to AcquireKind::Unsupported on purpose. Those transports'
     // requestObject() is a registry hash lookup (qt_local), an in-memory
-    // construction (plain) or an unconditional success (mock). qt_remote's
+    // construction (plain; a dropped connection starts a background redial it
+    // waits on for at most 20 ms) or an unconditional success (mock). qt_remote's
     // enters QRemoteObjectReplica::waitForSource()'s nested event loop even at
     // timeout 0, so calling it from here — or from tick() — would smuggle a GUI
     // thread block in through the retry. Routing on the transport's OWN answer
@@ -411,7 +412,8 @@ private:
     // m_acquiring, so tick() finds nothing to ask for and the timer exists
     // purely as the log watchdog below. On the other transports it also retries
     // requestObject(), at 250 ms → 5 s, costing a hash lookup or an in-memory
-    // socket-state read per pending object per tick.
+    // socket-state read per pending object per tick (plain, while its peer is
+    // gone: at most one background redial per tick).
     //
     // Known cost, stated rather than hidden: on qt_local/mock a retry against a
     // module that is not registered makes the transport log its own "plugin not

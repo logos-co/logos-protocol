@@ -7,6 +7,7 @@
 #include "rpc_connection.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace logos::plain {
@@ -17,6 +18,9 @@ namespace logos::plain {
 // connectToHost() opens a TCP (or TLS) socket to the daemon's endpoint from
 // the LogosTransportConfig and starts the RPC read loop. requestObject()
 // returns a PlainLogosObject sharing that connection.
+//
+// A connection the peer dropped stays dead, so requestObject() and
+// isConnected() redial in the background and adopt the result (see Dial).
 // -----------------------------------------------------------------------------
 class PlainTransportConnection : public LogosTransportConnection {
 public:
@@ -31,9 +35,17 @@ public:
                         const QString& moduleName) override;
 
 private:
-    LogosTransportConfig               m_cfg;
-    std::shared_ptr<RpcConnectionBase> m_conn;
-    bool                               m_connected = false;
+    struct Dial;   // one background connection attempt; defined in the .cpp
+
+    // The open connection, or null. Adopts a finished redial or starts one; waits at most `waitMs`.
+    std::shared_ptr<RpcConnectionBase> liveConnection(int waitMs, bool waitForRunningDial) const;
+
+    LogosTransportConfig                       m_cfg;
+    // Guards everything below: isConnected() is not marshalled to the owner thread.
+    mutable std::mutex                         m_mu;
+    mutable std::shared_ptr<RpcConnectionBase> m_conn;
+    mutable std::shared_ptr<Dial>              m_dial;
+    mutable bool                               m_connected = false;
 };
 
 } // namespace logos::plain

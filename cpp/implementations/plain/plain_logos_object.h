@@ -104,6 +104,8 @@ public:
     // documented on LogosObject::release() and cannot be closed from here.
     void release() override;
     quintptr id() const override;
+    // A connection the peer closed never reopens; the transport dials a new one instead.
+    bool isValid() const override;
 
 public:
     // ── the shared call state ────────────────────────────────────────────────
