@@ -1,5 +1,6 @@
 #include "remote_transport.h"
 #include "../../logos_async_dispatch.h"
+#include "../../logos_object_source_watch.h"
 #include "../../logos_socket_paths.h"
 #include "qt_socket_path.h"
 #include <QRemoteObjectRegistryHost>
@@ -17,6 +18,7 @@
 #include <QJsonArray>
 #include <QVariantMap>
 #include <atomic>
+#include <memory>
 
 // Process-wide count of replicas acquired by requestObject() — a test hook to
 // prove the consumer reuses one cached handle instead of re-acquiring per call.
@@ -28,10 +30,18 @@ using logos::qtremote::localSocketFilePath;
 
 namespace {
 
+// Shared by a handle and its replica's stateChanged handler, so neither outlives what it reads.
+struct SourceWatchState {
+    bool bound = false;
+    bool lost = false;
+    std::function<void()> onLost;
+};
+
 class RemoteEventHelper : public QObject {
     Q_OBJECT
 public:
-    explicit RemoteEventHelper(QObject* parent = nullptr) : QObject(parent) {}
+    explicit RemoteEventHelper(std::shared_ptr<const SourceWatchState> watch)
+        : m_watch(std::move(watch)) {}
 
     void addCallback(const QString& eventName, LogosObject::EventCallback cb) {
         m_callbacks[eventName].append(std::move(cb));
@@ -45,8 +55,10 @@ public slots:
         // reserved name, which no wildcard carries and which only the
         // completion callback wired up in the constructor ever asked for. It
         // also dispatches without a log line, being one per deferred call.
-        auto cbs = m_callbacks.value(eventName);
         const bool reserved = logos::isReservedEventName(eventName);
+        // A bound handle whose source went away must not hand the replacement's events to old subscribers.
+        if (!reserved && m_watch->bound && m_watch->lost) return;
+        auto cbs = m_callbacks.value(eventName);
         if (!reserved) cbs.append(m_callbacks.value(QString()));
         if (!cbs.isEmpty() && !reserved) {
             qDebug() << "[LogosObject] Remote EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s) (via IPC)";
@@ -58,11 +70,13 @@ public slots:
 
 private:
     QHash<QString, QList<LogosObject::EventCallback>> m_callbacks;
+    std::shared_ptr<const SourceWatchState> m_watch;
 };
 
 } // anonymous namespace
 
-class RemoteLogosObject : public LogosObject, public LogosObjectErrorChannel {
+class RemoteLogosObject : public LogosObject, public LogosObjectErrorChannel,
+                          public LogosObjectSourceWatch {
 public:
     // objectName is carried purely so a failure can name the module it belongs
     // to — logos::CallError::origin, the same field the acquire-time error and
@@ -75,7 +89,7 @@ public:
             // Eager event wiring — a deferred ("multi") call's result arrives as a
             // completion event, so the channel must be live even when the caller
             // never subscribes to a user event. onEvent() reuses this same helper.
-            m_helper = new RemoteEventHelper();
+            m_helper = new RemoteEventHelper(m_watch);
             QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
             m_helper->addCallback(logos::callCompleteEvent(),
@@ -114,6 +128,7 @@ public:
 
     ~RemoteLogosObject() override {
         qDebug() << "[LogosObject] Destroying RemoteLogosObject" << reinterpret_cast<quintptr>(m_replica);
+        m_watch->onLost = nullptr;   // the replica may outlive us and still emit stateChanged
         // release() normally clears m_helper first (deferred). If we get here on a
         // direct delete, defer the helper too: a direct delete can still be reached
         // from within the helper's own slot dispatch. See disconnectEvents().
@@ -384,7 +399,7 @@ public:
 
         qDebug() << "[LogosObject] RemoteLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {
-            m_helper = new RemoteEventHelper();
+            m_helper = new RemoteEventHelper(m_watch);
             QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
             qDebug() << "[LogosObject] RemoteLogosObject: connected EventHelper to QRemoteObjectReplica signals (IPC)";
@@ -436,6 +451,7 @@ public:
 
     void release() override
     {
+        m_watch->onLost = nullptr;       // whoever bound us is letting go; never call it again
         disconnectEvents();              // defers the helper (signal receiver)
         // The replica is the QtRO signal *sender* whose eventResponse() may be the
         // very emission that re-entered release() (a deferred completion event).
@@ -459,6 +475,29 @@ public:
     {
         auto* r = qobject_cast<QRemoteObjectReplica*>(m_replica);
         return r && r->state() == QRemoteObjectReplica::Valid;
+    }
+
+    bool sourceLost() const override { return m_watch->lost; }
+
+    // QtRO re-attaches a facade to a replacement source, so isValid() alone cannot tell a sub-second swap
+    // from continuity. Every loss passes through setState(Suspect), which stateChanged reports synchronously.
+    void bindToSource(std::function<void()> onLost) override
+    {
+        m_watch->onLost = std::move(onLost);
+        if (m_watch->bound) return;
+        m_watch->bound = true;
+        auto* rep = qobject_cast<QRemoteObjectReplica*>(m_replica);
+        if (!rep || rep->state() != QRemoteObjectReplica::Valid) {
+            m_watch->lost = true;
+            return;
+        }
+        std::shared_ptr<SourceWatchState> watch = m_watch;
+        QObject::connect(rep, &QRemoteObjectReplica::stateChanged, rep,
+            [watch](QRemoteObjectReplica::State now, QRemoteObjectReplica::State) {
+                if (now == QRemoteObjectReplica::Valid || watch->lost) return;
+                watch->lost = true;
+                if (watch->onLost) watch->onLost();
+            });
     }
 
 private:
@@ -499,6 +538,7 @@ private:
     QHash<QString, QEventLoop*> m_completionWaiters;
     QHash<QString, AsyncResultErrorCallback> m_asyncCompletionCbs;
     QString m_objectName;
+    std::shared_ptr<SourceWatchState> m_watch = std::make_shared<SourceWatchState>();
 };
 
 // ── PendingAcquire ───────────────────────────────────────────────────────────

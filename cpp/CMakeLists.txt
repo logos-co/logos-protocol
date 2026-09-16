@@ -59,6 +59,8 @@ set(PROTOCOL_SOURCES
     logos_socket_paths.cpp
     plugin_registry.h
     logos_object.h
+    # Internal and deliberately not installed: the consumer registry's hook into qt_remote's source loss.
+    logos_object_source_watch.h
     logos_thread_marshal.h
     logos_provider_interface.cpp
     logos_provider_interface.h

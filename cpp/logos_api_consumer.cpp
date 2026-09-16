@@ -1,6 +1,7 @@
 #include "logos_api_consumer.h"
 #include "logos_async_dispatch.h"
 #include "logos_object.h"
+#include "logos_object_source_watch.h"
 #include "module_proxy.h"
 #include "token_manager.h"
 #include "logos_mode.h"
@@ -194,10 +195,8 @@ public:
     // armed subscriptions back into the pending set so they re-arm against the
     // new connection instead of going quietly dead.
     //
-    // NOTE this is NOT the module-unload path. A module that unloads and comes
-    // back drives its replica Suspect → Valid on the SAME node, and the event
-    // helper is attached to that replica, so those subscriptions survive on
-    // their own with nothing to do here.
+    // NOTE this is NOT the module-unload path: a provider that dies under a live
+    // connection is checkLiveness()'s job.
     void reconnected()
     {
         for (LogosObject* obj : m_handles)
@@ -288,10 +287,38 @@ private:
         Unsupported,  // no deferred acquire at all. requestObject() is the only way.
     };
 
+    // Dead also covers a source that went away and was replaced: the facade is Valid again, but not for us.
+    static bool isDead(const LogosObject* obj)
+    {
+        if (!obj->isValid()) return true;
+        auto* watch = dynamic_cast<const LogosObjectSourceWatch*>(obj);
+        return watch && watch->sourceLost();
+    }
+
     LogosObject* liveHandle(const QString& objectName) const
     {
         LogosObject* obj = m_handles.value(objectName, nullptr);
-        return (obj && obj->isValid()) ? obj : nullptr;
+        return (obj && !isDead(obj)) ? obj : nullptr;
+    }
+
+    // The event-driven half of the watchdog. The transport reports a loss from inside its read stack, so defer.
+    void watchSource(LogosObject* obj)
+    {
+        auto* watch = dynamic_cast<LogosObjectSourceWatch*>(obj);
+        if (!watch) return;
+        watch->bindToSource([this]() { scheduleLivenessCheck(); });
+        if (watch->sourceLost()) scheduleLivenessCheck();
+    }
+
+    // Posted to the timer, so a registry torn down first takes the pending check with it.
+    void scheduleLivenessCheck()
+    {
+        if (m_livenessCheckQueued) return;
+        m_livenessCheckQueued = true;
+        QMetaObject::invokeMethod(timer(), [this]() {
+            m_livenessCheckQueued = false;
+            checkLiveness();
+        }, Qt::QueuedConnection);
     }
 
     // Ask the transport to acquire `objectName`, without ever blocking.
@@ -392,23 +419,24 @@ private:
     // non-empty, where it used to run only for the first.
     bool timerNeeded() const { return !m_entries.isEmpty() || !m_armed.isEmpty(); }
 
-    // Cadence for the armed-set liveness poll, deliberately faster than the
-    // 5 s retry-backoff cap: this is the delay before a subscriber learns its
-    // provider died, and it bounds how long a consumer keeps believing a dead
-    // stream is merely quiet. One virtual isValid() per held handle per second
-    // — on qt_remote a replica state read — is cheap enough that the tighter
-    // number costs nothing worth measuring.
+    // Cadence for the armed-set liveness poll. On qt_remote a loss is reported as it happens (watchSource);
+    // the poll remains the only detector on transports without LogosObjectSourceWatch, and a backstop on it.
     static constexpr int kLivenessIntervalMs = 1000;
 
-    void ensureTimer()
+    QTimer* timer()
     {
-        if (!timerNeeded()) return;
         if (!m_timer) {
             m_timer = new QTimer(m_owner);
             QObject::connect(m_timer, &QTimer::timeout, m_owner, [this]() { tick(); });
         }
+        return m_timer;
+    }
+
+    void ensureTimer()
+    {
+        if (!timerNeeded()) return;
         m_intervalMs = 250;                            // a new pending resets the backoff
-        m_timer->start(m_intervalMs);
+        timer()->start(m_intervalMs);
     }
 
     void tick()
@@ -513,35 +541,16 @@ private:
     void armAgainst(const QString& objectName, LogosObject* obj)
     {
         LogosObject* handle = m_handles.value(objectName, nullptr);
-        if (handle && handle != obj && !handle->isValid()) {
-            // Releasing this handle destroys its event helper, and every
-            // subscription already armed for this object is attached to THAT
-            // helper. Without the revive they stay in m_armed, never fire
-            // again, and pendingSubscriptions() reports nothing wrong — a
-            // subscription that is dead while looking healthy, which is the
-            // exact failure this class exists to remove. Move them back to the
-            // pending set so takeMatching() below re-arms them on the new
-            // handle, THEN release.
-            //
-            // NOT COVERED BY A TEST, deliberately, and it is worth knowing why
-            // before anyone simplifies it away. LogosObject::isValid() defaults
-            // to true and is overridden ONLY by qt_remote's RemoteLogosObject,
-            // so on qt_local / mock / plain a held handle is always "live" and
-            // add() short-circuits before a second acquire can start — this
-            // branch is structurally unreachable there. On qt_remote it is
-            // reachable but not reliably reproducible: QtRO shares one replica
-            // implementation per object name on a node, so a reload usually
-            // restores the old handle to Valid before the new acquire's
-            // callback runs. The branch survives on an invariant of QtRO's that
-            // nothing in this file controls; a test for it would be a race, and
-            // a racing test is worse than none.
-            reviveArmed(objectName);
-            handle->release();
-            handle = nullptr;
+        if (handle && handle != obj && isDead(handle)) {
+            // A new handle arrived before the deferred check ran. Releasing the old one detaches every armed
+            // subscription, so take the same loss path the check would, then re-read: a watcher may have re-armed.
+            loseTarget(objectName, /*chase=*/false);
+            handle = m_handles.value(objectName, nullptr);
         }
         if (!handle) {
             m_handles.insert(objectName, obj);
             handle = obj;
+            watchSource(obj);
         } else if (handle != obj) {
             obj->release();                            // already had a live one
         }
@@ -685,78 +694,72 @@ private:
                          QStringLiteral("object_unreachable"));
     }
 
-    // Liveness watchdog: the missing half of subscription continuity.
-    //
-    // A provider that unloads and reloads drives its replica out of Valid and
-    // back on the SAME node, and the event helper stays attached to that
-    // replica — so the subscription survives with nothing to do here and, until
-    // now, nothing to SAY here either. reconnected() covers a torn-down
-    // connection and reviveArmed() covers a handle being replaced; neither
-    // observes a provider dying underneath a subscription that is already
-    // armed. That is the case a subscriber cannot detect for itself, and it is
-    // the one that silently loses events.
-    //
-    // So poll the handles we hold while anything is armed. LogosObject::isValid
-    // is the transport's own answer (on qt_remote, the default, it is exactly
-    // "the replica is still synced to its source"); the base returns true, so
-    // on a transport with no notion of staleness this costs one virtual call
-    // per handle per tick and never fires.
+    // Liveness watchdog: a provider that dies under an ARMED subscription. QtRO re-attaches the same facade
+    // to a replacement, so without this the stream resumes with a hole in it and nothing says so.
     void checkLiveness()
     {
         if (m_armed.isEmpty()) return;
 
         QSet<QString> dead;
         for (auto it = m_handles.cbegin(); it != m_handles.cend(); ++it)
-            if (it.value() && !it.value()->isValid()) dead.insert(it.key());
+            if (it.value() && isDead(it.value())) dead.insert(it.key());
         if (dead.isEmpty()) return;
 
-        for (const QString& objectName : dead) {
-            const bool held =
-                m_targets.value(objectName).restart == LogosRestartPolicy::Manual;
-            // A handle can go stale with nothing armed against it -- every
-            // subscription to it cancelled, the handle not yet dropped. There
-            // is no loss to report there: nobody was receiving anything.
-            // Sampled BEFORE the moves below, which empty m_armed for this
-            // object.
-            const bool wasArmed = hasArmedFor(objectName);
-            for (const Entry& e : m_armed) {
-                if (e.objectName != objectName) continue;
-                qWarning().nospace()
-                    << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
-                    << (held ? "' subscription HELD (generation " : "' subscription LOST (generation ")
-                    << m_targets.value(objectName).generation
-                    << (held ? ") -- the provider became unreachable and this module's "
-                               "restart policy is Manual, so it will NOT re-arm. Call "
-                               "rearmSubscriptions() to revive it."
-                             : ") -- the provider became unreachable. Re-arming; events "
-                               "emitted before it returns are unrecoverable.");
-            }
-
-            // Drop the dead handle so liveHandle() stops answering with it and
-            // beginAcquire() is free to fetch a fresh one.
-            if (LogosObject* obj = m_handles.take(objectName))
-                obj->release();
-            m_acquiring.remove(objectName);
-            // Park the Manual ones FIRST, so reviveArmed sees only Automatic.
-            holdArmed(objectName);
-            reviveArmed(objectName);
-
-            // After the moves, so a watcher that calls rearmSubscriptions() on
-            // Held finds the held set populated; before the chase, because
-            // beginAcquire() can arm synchronously and would otherwise deliver
-            // Armed ahead of the Lost it answers.
-            if (wasArmed)
-                reportTarget(objectName, held ? LogosSubscriptionEvent::Held
-                                              : LogosSubscriptionEvent::Lost,
-                             QStringLiteral("provider_unavailable"));
-
-            // Only chase the object if something still wants it. An
-            // all-Manual object has nothing pending, and asking the transport
-            // for it would re-acquire a handle no subscription is waiting on.
-            if (hasPendingFor(objectName))
-                beginAcquire(objectName);
-        }
+        for (const QString& objectName : dead)
+            loseTarget(objectName, /*chase=*/true);
         ensureTimer();
+    }
+
+    // Drop the object's handle, hold (Manual) or revive (Automatic) what was armed on it, and report once.
+    void loseTarget(const QString& objectName, bool chase)
+    {
+        // Re-checked: a watcher run for an earlier object may already have replaced this handle.
+        const LogosObject* current = m_handles.value(objectName, nullptr);
+        if (!current || !isDead(current)) return;
+        const bool held =
+            m_targets.value(objectName).restart == LogosRestartPolicy::Manual;
+        // A handle can go stale with nothing armed against it -- every
+        // subscription to it cancelled, the handle not yet dropped. There
+        // is no loss to report there: nobody was receiving anything.
+        // Sampled BEFORE the moves below, which empty m_armed for this
+        // object.
+        const bool wasArmed = hasArmedFor(objectName);
+        for (const Entry& e : m_armed) {
+            if (e.objectName != objectName) continue;
+            qWarning().nospace()
+                << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
+                << (held ? "' subscription HELD (generation " : "' subscription LOST (generation ")
+                << m_targets.value(objectName).generation
+                << (held ? ") -- the provider became unreachable and this module's "
+                           "restart policy is Manual, so it will NOT re-arm. Call "
+                           "rearmSubscriptions() to revive it."
+                         : ") -- the provider became unreachable. Re-arming; events "
+                           "emitted before it returns are unrecoverable.");
+        }
+
+        // Drop the dead handle so liveHandle() stops answering with it and
+        // beginAcquire() is free to fetch a fresh one.
+        if (LogosObject* obj = m_handles.take(objectName))
+            obj->release();
+        m_acquiring.remove(objectName);
+        // Park the Manual ones FIRST, so reviveArmed sees only Automatic.
+        holdArmed(objectName);
+        reviveArmed(objectName);
+
+        // After the moves, so a watcher that calls rearmSubscriptions() on
+        // Held finds the held set populated; before the chase, because
+        // beginAcquire() can arm synchronously and would otherwise deliver
+        // Armed ahead of the Lost it answers.
+        if (wasArmed)
+            reportTarget(objectName, held ? LogosSubscriptionEvent::Held
+                                          : LogosSubscriptionEvent::Lost,
+                         QStringLiteral("provider_unavailable"));
+
+        // Only chase the object if something still wants it. An
+        // all-Manual object has nothing pending, and asking the transport
+        // for it would re-acquire a handle no subscription is waiting on.
+        if (chase && hasPendingFor(objectName))
+            beginAcquire(objectName);
     }
 
     bool hasPendingFor(const QString& objectName) const
@@ -812,6 +815,7 @@ private:
     QTimer* m_timer = nullptr;
     int m_intervalMs = 250;
     quint64 m_nextId = 1;
+    bool m_livenessCheckQueued = false;
 };
 
 LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
