@@ -1,6 +1,6 @@
 // A provider served over plain TCP that dies and comes back on the same port: the consumer must
 // report the loss, re-arm on a new connection, and count it as a new establishment.
-// The first connect is bounded by the same dial deadline as the redial.
+// The first connect is bounded by the same dial deadline as the redial, and a call on the io thread never waits on one.
 
 #include <gtest/gtest.h>
 
@@ -36,10 +36,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -230,6 +233,32 @@ long long elapsedMs(std::chrono::steady_clock::time_point since)
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - since).count();
 }
+
+// Aborts the process unless destroyed within `ms`: a wedged io thread cannot be failed past.
+class Watchdog {
+public:
+    Watchdog(int ms, std::string what)
+        : m_thread([this, ms, what = std::move(what)] {
+              std::unique_lock<std::mutex> lk(m_mu);
+              if (m_cv.wait_for(lk, std::chrono::milliseconds(ms), [this] { return m_disarmed; })) return;
+              std::fprintf(stderr, "\nWATCHDOG: %s after %d ms\n", what.c_str(), ms);
+              std::fflush(stderr);
+              std::abort();
+          })
+    {}
+    ~Watchdog()
+    {
+        { std::lock_guard<std::mutex> g(m_mu); m_disarmed = true; }
+        m_cv.notify_all();
+        m_thread.join();
+    }
+
+private:
+    std::mutex m_mu;
+    std::condition_variable m_cv;
+    bool m_disarmed = false;
+    std::thread m_thread;   // last, so it starts after what it reads
+};
 
 // connectToHost() on its own thread, so a hang fails the test instead of the suite. Returns its
 // duration in ms, or -1 if it is still running after `watchdogMs` (the thread is then left behind).
@@ -670,6 +699,83 @@ TEST_F(PlainProviderRestartTest, AConnectFromAnEventHandlerStillConnects)
     EXPECT_LT(took, 1000) << "a connect from the io thread waited on work only that thread can do";
     obj->release();
     out->inner.reset();
+}
+
+// DETECTOR: an event handler's call to a restarted target fails at once instead of waiting on a redial only its own
+// thread can run; the redial it starts still runs, so the handler's retry connects.
+TEST_F(PlainProviderRestartTest, ACallFromAnEventHandlerDoesNotWaitOnTheRedial)
+{
+    const QString mod = QStringLiteral("plain_handler_call_module");
+    const QString targetMod = QStringLiteral("plain_handler_call_target");
+    Provider p(QStringLiteral("p")), t1(QStringLiteral("t1")), t2(QStringLiteral("t2"));
+    Host host(mod, p, 0);
+    auto target = std::make_unique<Host>(targetMod, t1, 0);
+    const uint16_t targetPort = target->port;
+
+    logos::plain::PlainTransportConnection conn(tcpConfig(host.port));
+    ASSERT_TRUE(conn.connectToHost());
+    LogosObject* obj = conn.requestObject(mod, 1000);
+    ASSERT_NE(obj, nullptr);
+
+    struct Attempt {
+        std::atomic<bool> armed{false}, onIoThread{false};
+        std::atomic<long long> tookMs{-1};
+        std::atomic<LogosObject*> got{nullptr};
+        std::shared_ptr<logos::plain::PlainTransportConnection> inner;   // destroyed off the io thread
+    };
+    auto at = std::make_shared<Attempt>();
+    at->inner = std::make_shared<logos::plain::PlainTransportConnection>(tcpConfig(targetPort));
+    ASSERT_TRUE(at->inner->connectToHost());
+    LogosObject* old = at->inner->requestObject(targetMod, 1000);
+    ASSERT_NE(old, nullptr);
+
+    target.reset();
+    target = std::make_unique<Host>(targetMod, t2, targetPort);
+    ASSERT_EQ(target->port, targetPort) << "the replacement could not take the port";
+    // Watched through the old handle, which starts no redial of its own.
+    ASSERT_TRUE(pumpUntil([&] { return !old->isValid(); }, 5000)) << "the old connection never closed";
+
+    const std::thread::id testThread = std::this_thread::get_id();
+    obj->onEvent(QStringLiteral("ev"), [at, targetMod, testThread](const QString&, const QVariantList&) {
+        if (!at->armed.exchange(false)) return;
+        at->onIoThread = std::this_thread::get_id() != testThread;
+        const auto t0 = std::chrono::steady_clock::now();
+        at->got = at->inner->requestObject(targetMod, 3000);
+        at->tookMs = elapsedMs(t0);
+    });
+    // One call per arming. Once the handler has taken it, a call that never returns aborts instead of hanging.
+    auto callFromHandler = [&] {
+        at->tookMs = -1;
+        at->got = nullptr;
+        at->armed = true;
+        if (!emitUntil(p, [&] { return !at->armed.load(); }, kBudgetMs)) return false;
+        Watchdog dog(kConnectWatchdogMs, "a call from an event handler never returned");
+        return pumpUntil([&] { return at->tookMs.load() >= 0; }, kConnectWatchdogMs + 1000);
+    };
+
+    ASSERT_TRUE(callFromHandler()) << "the handler never ran";
+    EXPECT_TRUE(at->onIoThread.load()) << "the event did not arrive on the io thread, so this proves nothing";
+    const long long took = at->tookMs.load();
+    LogosObject* first = at->got.load();
+    EXPECT_LT(took, 1000) << "a call from the io thread waited " << took << " ms on a redial only that thread runs";
+    EXPECT_EQ(first, nullptr) << "the io thread connected inline, which an unreachable target would stall";
+
+    // Between events the io thread is free to run the redial the first call started.
+    LogosObject* retried = nullptr;
+    long long slowest = 0;
+    for (int i = 0; i < 10 && !retried; ++i) {
+        pump(100);
+        ASSERT_TRUE(callFromHandler()) << "the handler never ran again";
+        retried = at->got.load();
+        slowest = std::max(slowest, at->tookMs.load());
+    }
+    EXPECT_NE(retried, nullptr) << "a handler that retries never connected: its calls start no redial";
+    EXPECT_LT(slowest, 1000);
+
+    for (LogosObject* o : {first, retried, old})
+        if (o) o->release();
+    obj->release();
+    at->inner.reset();
 }
 
 // CONTROL: a healthy connection is never a restart.

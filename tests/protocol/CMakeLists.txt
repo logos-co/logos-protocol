@@ -329,6 +329,7 @@ add_executable(protocol_tests
     # with its mechanism removed (isValid, the redial, its 20 ms cap, its deadline); AHealthyConnection* is a control.
     # AFirstConnect*/AConsumer* are RED while connectToHost() is unbounded, *WhileTheIoThreadIsHeld also without its own
     # cap; the AConnectFromAnEventHandler* control is RED if connectToHost() waits on a dial from the io thread.
+    # ACallFromAnEventHandler* is RED while requestObject() waits on a dial from the io thread (363408d, 9abb6bf).
     test_plain_provider_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod

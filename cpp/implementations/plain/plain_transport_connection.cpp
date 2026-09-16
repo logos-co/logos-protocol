@@ -395,8 +395,8 @@ std::shared_ptr<RpcConnectionBase> PlainTransportConnection::liveConnection(int 
         }
     }
     if (dead) dead->stop("replaced after the peer went away");
-    // A second pass adopts what the wait produced; the finished dial cannot start another.
-    if (waitOn && waitMs > 0 && waitOn->waitFinished(waitMs))
+    // The io thread never waits: the dial runs there once it returns. A second pass adopts what a wait produced.
+    if (waitOn && waitMs > 0 && !onIoThread() && waitOn->waitFinished(waitMs))
         return liveConnection(0, false);
     std::lock_guard<std::mutex> g(m_mu);
     return (m_conn && m_conn->isOpen()) ? m_conn : nullptr;

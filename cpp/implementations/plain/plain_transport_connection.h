@@ -22,7 +22,8 @@ namespace logos::plain {
 // A connection the peer dropped stays dead, so requestObject() and
 // isConnected() redial in the background and adopt the result (see Dial).
 // connectToHost() waits on the same Dial, so its deadline bounds the first
-// connect too, except on the io thread, which cannot run a Dial it waits on.
+// connect too. The io thread cannot run a Dial it waits on: there
+// connectToHost() connects inline and requestObject() does not wait.
 // -----------------------------------------------------------------------------
 class PlainTransportConnection : public LogosTransportConnection {
 public:
@@ -39,7 +40,7 @@ public:
 private:
     struct Dial;   // one connection attempt, run on the io thread; defined in the .cpp
 
-    // The open connection, or null. Adopts a finished redial or starts one; waits at most `waitMs`.
+    // The open connection, or null. Adopts a finished redial or starts one; waits at most `waitMs`, never on the io thread.
     std::shared_ptr<RpcConnectionBase> liveConnection(int waitMs, bool waitForRunningDial) const;
     // Joins or starts a dial and waits out its deadline; the connection, or null and the reason.
     std::shared_ptr<RpcConnectionBase> awaitDial(std::string& why);
