@@ -719,6 +719,7 @@ RemoteTransportConnection::~RemoteTransportConnection()
     // Pending replicas and parked probes belong to the node; kill them FIRST so
     // none outlives it.
     m_probes.clear();
+    m_parked.clear();
     delete m_pendingAcquires;
     m_pendingAcquires = nullptr;
     delete m_node;
@@ -779,6 +780,7 @@ bool RemoteTransportConnection::reconnect()
         // consumer's subscription registry re-arms against the new node
         // (LogosAPIConsumer::reconnect -> reconnected()).
         m_probes.clear();
+        m_parked.clear();
         delete m_pendingAcquires;
         m_pendingAcquires = new QObject();
         delete m_node;
@@ -843,7 +845,10 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     qDebug() << "RemoteTransportConnection: Requesting object:" << objectName
              << "at" << QTime::currentTime().toString("hh:mm:ss.zzz");
 
-    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    // Wait on the facade an earlier timeout parked for this name rather than
+    // adding a second one for the implementation to hold raw.
+    QRemoteObjectReplica* replica = takeParked(objectName);
+    if (!replica) replica = m_node->acquireDynamic(objectName);
     if (!replica) {
         qWarning() << "RemoteTransportConnection: Failed to acquire replica for:" << objectName;
         return nullptr;
@@ -851,7 +856,14 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
 
     if (!replica->waitForSource(timeoutMs)) {
         qWarning() << "RemoteTransportConnection: Timeout waiting for replica:" << objectName;
-        delete replica;
+        // PARK it; do NOT free it. A timeout means the class definition never
+        // arrived, so this facade is still listed RAW in the implementation's
+        // m_parentsNeedingConnect -- see m_probes. Freeing it here is the
+        // use-after-free that killed the json_rpc_bridge host: the module came
+        // back a second later, the source's dynamic API landed in
+        // QRemoteObjectNodePrivate::onClientRead, and setDynamicProperties()
+        // walked the list into the freed facade.
+        parkOrDelete(objectName, replica);
         return nullptr;
     }
 
@@ -933,6 +945,50 @@ LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
 
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);
+}
+
+// Uninitialized is exactly "the implementation has no metaobject yet" for a
+// dynamic replica, which is exactly when it lists this facade raw. In any other
+// state the implementation had already synced and connected the facade
+// directly, so it is no longer in that list and freeing it is safe.
+void RemoteTransportConnection::parkOrDelete(const QString& objectName,
+                                             QRemoteObjectReplica* replica)
+{
+    if (!replica) return;
+    if (replica->state() != QRemoteObjectReplica::Uninitialized) {
+        delete replica;
+        return;
+    }
+    // Parented to m_pendingAcquires, which both ~RemoteTransportConnection and
+    // reconnect() destroy BEFORE the node -- so a parked facade never outlives
+    // the implementation that points at it. If that parent is already gone we
+    // still refuse to free it: leaking one facade beats a use-after-free.
+    if (m_pendingAcquires) replica->setParent(m_pendingAcquires);
+    m_parked[objectName].append(replica);
+}
+
+// Removes the facade BEFORE the caller's waitForSource() pumps a nested event
+// loop. A requestObject() re-entered from that loop must not find the same
+// facade parked and hand it over a second time.
+QRemoteObjectReplica* RemoteTransportConnection::takeParked(const QString& objectName)
+{
+    auto it = m_parked.find(objectName);
+    if (it == m_parked.end()) return nullptr;
+    QRemoteObjectReplica* replica = nullptr;
+    while (!replica && !it->isEmpty()) replica = it->takeLast();   // QPointers may have gone null
+    if (it->isEmpty()) m_parked.erase(it);
+    if (replica) replica->setParent(nullptr);   // the caller owns it while it waits
+    return replica;
+}
+
+int RemoteTransportConnection::parkedCount(const QString& objectName) const
+{
+    const auto it = m_parked.constFind(objectName);
+    if (it == m_parked.constEnd()) return 0;
+    int alive = 0;
+    for (const QPointer<QRemoteObjectReplica>& parked : *it)
+        if (parked) ++alive;
+    return alive;
 }
 
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }

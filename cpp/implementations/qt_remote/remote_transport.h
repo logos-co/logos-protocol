@@ -4,6 +4,7 @@
 #include "../../logos_transport.h"
 #include "../../logos_object.h"
 #include <QHash>
+#include <QList>
 #include <QPointer>
 #include <QString>
 
@@ -49,8 +50,18 @@ public:
     static long acquireCount();
     static void resetAcquireCount();
 
+    // Test hook: facades a timed-out requestObject() parked for this name and
+    // has not reused yet. Pins the bound — retrying against a module that is
+    // down must park ONE facade, not one per attempt.
+    int parkedCount(const QString& objectName) const;
+
 private:
     bool connectToRegistry();
+
+    // The two halves of "never free a facade QtRO still lists raw": park the
+    // one a timeout gave up on, and hand it to the next wait for that name.
+    void parkOrDelete(const QString& objectName, QRemoteObjectReplica* replica);
+    QRemoteObjectReplica* takeParked(const QString& objectName);
 
     QRemoteObjectNode* m_node;
     // Parent of every in-flight PendingAcquire (defined in the .cpp). Destroying
@@ -70,6 +81,11 @@ private:
     // arrives. Probing repeatedly and freeing each probe is therefore a
     // use-after-free with one dangling pointer per probe.
     QHash<QString, QPointer<QRemoteObjectReplica>> m_probes;
+    // Facades requestObject() gave up on while they were still unsynced, parked
+    // for the same reason as m_probes and reused by the next wait on that name.
+    // Reused rather than merely parked because requestObject() is RETRIED: a
+    // module that stays down would otherwise park one facade per attempt.
+    QHash<QString, QList<QPointer<QRemoteObjectReplica>>> m_parked;
     // Does the registry endpoint currently have a listener?
     //
     // Separate from m_connected because connectToNode() cannot answer it: it

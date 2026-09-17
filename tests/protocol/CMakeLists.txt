@@ -309,6 +309,20 @@ add_executable(protocol_tests
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
     test_remote_transport_events.cpp
+    # Freeing a dynamic replica that never reached Valid leaves QtRO holding it
+    # as a raw pointer (m_parentsNeedingConnect) and the implementation walks
+    # that list when the source finally publishes. requestObject()'s timeout
+    # branch did exactly that; it killed the json_rpc_bridge host whenever
+    # storage_module came back after a wedge.
+    #
+    # Its two crash cases are DETECTORS, validated on the pre-fix tree dcf4f05:
+    # SIGSEGV 5/5 runs, with the production reports' stack. The third case,
+    # ParksExactlyOneFacade, is a GUARD on the bound rather than on the crash --
+    # it cannot run on dcf4f05 because it asserts through a hook the fix adds, so
+    # it was validated against the park-WITHOUT-reuse mechanism instead (a
+    # throwaway edit making takeParked() return nullptr): it reports 8 parked
+    # facades for 8 attempts, and 8 still parked after recovery.
+    test_unconfigured_replica_lifetime.cpp
     test_deferred_subscription.cpp
     # The other half of deferred subscription: a provider that dies UNDER an
     # already-armed subscription. It re-arms on the same node with the event
