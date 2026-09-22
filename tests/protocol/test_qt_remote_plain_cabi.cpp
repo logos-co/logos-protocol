@@ -593,7 +593,9 @@ TEST(QtRemotePlainCabiTest, EventCallbackCanDestroyItsClient)
 
 TEST(QtRemotePlainCabiTest, ProviderDestroyWaitsForOutstandingDispatch)
 {
-    setInstanceId("qtro_cabi_provider_destroy_");
+    // Keep the socket name short enough for macOS sun_path even when Nix sets
+    // TMPDIR to a long per-build directory.
+    setInstanceId("qtro_drain_");
     BlockingDispatchFixture fixture;
     lp_provider* provider = lp_provider_create("provider_destroy_fixture", nullptr);
     ASSERT_NE(provider, nullptr);

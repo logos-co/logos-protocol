@@ -4,9 +4,8 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/address.hpp>
 
-#include <QDebug>
-
 #include <algorithm>
+#include <cstdio>
 
 namespace logos::plain {
 
@@ -249,10 +248,9 @@ void RpcServerSsl::doAccept()
                         // is unavailable, or the listener picked a
                         // version the client refuses). Category + code
                         // + message give enough to grep for.
-                        qWarning().nospace()
-                            << "RpcServerSsl: TLS handshake failed: "
-                            << hs.category().name() << ':' << hs.value()
-                            << " (" << QString::fromStdString(hs.message()) << ")";
+                        std::fprintf(stderr,
+                                     "RpcServerSsl: TLS handshake failed: %s:%d (%s)\n",
+                                     hs.category().name(), hs.value(), hs.message().c_str());
                         return;
                     }
                     // Hand the SslStream off to a connection that owns

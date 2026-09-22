@@ -1,7 +1,9 @@
 #include "logos_protocol.h"
 
 #include "implementations/qt_remote_plain/qtro_transport.h"
+#include "logos_protocol_plain_network.h"
 #include "logos_codec.h"
+#include "logos_transport_config_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +34,11 @@ using logos::plain::RpcBytes;
 using logos::plain::RpcList;
 using logos::plain::RpcMap;
 using logos::plain::RpcValue;
+using logos::plain::RpcConnectionBase;
+using logos::plain::CallMessage;
+using logos::plain::ResultMessage;
+using logos::plain::EventMessage;
+using logos::plain::SubscribeMessage;
 using logos::qt_remote_plain::Client;
 using logos::qt_remote_plain::MetaType;
 using logos::qt_remote_plain::Server;
@@ -170,13 +178,36 @@ std::string endpoint(const std::string& module)
     return "local:logos_" + module + "_" + instanceId();
 }
 
+std::mutex gDefaultMutex;
+std::string gDefaultTransport = R"({"protocol":"qt_remote_plain"})";
+
 bool acceptsPlainConfig(const char* text)
 {
     if (!text || !*text || std::strcmp(text, "null") == 0) return true;
-    const json value = json::parse(text, nullptr, false);
-    if (value.is_discarded() || !value.is_object()) return false;
-    const std::string protocol = value.value("protocol", "qt_remote_plain");
-    return protocol == "qt_remote_plain";
+    try {
+        const json value = json::parse(text, nullptr, false);
+        if (value.is_discarded() || !value.is_object()) return false;
+        const std::string protocol = value.value("protocol", "qt_remote_plain");
+        if (protocol != "qt_remote_plain" && protocol != "tcp"
+            && protocol != "tcp_ssl") return false;
+        return !logos::transportSetFromJsonString(
+            std::string("[") + text + "]").empty();
+    } catch (...) {
+        return false;
+    }
+}
+
+LogosTransportConfig parsePlainConfig(const char* text)
+{
+    LogosTransportConfig config;
+    config.protocol = LogosProtocol::QtRemotePlain;
+    std::string source;
+    if (!text || !*text || std::strcmp(text, "null") == 0) {
+        std::lock_guard<std::mutex> lock(gDefaultMutex);
+        source = gDefaultTransport;
+    } else source = text;
+    const auto set = logos::transportSetFromJsonString(std::string("[") + source + "]");
+    return set.empty() ? config : set.front();
 }
 
 struct TokenStore {
@@ -260,7 +291,13 @@ struct ClientState {
     std::mutex connectionMutex;
     std::condition_variable completionChanged;
     std::condition_variable subscriptionChanged;
+    std::condition_variable eventsChanged;
+    std::mutex eventsMutex;
+    std::deque<EventMessage> events;
     std::shared_ptr<Client> wire = std::make_shared<Client>();
+    std::shared_ptr<RpcConnectionBase> networkWire;
+    LogosTransportConfig targetConfig;
+    LogosTransportConfig capabilityConfig;
     std::string target;
     std::string origin;
     std::shared_ptr<TokenStore> tokens;
@@ -274,7 +311,77 @@ struct ClientState {
     bool manualRestart = false;
     bool workerStop = false;
     std::thread subscriptionWorker;
+    std::thread eventWorker;
 };
+
+void connectionLost(const std::shared_ptr<ClientState>& state);
+
+void deliverNetworkEvent(const std::shared_ptr<ClientState>& state,
+                         const EventMessage& message)
+{
+    if (message.object != state->target) return;
+    if (message.eventName == kCompletionEvent) {
+        if (message.data.size() == 2 && message.data[0].isString()) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->completions[message.data[0].asString()] = message.data[1];
+            }
+            state->completionChanged.notify_all();
+        }
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> callbackLock(state->callbackMutex);
+    if (!state->alive) return;
+    std::vector<std::shared_ptr<SubscriptionState>> subscriptions;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        for (auto it = state->subscriptions.begin(); it != state->subscriptions.end();) {
+            if (auto sub = it->lock()) {
+                if (sub->active && sub->phase == SubscriptionState::Phase::Armed)
+                    subscriptions.push_back(std::move(sub));
+                ++it;
+            } else it = state->subscriptions.erase(it);
+        }
+    }
+    json data = json::array();
+    for (const auto& value : message.data) data.push_back(rpcToJson(value));
+    const std::string text = data.dump();
+    for (const auto& sub : subscriptions) {
+        std::lock_guard<std::recursive_mutex> subLock(sub->callbackMutex);
+        if (sub->active && (sub->event.empty() || sub->event == message.eventName)
+            && sub->callback)
+            sub->callback(message.eventName.c_str(), text.c_str(), sub->userData);
+        if (!state->alive) break;
+    }
+}
+
+void queueNetworkEvent(const std::shared_ptr<ClientState>& state,
+                       EventMessage message)
+{
+    {
+        std::lock_guard<std::mutex> lock(state->eventsMutex);
+        if (!state->alive) return;
+        state->events.push_back(std::move(message));
+    }
+    state->eventsChanged.notify_one();
+}
+
+void networkEventLoop(const std::shared_ptr<ClientState>& state)
+{
+    for (;;) {
+        EventMessage message;
+        {
+            std::unique_lock<std::mutex> lock(state->eventsMutex);
+            state->eventsChanged.wait(lock, [&] {
+                return !state->alive || !state->events.empty();
+            });
+            if (!state->alive) return;
+            message = std::move(state->events.front());
+            state->events.pop_front();
+        }
+        deliverNetworkEvent(state, message);
+    }
+}
 
 void reportSubscriptionStatus(const std::shared_ptr<ClientState>& state,
                               int status, unsigned long long generation,
@@ -310,6 +417,27 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
                      int timeout, std::string& error)
 {
     std::lock_guard<std::mutex> connectionLock(state->connectionMutex);
+    if (state->targetConfig.protocol == LogosProtocol::Tcp
+        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+        if (state->networkWire && state->networkWire->isOpen()) return true;
+        if (state->networkWire) state->networkWire->stop("reconnecting");
+        auto wire = logos::plain::abi::connect(state->targetConfig, error);
+        if (!wire) return false;
+        std::weak_ptr<ClientState> weak = state;
+        wire->setErrorHandler([weak](const std::string&) {
+            if (auto locked = weak.lock()) connectionLost(locked);
+        });
+        wire->sendSubscribe({state->target, kCompletionEvent},
+            [weak](EventMessage event) {
+                if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
+            });
+        wire->sendSubscribe({state->target, ""},
+            [weak](EventMessage event) {
+                if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
+            });
+        state->networkWire = std::move(wire);
+        return true;
+    }
     if (state->wire->isConnected()) return true;
     return state->wire->connect(endpoint(state->target),
                                 std::chrono::milliseconds(timeout), &error);
@@ -339,7 +467,7 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
 
         std::string error;
         bool acquired = ensureConnected(state, 250, error);
-        if (acquired) {
+        if (acquired && state->targetConfig.protocol == LogosProtocol::QtRemotePlain) {
             std::lock_guard<std::mutex> connectionLock(state->connectionMutex);
             acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
                                              &error);
@@ -384,6 +512,43 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         if (established)
             reportSubscriptionStatus(state, LP_SUB_ARMED, generation, nullptr);
     }
+}
+
+std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
+                                    const std::string& object,
+                                    const std::string& method,
+                                    const json& args, const std::string& token,
+                                    int timeout, std::string& error)
+{
+    if (!ensureConnected(state, timeout, error)) return std::nullopt;
+    std::shared_ptr<RpcConnectionBase> wire;
+    {
+        std::lock_guard<std::mutex> lock(state->connectionMutex);
+        wire = state->networkWire;
+    }
+    if (!wire || !wire->isOpen()) {
+        error = "connection closed";
+        return std::nullopt;
+    }
+    CallMessage request;
+    request.id = wire->nextId();
+    request.authToken = token;
+    request.object = object;
+    request.method = method;
+    for (const auto& arg : args) request.args.push_back(jsonToRpc(arg));
+    const auto id = request.id;
+    auto future = wire->sendCall(std::move(request));
+    if (future.wait_for(std::chrono::milliseconds(timeout)) != std::future_status::ready) {
+        wire->cancelPending(id);
+        error = "invocation timed out";
+        return std::nullopt;
+    }
+    auto result = future.get();
+    if (!result.ok) {
+        error = result.err.empty() ? result.errCode : result.err;
+        return std::nullopt;
+    }
+    return std::move(result.value);
 }
 
 void connectionLost(const std::shared_ptr<ClientState>& state)
@@ -439,6 +604,34 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
                       int timeout, std::string& error)
 {
     const std::string credential = tokenGet(state->tokens, "capability_module");
+    if (state->capabilityConfig.protocol == LogosProtocol::Tcp
+        || state->capabilityConfig.protocol == LogosProtocol::TcpSsl) {
+        auto wire = logos::plain::abi::connect(state->capabilityConfig, error);
+        if (!wire) return {};
+        CallMessage request;
+        request.id = wire->nextId();
+        request.authToken = credential;
+        request.object = "capability_module";
+        request.method = "requestModule";
+        request.args = {RpcValue{state->origin}, RpcValue{state->target}};
+        const auto id = request.id;
+        auto future = wire->sendCall(std::move(request));
+        if (future.wait_for(std::chrono::milliseconds(timeout)) != std::future_status::ready) {
+            wire->cancelPending(id);
+            wire->stop("capability request timed out");
+            error = "capability request timed out";
+            return {};
+        }
+        auto result = future.get();
+        wire->stop("capability request complete");
+        if (!result.ok || !result.value.isString()) {
+            error = result.err;
+            return {};
+        }
+        const std::string token = result.value.asString();
+        if (!token.empty()) tokenSave(state->tokens, state->target, token);
+        return token;
+    }
     Client capability;
     if (!capability.connect(endpoint("capability_module"),
                             std::chrono::milliseconds(timeout), &error)) return {};
@@ -466,6 +659,47 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     std::string token = tokenGet(state->tokens, state->target);
     if (token.empty() && state->target != "capability_module")
         token = mintToken(state, timeout, error);
+    if (state->targetConfig.protocol == LogosProtocol::Tcp
+        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+        auto result = networkCall(state, state->target, method, args, token, timeout, error);
+        auto unauthorized = [](const std::optional<RpcValue>& value) {
+            if (!value || !value->isMap()) return false;
+            const RpcValue* status = value->asMap().find(kStatusKey);
+            return status && status->isString() && status->asString() == "unauthorized";
+        };
+        if (unauthorized(result) && state->target != "capability_module") {
+            {
+                std::lock_guard<std::mutex> lock(state->tokens->mutex);
+                state->tokens->outbound.erase(state->target);
+            }
+            token = mintToken(state, timeout, error);
+            if (!token.empty())
+                result = networkCall(state, state->target, method, args,
+                                     token, timeout, error);
+        }
+        if (unauthorized(result)) {
+            error = "token not recognized";
+            return std::nullopt;
+        }
+        if (!result) return std::nullopt;
+        Variant wrapped = Variant::fromRpc(*result);
+        std::string completion;
+        if (pendingId(wrapped, completion)) {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            if (!state->completionChanged.wait_for(lock, std::chrono::milliseconds(timeout), [&] {
+                    return !state->alive || state->completions.count(completion) != 0;
+                })) {
+                error = "deferred invocation timed out";
+                return std::nullopt;
+            }
+            auto found = state->completions.find(completion);
+            if (found == state->completions.end()) return std::nullopt;
+            Variant completed = Variant::fromRpc(std::move(found->second));
+            state->completions.erase(found);
+            return completed;
+        }
+        return wrapped;
+    }
     Variant arguments = Variant::fromRpc(jsonToRpc(args));
     auto result = directCall(state, state->target,
         "callRemoteMethod(QString,QString,QVariantList)",
@@ -512,8 +746,6 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
 std::atomic<unsigned> gHostServices{0};
 constexpr unsigned kTokenRegistry = 1;
 constexpr unsigned kTokenDelivery = 2;
-std::mutex gDefaultMutex;
-std::string gDefaultTransport = R"({"protocol":"qt_remote_plain"})";
 thread_local std::string gCurrentCaller = R"({"kind":"unknown"})";
 
 } // namespace
@@ -528,6 +760,8 @@ struct lp_provider {
     std::string moduleName;
     std::string transportSetJson;
     Server server;
+    bool qtroStarted = false;
+    std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networkEndpoints;
     lp_dispatch_cb dispatch = nullptr;
     lp_getmethods_cb getMethods = nullptr;
     lp_token_cb onToken = nullptr;
@@ -538,13 +772,14 @@ struct lp_provider {
     std::map<std::string, std::string> inbound;
     std::map<std::string, std::string> returnTypes;
     std::string credential;
-    bool prepared = false;
-    bool registered = false;
+    std::atomic<bool> prepared{false};
+    std::atomic<bool> registered{false};
 };
 
 namespace {
 
-std::string providerCaller(lp_provider* provider, const std::string& token)
+std::string providerCaller(lp_provider* provider, const std::string& token,
+                           const char* protocol = "local")
 {
     if (token.empty()) return {};
     lp_validate_token_cb validate = nullptr;
@@ -559,7 +794,7 @@ std::string providerCaller(lp_provider* provider, const std::string& token)
         validate = provider->validateToken;
         validatorData = provider->validatorUserData;
     }
-    if (validate && validate(token.c_str(), "local", validatorData) == LP_OK)
+    if (validate && validate(token.c_str(), protocol, validatorData) == LP_OK)
         return R"({"kind":"external"})";
     return {};
 }
@@ -659,6 +894,113 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
                                  : resultVariant(result, providerReturnType(provider, method));
 }
 
+bool providerAcceptToken(lp_provider* provider, const std::string& auth,
+                         const std::string& module, const std::string& token)
+{
+    bool trusted = false;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        trusted = !provider->credential.empty() && provider->credential == auth;
+        if (trusted && !module.empty() && !token.empty())
+            provider->inbound[module] = token;
+    }
+    return trusted && (!provider->onToken
+        || provider->onToken(module.c_str(), token.c_str(), provider->userData) == LP_OK);
+}
+
+ResultMessage providerNetworkCall(lp_provider* provider,
+                                  const CallMessage& request,
+                                  const char* protocol)
+{
+    ResultMessage reply;
+    reply.id = request.id;
+    if (request.object != provider->moduleName) {
+        reply.err = "object not published: " + request.object;
+        reply.errCode = "MODULE_NOT_LOADED";
+        return reply;
+    }
+    if (request.method == "informModuleToken") {
+        if (request.args.size() != 2 || !request.args[0].isString()
+            || !request.args[1].isString()) {
+            reply.err = "invalid token arguments";
+            reply.errCode = "INVALID_ARGUMENT";
+            return reply;
+        }
+        reply.ok = true;
+        reply.value = RpcValue{providerAcceptToken(provider, request.authToken,
+            request.args[0].asString(), request.args[1].asString())};
+        return reply;
+    }
+    if (!provider->registered) {
+        reply.err = "object not published: " + request.object;
+        reply.errCode = "MODULE_NOT_LOADED";
+        return reply;
+    }
+    if (request.method == "getPluginMethods" || request.method == "getPluginEvents"
+        || request.method == "getPluginInterface") {
+        reply.ok = true;
+        reply.value = jsonToRpc(providerMetadata(provider,
+            request.method == "getPluginMethods" ? "methods"
+            : request.method == "getPluginEvents" ? "events" : "interface"));
+        return reply;
+    }
+    const std::string caller = providerCaller(provider, request.authToken, protocol);
+    if (caller.empty()) {
+        reply.ok = true;
+        reply.value = jsonToRpc(json{{kStatusKey, "unauthorized"}});
+        return reply;
+    }
+    json args = json::array();
+    for (const auto& value : request.args) args.push_back(rpcToJson(value));
+    const std::string argsText = args.dump();
+    const std::string previousCaller = std::move(gCurrentCaller);
+    gCurrentCaller = caller;
+    char* text = provider->dispatch(request.method.c_str(), argsText.c_str(),
+                                    provider->userData);
+    gCurrentCaller = previousCaller;
+    if (!text) {
+        reply.err = "method failed";
+        reply.errCode = "METHOD_FAILED";
+        return reply;
+    }
+    const json result = json::parse(text, nullptr, false);
+    lp_string_free(text);
+    if (result.is_discarded()) {
+        reply.err = "invalid method result";
+        reply.errCode = "METHOD_FAILED";
+        return reply;
+    }
+    reply.ok = true;
+    reply.value = jsonToRpc(result);
+    return reply;
+}
+
+logos::plain::MethodsResultMessage providerNetworkMethods(
+    lp_provider* provider, const logos::plain::MethodsMessage& request)
+{
+    logos::plain::MethodsResultMessage reply;
+    reply.id = request.id;
+    if (request.object != provider->moduleName || !provider->registered) {
+        reply.err = "object not published";
+        return reply;
+    }
+    const json metadata = providerMetadata(provider, "methods");
+    for (const auto& entry : metadata) {
+        if (!entry.is_object()) continue;
+        logos::plain::MethodMetadata method;
+        method.name = entry.value("name", std::string{});
+        method.signature = entry.value("signature", std::string{});
+        method.returnType = entry.value("returnType", std::string{});
+        method.isInvokable = entry.value("isInvokable", true);
+        if (entry.contains("parameters") && entry["parameters"].is_array())
+            for (const auto& parameter : entry["parameters"])
+                method.parameters.items.push_back(jsonToRpc(parameter));
+        reply.methods.push_back(std::move(method));
+    }
+    reply.ok = true;
+    return reply;
+}
+
 } // namespace
 
 extern "C" {
@@ -677,7 +1019,7 @@ const char* lp_get_mode(void) { return "remote"; }
 
 int lp_set_default_transport(const char* transportJson)
 {
-    if (!acceptsPlainConfig(transportJson)) return LP_ERR_INVALID_ARG;
+    if (!transportJson || !acceptsPlainConfig(transportJson)) return LP_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(gDefaultMutex);
     gDefaultTransport = transportJson;
     return LP_OK;
@@ -693,6 +1035,8 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
     auto state = std::make_shared<ClientState>();
     state->target = targetModule;
     state->origin = originModule;
+    state->targetConfig = parsePlainConfig(targetTransportJson);
+    state->capabilityConfig = parsePlainConfig(capabilityTransportJson);
     state->tokens = tokensFor(originModule);
     std::weak_ptr<ClientState> weak = state;
     state->wire->setInternalEventHandler(
@@ -749,6 +1093,9 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
         if (auto state = weak.lock()) connectionLost(state);
     });
     state->subscriptionWorker = std::thread([state] { subscriptionLoop(state); });
+    if (state->targetConfig.protocol == LogosProtocol::Tcp
+        || state->targetConfig.protocol == LogosProtocol::TcpSsl)
+        state->eventWorker = std::thread([state] { networkEventLoop(state); });
     return new lp_client{std::move(state)};
 }
 
@@ -765,12 +1112,21 @@ void lp_client_destroy(lp_client* client)
     }
     client->state->completionChanged.notify_all();
     client->state->subscriptionChanged.notify_all();
+    client->state->eventsChanged.notify_all();
+    if (client->state->networkWire)
+        client->state->networkWire->stop("client destroyed");
     client->state->wire->close();
     if (client->state->subscriptionWorker.joinable()) {
         if (client->state->subscriptionWorker.get_id() == std::this_thread::get_id())
             client->state->subscriptionWorker.detach();
         else
             client->state->subscriptionWorker.join();
+    }
+    if (client->state->eventWorker.joinable()) {
+        if (client->state->eventWorker.get_id() == std::this_thread::get_id())
+            client->state->eventWorker.detach();
+        else
+            client->state->eventWorker.join();
     }
     delete client;
 }
@@ -943,6 +1299,12 @@ char* lp_get_methods(lp_client* client)
 {
     if (!client) return nullptr;
     std::string error;
+    if (client->state->targetConfig.protocol == LogosProtocol::Tcp
+        || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+        auto result = networkCall(client->state, client->state->target,
+            "getPluginInterface", json::array(), {}, kDefaultTimeoutMs, error);
+        return result ? duplicate(rpcToJson(*result).dump()) : nullptr;
+    }
     if (!ensureConnected(client->state, kDefaultTimeoutMs, error)) return nullptr;
     auto result = client->state->wire->call(client->state->target, "getPluginInterface()", {},
                                              std::chrono::milliseconds(kDefaultTimeoutMs), &error);
@@ -1050,6 +1412,18 @@ int lp_inform_module_token(lp_client* client, const char* authToken,
 {
     if (!client || !authToken || !moduleName || !token) return LP_ERR_INVALID_ARG;
     std::string error;
+    if (client->state->targetConfig.protocol == LogosProtocol::Tcp
+        || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+        if (!ensureConnected(client->state, kDefaultTimeoutMs, error))
+            return LP_ERR_INTERNAL;
+        std::shared_ptr<RpcConnectionBase> wire;
+        {
+            std::lock_guard<std::mutex> lock(client->state->connectionMutex);
+            wire = client->state->networkWire;
+        }
+        wire->sendToken({authToken, moduleName, token});
+        return LP_OK;
+    }
     auto result = directCall(client->state, client->state->target,
         "informModuleToken(QString,QString,QString)",
         {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
@@ -1112,6 +1486,8 @@ void lp_provider_destroy(lp_provider* provider)
     if (!provider) return;
     // Stop waits for every outstanding connection handler before the callback
     // pointers and module-owned user data in `provider` can be destroyed.
+    for (auto& endpoint : provider->networkEndpoints) endpoint->stop();
+    provider->networkEndpoints.clear();
     provider->server.stop();
     delete provider;
 }
@@ -1127,15 +1503,49 @@ int lp_provider_prepare(lp_provider* provider, lp_dispatch_cb dispatch,
     provider->onToken = onToken;
     provider->userData = userData;
     std::string error;
-    if (!provider->server.start(endpoint(provider->moduleName), &error))
-        return LP_ERR_INTERNAL;
-    if (!provider->server.publish({provider->moduleName + "__handshake",
-            logos::qt_remote_plain::moduleHandshakeProxyDefinition(),
-            [provider](std::int32_t index, const std::vector<Variant>& args) {
-                return providerInvoke(provider, true, index, args);
-            }}, &error)) {
-        provider->server.stop();
-        return LP_ERR_INTERNAL;
+    auto transports = logos::transportSetFromJsonString(provider->transportSetJson);
+    if (transports.empty()) {
+        LogosTransportConfig local;
+        local.protocol = LogosProtocol::QtRemotePlain;
+        transports.push_back(local);
+    }
+    for (const auto& config : transports) {
+        if (config.protocol == LogosProtocol::QtRemotePlain
+            || config.protocol == LogosProtocol::LocalSocket) {
+            if (provider->qtroStarted) continue;
+            if (!provider->server.start(endpoint(provider->moduleName), &error)
+                || !provider->server.publish({provider->moduleName + "__handshake",
+                    logos::qt_remote_plain::moduleHandshakeProxyDefinition(),
+                    [provider](std::int32_t index, const std::vector<Variant>& args) {
+                        return providerInvoke(provider, true, index, args);
+                    }}, &error)) {
+                provider->server.stop();
+                return LP_ERR_INTERNAL;
+            }
+            provider->qtroStarted = true;
+            continue;
+        }
+        if (config.protocol != LogosProtocol::Tcp
+            && config.protocol != LogosProtocol::TcpSsl) return LP_ERR_UNSUPPORTED;
+        const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
+        auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
+            [provider, label](const CallMessage& request) {
+                return providerNetworkCall(provider, request, label);
+            },
+            [provider](const logos::plain::MethodsMessage& request) {
+                return providerNetworkMethods(provider, request);
+            },
+            [provider](const logos::plain::TokenMessage& request) {
+                providerAcceptToken(provider, request.authToken,
+                                    request.moduleName, request.token);
+            });
+        if (!network->start()) {
+            for (auto& active : provider->networkEndpoints) active->stop();
+            provider->networkEndpoints.clear();
+            provider->server.stop();
+            return LP_ERR_INTERNAL;
+        }
+        provider->networkEndpoints.push_back(std::move(network));
     }
     provider->prepared = true;
     return LP_OK;
@@ -1156,12 +1566,14 @@ int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
     }
     cacheReturnTypes(provider);
     std::string error;
-    if (!provider->server.publish({provider->moduleName,
-            logos::qt_remote_plain::moduleProxyDefinition(),
-            [provider](std::int32_t index, const std::vector<Variant>& args) {
-                return providerInvoke(provider, false, index, args);
-            }}, &error)) {
-        return LP_ERR_INTERNAL;
+    if (provider->qtroStarted) {
+        if (!provider->server.publish({provider->moduleName,
+                logos::qt_remote_plain::moduleProxyDefinition(),
+                [provider](std::int32_t index, const std::vector<Variant>& args) {
+                    return providerInvoke(provider, false, index, args);
+                }}, &error)) {
+            return LP_ERR_INTERNAL;
+        }
     }
     provider->registered = true;
     return LP_OK;
@@ -1174,6 +1586,11 @@ int lp_provider_emit_event(lp_provider* provider, const char* eventName,
         return LP_ERR_INVALID_ARG;
     const json data = json::parse(dataJson && *dataJson ? dataJson : "[]", nullptr, false);
     if (data.is_discarded() || !data.is_array()) return LP_ERR_INVALID_ARG;
+    std::vector<RpcValue> arguments;
+    for (const auto& item : data) arguments.push_back(jsonToRpc(item));
+    for (auto& endpoint : provider->networkEndpoints)
+        endpoint->emit(provider->moduleName, eventName, arguments);
+    if (!provider->qtroStarted) return LP_OK;
     std::string error;
     return provider->server.emitSignal(provider->moduleName, 0,
         {Variant::fromRpc(RpcValue{std::string(eventName)}),
