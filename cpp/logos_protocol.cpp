@@ -932,6 +932,11 @@ int lp_grant_host_services(const char* services_json)
     return LP_OK;
 }
 
+const char* lp_current_caller_json(void)
+{
+    return "{\"kind\":\"unknown\"}";
+}
+
 /* -------------------------------------------------- provider (groundwork) */
 
 lp_provider* lp_provider_create(const char* module_name,

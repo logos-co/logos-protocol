@@ -29,12 +29,13 @@
  *   - Handles are thread-safe per-handle: calls on one handle may be made
  *     from any thread; the library marshals to the handle's owner thread
  *     internally where required.
- *   - Qt-free transports (plain tcp/tcp_ssl, mock) are serviced by the
- *     library's own workers — no caller event loop is needed.
+ *   - Qt-free transports (plain tcp/tcp_ssl, qt_remote_plain, mock) are
+ *     serviced by the library's own workers — no caller event loop is needed.
  *   - The Qt Remote Objects transport (the current default inside module
  *     processes) ADDITIONALLY requires a running Qt event loop in the
  *     process. Every Logos module process has one (logos_host runs it).
- *     Standalone non-Qt consumers must use the plain transport.
+ *     Standalone non-Qt consumers can use qt_remote_plain for QtRO wire
+ *     compatibility, or the independent plain TCP transports.
  *     A client on that transport is created on — and owned by — the Qt main
  *     thread no matter which thread calls lp_client_create(), because its
  *     node and socket are only serviced by that thread's loop. Calls from
@@ -267,9 +268,14 @@
 // name and mis-call it with no diagnostic. The generation counter is maintained
 // for EVERY client, so gap detection reaches a consumer that changes nothing;
 // only the live callback is opt-in.
-#define LOGOS_PROTOCOL_VERSION_MINOR 9
+// 0.10: qt_remote_plain, a Qt-free implementation of the Qt Remote Objects
+// 2.0 dynamic-object wire format, plus lp_current_caller_json() for native
+// module hosts. The existing qt_remote implementation remains unchanged and
+// shares the wire on Unix; Windows plain peers use named pipes on both sides.
+// Every existing C ABI symbol keeps its signature and behaviour.
+#define LOGOS_PROTOCOL_VERSION_MINOR 10
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.10.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -436,8 +442,8 @@ typedef void (*lp_subscription_status_cb)(int state, unsigned long long generati
  * Owner thread: for a Qt-affine transport (Qt Remote Objects / local mode) the
  * client is constructed on the Qt main thread — blocking this call until that
  * thread runs it — because its node and socket are only serviced there. Any
- * thread may call this. For the Qt-free transports (tcp / tcp_ssl / mock) the
- * calling thread becomes the owner thread, as before.
+ * thread may call this. Qt-free transports (qt_remote_plain / tcp / tcp_ssl /
+ * mock) own their protocol workers and require no caller event loop.
  *
  * Returns NULL on invalid arguments.
  */
@@ -917,6 +923,13 @@ typedef char* (*lp_getmethods_cb)(void* user_data);
 /** Accept a token delivered by another module. Return LP_OK to accept. */
 typedef int (*lp_token_cb)(const char* module_name, const char* token,
                            void* user_data);
+
+/** Identity authenticated for the provider dispatch currently running on this
+ *  thread, as the canonical caller JSON document. The pointer is borrowed and
+ *  remains valid only until the dispatch callback returns. Outside a provider
+ *  dispatch this returns {"kind":"unknown"}. A native module host forwards
+ *  this value through logos_module_set_call_caller(). */
+LP_API const char* lp_current_caller_json(void);
 
 LP_API lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json);

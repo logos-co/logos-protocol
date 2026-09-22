@@ -24,6 +24,7 @@
           src = ./.;
 
           lib = import ./nix/lib.nix { inherit pkgs common src; };
+          plain-lib = import ./nix/plain-lib.nix { inherit pkgs common src; };
           include = import ./nix/include.nix { inherit pkgs common src; };
           tests = import ./nix/tests.nix { inherit pkgs common src; };
 
@@ -46,9 +47,16 @@
             paths = [ lib include ];
             propagatedBuildInputs = common.propagatedBuildInputs;
           };
+          plain-protocol = pkgs.symlinkJoin {
+            name = "logos-protocol-plain";
+            paths = [ plain-lib include ];
+            propagatedBuildInputs = [ pkgs.nlohmann_json ];
+          };
         in
         {
           logos-protocol-lib = lib;
+          logos-protocol-plain-lib = plain-lib;
+          logos-protocol-plain = plain-protocol;
           logos-protocol-include = include;
           inherit tests module-impl-abi abi-closure-check;
 

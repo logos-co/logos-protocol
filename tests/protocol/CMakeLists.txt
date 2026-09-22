@@ -113,6 +113,15 @@ add_executable(protocol_tests
     test_main.cpp
     # New protocol-level tests
     test_protocol_version.cpp
+    # Byte-for-byte reference checks against Qt 6.9.2 QDataStream and the
+    # current ModuleProxy meta-object. The production codec under test has no
+    # Qt dependency; Qt lives only on this reference side.
+    test_qt_remote_plain_compat.cpp
+    # Real local-socket interoperability in both directions: raw plain codec
+    # client against QRemoteObjectHost, then QRemoteObjectNode against a raw
+    # plain server.
+    test_qt_remote_plain_socket_compat.cpp
+    test_qt_remote_plain_adapter.cpp
     test_json_convert_bytes.cpp
     # The `result` half of the canonical converter pair: qvariantToNlohmann has
     # always owned LogosResult -> JSON; jsonToLogosResult is its inverse, and
@@ -457,6 +466,30 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+
+# A genuinely Qt-free executable for the codec's bounds, frame and semantic
+# round trips. Keeping it separate prevents an accidental Qt include or link
+# dependency from being hidden by protocol_tests' reference-side Qt linkage.
+add_executable(qt_remote_plain_wire_tests
+    test_qt_remote_plain_wire.cpp
+    test_qt_remote_plain_transport.cpp
+)
+target_link_libraries(qt_remote_plain_wire_tests PRIVATE
+    logos_qt_remote_plain_transport
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_wire_tests)
+
+# Public C ABI linked to the production Qt-free runtime.  Keep this in its own
+# executable so any accidental Qt dependency is visible in the link closure.
+add_executable(qt_remote_plain_cabi_tests
+    test_qt_remote_plain_cabi.cpp
+)
+target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_cabi_tests)
 
 # ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
 #
