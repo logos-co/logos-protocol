@@ -35,6 +35,18 @@ struct Fixture {
     std::string informedToken;
 };
 
+struct ValidatorFixture {
+    std::string acceptedToken;
+    std::string transport;
+};
+
+int validateToken(const char* value, const char* transport, void* userData)
+{
+    auto* fixture = static_cast<ValidatorFixture*>(userData);
+    fixture->transport = transport ? transport : "";
+    return value && fixture->acceptedToken == value ? LP_OK : LP_ERR_UNAVAILABLE;
+}
+
 char* dispatch(const char* method, const char* argsJson, void*)
 {
     const auto args = nlohmann::json::parse(argsJson);
@@ -155,7 +167,7 @@ TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
     EXPECT_EQ(fixture.informedToken, "peer-token");
 
     EventResult event;
-    lp_subscription* subscription = lp_subscribe(client, "tick", onEvent, &event);
+    lp_subscription* subscription = lp_subscribe(client, "", onEvent, &event);
     ASSERT_NE(subscription, nullptr);
     ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
     ASSERT_EQ(lp_provider_emit_event(provider, "tick", R"(["payload",7])"), LP_OK);
@@ -170,6 +182,38 @@ TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
               nlohmann::json::array({"payload", 7}));
 
     lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, ProviderCanValidatePersistentTokensOnDemand)
+{
+    setInstanceId("qtro_cabi_validator_");
+    Fixture fixture;
+    ValidatorFixture validator{"operator-secret", {}};
+    lp_provider* provider = lp_provider_create(
+        "validator_fixture", R"([{"protocol":"qt_remote_plain"}])");
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_set_token_validator(provider, validateToken, &validator), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+
+    ASSERT_EQ(lp_token_save("validator_fixture", "operator-secret"), LP_OK);
+    lp_client* client = lp_client_create(
+        "validator_fixture", "external_client",
+        R"({"protocol":"qt_remote_plain"})",
+        R"({"protocol":"qt_remote_plain"})");
+    ASSERT_NE(client, nullptr);
+
+    char* result = nullptr;
+    char* error = nullptr;
+    ASSERT_EQ(lp_invoke(client, "echo", R"(["hello"])", 1000, &result, &error), LP_OK)
+        << (error ? error : "");
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(nlohmann::json::parse(result), "plain:hello");
+    EXPECT_EQ(validator.transport, "local");
+
+    lp_string_free(result);
+    lp_string_free(error);
     lp_client_destroy(client);
     lp_provider_destroy(provider);
 }
