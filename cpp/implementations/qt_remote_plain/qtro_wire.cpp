@@ -628,8 +628,15 @@ Variant Reader::variant()
             throw CodecError("QVariantMap exceeds transport limit");
         plain::RpcMap map;
         map.entries.reserve(count);
-        for (std::uint32_t i = 0; i < count; ++i)
-            map.emplace(string().value_or(std::string{}), variant().value);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            // Function-argument evaluation order is unspecified in C++17.
+            // Decode the key before the value explicitly so GCC/MinGW cannot
+            // consume the QVariant bytes while the reader still points at the
+            // QString key.
+            auto key = string().value_or(std::string{});
+            auto value = variant().value;
+            map.emplace(std::move(key), std::move(value));
+        }
         result.value = plain::RpcValue{std::move(map)};
         break;
     }
