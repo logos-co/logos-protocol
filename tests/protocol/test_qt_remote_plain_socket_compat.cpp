@@ -1,4 +1,5 @@
 #include "implementations/qt_remote_plain/qtro_wire.h"
+#include "implementations/qt_remote_plain/qtro_transport.h"
 
 #include <gtest/gtest.h>
 
@@ -351,6 +352,45 @@ TEST(QtRemotePlainSocketCompatTest, QtClientCallsAndReceivesEventsFromPlainServe
     ASSERT_EQ(serverResult.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_NO_THROW(serverResult.get());
     server.join();
+}
+
+TEST(QtRemotePlainSocketCompatTest, WaitingQtClientSeesBusinessObjectPublishedAfterInit)
+{
+    const std::string path = uniqueSocketPath("staged_plain_host");
+    Server server;
+    ASSERT_TRUE(server.publish({"fixture__handshake", moduleHandshakeProxyDefinition(),
+        [](std::int32_t, const std::vector<Variant>&) {
+            return Variant::fromRpc(RpcValue{true});
+        }}));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(
+        QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("fixture")));
+    EXPECT_FALSE(replica->waitForSource(100));
+
+    ASSERT_TRUE(server.publish({"fixture", moduleProxyDefinition(),
+        [](std::int32_t index, const std::vector<Variant>&) {
+            if (index != 0) return Variant{};
+            return Variant::fromRpc(RpcValue{"ready"});
+        }}, &error)) << error;
+    ASSERT_TRUE(replica->waitForSource(3000));
+
+    QRemoteObjectPendingCall pending;
+    ASSERT_TRUE(QMetaObject::invokeMethod(
+        replica.data(), "callRemoteMethod", Qt::DirectConnection,
+        Q_RETURN_ARG(QRemoteObjectPendingCall, pending),
+        Q_ARG(QString, QStringLiteral("token")),
+        Q_ARG(QString, QStringLiteral("ready")),
+        Q_ARG(QVariantList, QVariantList{})));
+    pending.waitForFinished(3000);
+    ASSERT_TRUE(pending.isFinished());
+    EXPECT_EQ(pending.returnValue().toString(), QStringLiteral("ready"));
+
+    server.stop();
 }
 
 #else

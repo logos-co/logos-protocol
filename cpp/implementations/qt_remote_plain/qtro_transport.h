@@ -24,6 +24,10 @@ public:
         const std::string& object,
         std::int32_t signalIndex,
         std::vector<Variant> arguments)>;
+    using InternalEventHandler = std::function<bool(
+        const std::string& object,
+        std::int32_t signalIndex,
+        const std::vector<Variant>& arguments)>;
     using DisconnectHandler = std::function<void(const std::string& reason)>;
 
     Client();
@@ -50,6 +54,10 @@ public:
         std::string* error = nullptr);
 
     void setEventHandler(EventHandler handler);
+    // Runs on the reader before public callback dispatch. Returning true
+    // consumes the signal. Reserved for transport control events whose state
+    // must advance even while a user callback is blocked.
+    void setInternalEventHandler(InternalEventHandler handler);
     void setDisconnectHandler(DisconnectHandler handler);
 
 private:

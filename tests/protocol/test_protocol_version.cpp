@@ -38,3 +38,14 @@ TEST(ProtocolVersion, StringFreeAcceptsNull)
 {
     lp_string_free(nullptr);  // must be a no-op, not a crash
 }
+
+TEST(ProtocolVersion, StringCopyUsesProtocolOwnedStorage)
+{
+    char source[] = "allocator-boundary";
+    char* copy = lp_string_copy(source);
+    ASSERT_NE(copy, nullptr);
+    EXPECT_STREQ(copy, source);
+    EXPECT_NE(copy, source);
+    lp_string_free(copy);
+    EXPECT_EQ(lp_string_copy(nullptr), nullptr);
+}

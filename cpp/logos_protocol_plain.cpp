@@ -129,9 +129,16 @@ json rpcToJson(const RpcValue& value)
     return out;
 }
 
-Variant resultVariant(const json& value)
+bool isLogosResultType(const std::string& type)
 {
-    if (value.is_object() && value.size() == 3
+    return type == "LogosResult"
+        || (type.size() > 13 && type.compare(type.size() - 13, 13, "::LogosResult") == 0);
+}
+
+Variant resultVariant(const json& value, const std::string& declaredReturnType)
+{
+    if (isLogosResultType(declaredReturnType)
+        && value.is_object() && value.size() == 3
         && value.contains("success") && value["success"].is_boolean()
         && value.contains("value") && value.contains("error")) {
         return Variant::logosResult(value["success"].get<bool>(),
@@ -510,7 +517,9 @@ struct lp_provider {
     void* userData = nullptr;
     std::mutex mutex;
     std::map<std::string, std::string> inbound;
+    std::map<std::string, std::string> returnTypes;
     std::string credential;
+    bool prepared = false;
     bool registered = false;
 };
 
@@ -551,6 +560,28 @@ json providerMetadata(lp_provider* provider, const std::string& requested)
         if ((requested == "events") == event) filtered.push_back(entry);
     }
     return filtered;
+}
+
+void cacheReturnTypes(lp_provider* provider)
+{
+    const json metadata = providerMetadata(provider, "methods");
+    std::map<std::string, std::string> returnTypes;
+    for (const auto& entry : metadata) {
+        if (!entry.is_object() || entry.value("type", std::string{"method"}) != "method")
+            continue;
+        const std::string name = entry.value("name", std::string{});
+        const std::string returnType = entry.value("returnType", std::string{});
+        if (!name.empty()) returnTypes[name] = returnType;
+    }
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->returnTypes = std::move(returnTypes);
+}
+
+std::string providerReturnType(lp_provider* provider, const std::string& method)
+{
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    const auto found = provider->returnTypes.find(method);
+    return found == provider->returnTypes.end() ? std::string{} : found->second;
 }
 
 Variant providerInvoke(lp_provider* provider, bool handshake,
@@ -605,7 +636,8 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
     if (!text) return {};
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
-    return result.is_discarded() ? Variant{} : resultVariant(result);
+    return result.is_discarded() ? Variant{}
+                                 : resultVariant(result, providerReturnType(provider, method));
 }
 
 } // namespace
@@ -615,6 +647,7 @@ extern "C" {
 const char* lp_protocol_version(void) { return LOGOS_PROTOCOL_VERSION_STRING; }
 int lp_protocol_abi_major(void) { return LOGOS_PROTOCOL_VERSION_MAJOR; }
 void lp_string_free(char* value) { std::free(value); }
+char* lp_string_copy(const char* value) { return value ? duplicate(value) : nullptr; }
 const char* lp_current_caller_json(void) { return gCurrentCaller.c_str(); }
 
 int lp_set_mode(const char* mode)
@@ -643,6 +676,25 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
     state->origin = originModule;
     state->tokens = tokensFor(originModule);
     std::weak_ptr<ClientState> weak = state;
+    state->wire->setInternalEventHandler(
+        [weak](const std::string& object, std::int32_t signal,
+               const std::vector<Variant>& arguments) {
+            auto state = weak.lock();
+            if (!state || !state->alive || object != state->target
+                || signal != 0 || arguments.size() != 2
+                || !arguments[0].value.isString()
+                || arguments[0].value.asString() != kCompletionEvent)
+                return false;
+            const json data = rpcToJson(arguments[1].value);
+            if (!data.is_array() || data.size() != 2 || !data[0].is_string())
+                return true;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->completions[data[0].get<std::string>()] = jsonToRpc(data[1]);
+            }
+            state->completionChanged.notify_all();
+            return true;
+        });
     state->wire->setEventHandler(
         [weak](const std::string& object, std::int32_t signal,
                std::vector<Variant> arguments) {
@@ -654,15 +706,6 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
                 || !arguments[0].value.isString()) return;
             const std::string event = arguments[0].value.asString();
             const json data = rpcToJson(arguments[1].value);
-            if (event == kCompletionEvent && data.is_array() && data.size() == 2
-                && data[0].is_string()) {
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->completions[data[0].get<std::string>()] = jsonToRpc(data[1]);
-                }
-                state->completionChanged.notify_all();
-                return;
-            }
             std::vector<std::shared_ptr<SubscriptionState>> subscriptions;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
@@ -1045,13 +1088,21 @@ lp_provider* lp_provider_create(const char* moduleName, const char* transportSet
     return provider;
 }
 
-void lp_provider_destroy(lp_provider* provider) { delete provider; }
-
-int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
-                         lp_getmethods_cb getMethods, lp_token_cb onToken,
-                         void* userData)
+void lp_provider_destroy(lp_provider* provider)
 {
-    if (!provider || !dispatch || provider->registered) return LP_ERR_INVALID_ARG;
+    if (!provider) return;
+    // Stop waits for every outstanding connection handler before the callback
+    // pointers and module-owned user data in `provider` can be destroyed.
+    provider->server.stop();
+    delete provider;
+}
+
+int lp_provider_prepare(lp_provider* provider, lp_dispatch_cb dispatch,
+                        lp_getmethods_cb getMethods, lp_token_cb onToken,
+                        void* userData)
+{
+    if (!provider || !dispatch || provider->prepared || provider->registered)
+        return LP_ERR_INVALID_ARG;
     provider->dispatch = dispatch;
     provider->getMethods = getMethods;
     provider->onToken = onToken;
@@ -1059,17 +1110,38 @@ int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
     std::string error;
     if (!provider->server.start(endpoint(provider->moduleName), &error))
         return LP_ERR_INTERNAL;
-    if (!provider->server.publish({provider->moduleName,
-            logos::qt_remote_plain::moduleProxyDefinition(),
-            [provider](std::int32_t index, const std::vector<Variant>& args) {
-                return providerInvoke(provider, false, index, args);
-            }}, &error)
-        || !provider->server.publish({provider->moduleName + "__handshake",
+    if (!provider->server.publish({provider->moduleName + "__handshake",
             logos::qt_remote_plain::moduleHandshakeProxyDefinition(),
             [provider](std::int32_t index, const std::vector<Variant>& args) {
                 return providerInvoke(provider, true, index, args);
             }}, &error)) {
         provider->server.stop();
+        return LP_ERR_INTERNAL;
+    }
+    provider->prepared = true;
+    return LP_OK;
+}
+
+int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
+                         lp_getmethods_cb getMethods, lp_token_cb onToken,
+                         void* userData)
+{
+    if (!provider || !dispatch || provider->registered) return LP_ERR_INVALID_ARG;
+    if (!provider->prepared) {
+        const int prepared = lp_provider_prepare(
+            provider, dispatch, getMethods, onToken, userData);
+        if (prepared != LP_OK) return prepared;
+    } else if (provider->dispatch != dispatch || provider->getMethods != getMethods
+               || provider->onToken != onToken || provider->userData != userData) {
+        return LP_ERR_INVALID_ARG;
+    }
+    cacheReturnTypes(provider);
+    std::string error;
+    if (!provider->server.publish({provider->moduleName,
+            logos::qt_remote_plain::moduleProxyDefinition(),
+            [provider](std::int32_t index, const std::vector<Variant>& args) {
+                return providerInvoke(provider, false, index, args);
+            }}, &error)) {
         return LP_ERR_INTERNAL;
     }
     provider->registered = true;

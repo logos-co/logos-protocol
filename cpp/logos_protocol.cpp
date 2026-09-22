@@ -201,6 +201,11 @@ void lp_string_free(char* s)
     std::free(s);
 }
 
+char* lp_string_copy(const char* s)
+{
+    return s ? lpStrdup(s) : nullptr;
+}
+
 /* ----------------------------------------------------- mode / transports */
 
 int lp_set_mode(const char* mode)
@@ -955,11 +960,11 @@ void lp_provider_destroy(lp_provider* provider)
     delete provider;
 }
 
-int lp_provider_register(lp_provider* provider,
-                         lp_dispatch_cb dispatch,
-                         lp_getmethods_cb get_methods,
-                         lp_token_cb on_token,
-                         void* user_data)
+int lp_provider_prepare(lp_provider* provider,
+                        lp_dispatch_cb dispatch,
+                        lp_getmethods_cb get_methods,
+                        lp_token_cb on_token,
+                        void* user_data)
 {
     if (!provider || !dispatch) return LP_ERR_INVALID_ARG;
     provider->dispatch = dispatch;
@@ -967,6 +972,15 @@ int lp_provider_register(lp_provider* provider,
     provider->onToken = on_token;
     provider->userData = user_data;
     return LP_OK;
+}
+
+int lp_provider_register(lp_provider* provider,
+                         lp_dispatch_cb dispatch,
+                         lp_getmethods_cb get_methods,
+                         lp_token_cb on_token,
+                         void* user_data)
+{
+    return lp_provider_prepare(provider, dispatch, get_methods, on_token, user_data);
 }
 
 int lp_provider_emit_event(lp_provider* provider,
