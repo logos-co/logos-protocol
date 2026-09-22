@@ -467,6 +467,20 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+
+# These cases regress lock cycles, so each runs in its own process with a CTest
+# deadline. A broken implementation fails as a timeout instead of wedging the
+# rest of protocol_tests and hiding which shutdown path deadlocked.
+add_executable(qt_remote_plain_regression_probe
+    qt_remote_plain_shutdown_probe.cpp
+)
+target_link_libraries(qt_remote_plain_regression_probe PRIVATE
+    logos_protocol
+    Qt${QT_VERSION_MAJOR}::Core
+)
+add_test(NAME QtRemotePlainRegression.adapter-shutdown
+         COMMAND qt_remote_plain_regression_probe)
+set_tests_properties(QtRemotePlainRegression.adapter-shutdown PROPERTIES TIMEOUT 8)
 endif()
 
 # A genuinely Qt-free executable for the codec's bounds, frame and semantic
@@ -495,7 +509,7 @@ target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
     logos_protocol_plain
     GTest::gtest_main
 )
-gtest_discover_tests(qt_remote_plain_cabi_tests)
+gtest_discover_tests(qt_remote_plain_cabi_tests PROPERTIES TIMEOUT 8)
 
 # ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
 #

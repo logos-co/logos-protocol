@@ -1,9 +1,11 @@
 #include "implementations/qt_remote_plain/qtro_wire.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
+#include "logos_types.h"
 
 #include <gtest/gtest.h>
 
 #include <QEventLoop>
+#include <QJsonValue>
 #include <QMetaObject>
 #include <QRemoteObjectDynamicReplica>
 #include <QRemoteObjectHost>
@@ -352,6 +354,77 @@ TEST(QtRemotePlainSocketCompatTest, QtClientCallsAndReceivesEventsFromPlainServe
     ASSERT_EQ(serverResult.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_NO_THROW(serverResult.get());
     server.join();
+}
+
+TEST(QtRemotePlainSocketCompatTest, QtClientAndPlainServerPreserveNestedTypes)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    const std::string path = uniqueSocketPath("plain_nested_types");
+    Server server;
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    ASSERT_TRUE(server.publish({"fixture", moduleProxyDefinition(),
+        [](std::int32_t index, const std::vector<Variant>& arguments) {
+            if (index != 0 || arguments.size() != 3
+                || !arguments[1].value.isString()) return Variant{};
+            const std::string method = arguments[1].value.asString();
+            if (method == "undefined")
+                return Variant{MetaType::JsonValue, false, RpcValue{}, {}, true};
+            if (method == "nestedResult") {
+                Variant result = Variant::logosResult(true,
+                    Variant::fromRpc(RpcValue{std::int64_t{42}}), Variant{});
+                RpcList list;
+                list.items.push_back(result.value);
+                Variant container = Variant::fromRpc(RpcValue{std::move(list)});
+                container.nestedValues[0] = std::move(result);
+                return container;
+            }
+            if (method == "argumentType") {
+                const Variant& callArgs = arguments[2];
+                const bool isResult = callArgs.type == MetaType::VariantList
+                    && callArgs.nestedValues.size() == 1
+                    && callArgs.nestedValues[0].type == MetaType::User
+                    && callArgs.nestedValues[0].customType == "LogosResult";
+                return Variant::fromRpc(RpcValue{isResult ? "LogosResult" : "flattened"});
+            }
+            return Variant{};
+        }}, &error)) << error;
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(
+        QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("fixture")));
+    ASSERT_TRUE(replica->waitForSource(3000));
+
+    const auto invoke = [&](const QString& method, const QVariantList& args = {}) {
+        QRemoteObjectPendingCall pending;
+        EXPECT_TRUE(QMetaObject::invokeMethod(
+            replica.data(), "callRemoteMethod", Qt::DirectConnection,
+            Q_RETURN_ARG(QRemoteObjectPendingCall, pending),
+            Q_ARG(QString, QStringLiteral("token")),
+            Q_ARG(QString, method),
+            Q_ARG(QVariantList, args)));
+        pending.waitForFinished(3000);
+        EXPECT_TRUE(pending.isFinished());
+        return pending.returnValue();
+    };
+
+    const QJsonValue undefined = invoke(QStringLiteral("undefined")).value<QJsonValue>();
+    EXPECT_TRUE(undefined.isUndefined());
+
+    const QVariantList nested = invoke(QStringLiteral("nestedResult")).toList();
+    ASSERT_EQ(nested.size(), 1);
+    EXPECT_STREQ(nested[0].typeName(), "LogosResult");
+    const LogosResult nestedResult = nested[0].value<LogosResult>();
+    EXPECT_TRUE(nestedResult.success);
+    EXPECT_EQ(nestedResult.value.toInt(), 42);
+
+    const LogosResult argument{true, 42, QVariant{}};
+    EXPECT_EQ(invoke(QStringLiteral("argumentType"),
+                     {QVariant::fromValue(argument)}).toString(),
+              QStringLiteral("LogosResult"));
+    server.stop();
 }
 
 TEST(QtRemotePlainSocketCompatTest, WaitingQtClientSeesBusinessObjectPublishedAfterInit)

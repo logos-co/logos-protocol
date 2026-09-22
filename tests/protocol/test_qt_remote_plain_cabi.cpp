@@ -217,6 +217,35 @@ struct StatusResult {
     std::vector<std::pair<int, unsigned long long>> edges;
 };
 
+struct DisconnectDuringEventResult {
+    lp_client* client = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool proceed = false;
+    std::atomic<bool> done{false};
+};
+
+void onDisconnectStatus(int, unsigned long long, const char*, void*) {}
+
+void onDisconnectingEvent(const char*, const char*, void* userData)
+{
+    auto* result = static_cast<DisconnectDuringEventResult*>(userData);
+    {
+        std::unique_lock<std::mutex> lock(result->mutex);
+        result->entered = true;
+        result->changed.notify_all();
+        result->changed.wait(lock, [&] { return result->proceed; });
+    }
+    char* value = nullptr;
+    char* error = nullptr;
+    (void)lp_invoke(result->client, "echo", R"(["after-disconnect"])",
+                    200, &value, &error);
+    lp_string_free(value);
+    lp_string_free(error);
+    result->done = true;
+}
+
 void onStatus(int status, unsigned long long generation, const char*, void* userData)
 {
     auto* result = static_cast<StatusResult*>(userData);
@@ -241,6 +270,49 @@ void setInstanceId(const std::string& prefix)
     const std::string instance = prefix + std::to_string(::getpid());
     ASSERT_EQ(::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1), 0);
 #endif
+}
+
+void runDisconnectDuringEvent(bool withStatus, bool manualRestart,
+                              const std::string& id)
+{
+    setInstanceId(id);
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("d", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("d", "secret"), LP_OK);
+    lp_client* client = lp_client_create("d", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    if (manualRestart)
+        ASSERT_EQ(lp_client_set_subscription_options(
+            client, R"({"restart":"manual"})"), 1);
+    if (withStatus)
+        ASSERT_EQ(lp_client_set_subscription_status_cb(
+            client, onDisconnectStatus, nullptr), 1);
+    DisconnectDuringEventResult event;
+    event.client = client;
+    lp_subscription* subscription = lp_subscribe(
+        client, "tick", onDisconnectingEvent, &event);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+    ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(event.mutex);
+        ASSERT_TRUE(event.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return event.entered;
+        }));
+    }
+    lp_provider_destroy(provider);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard<std::mutex> lock(event.mutex);
+        event.proceed = true;
+    }
+    event.changed.notify_all();
+    ASSERT_TRUE(waitUntil([&] { return event.done.load(); }, std::chrono::seconds(2)));
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
 }
 
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
@@ -374,6 +446,26 @@ TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
     lp_unsubscribe(subscription);
     lp_client_destroy(client);
     lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithStatusAndAutomaticRestartFinishes)
+{
+    runDisconnectDuringEvent(true, false, "dsa");
+}
+
+TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithStatusAndManualRestartFinishes)
+{
+    runDisconnectDuringEvent(true, true, "dsm");
+}
+
+TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithoutStatusAndAutomaticRestartFinishes)
+{
+    runDisconnectDuringEvent(false, false, "dna");
+}
+
+TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithoutStatusAndManualRestartFinishes)
+{
+    runDisconnectDuringEvent(false, true, "dnm");
 }
 
 TEST(QtRemotePlainCabiTest, SlowEventCallbackDoesNotBlockConcurrentReplies)

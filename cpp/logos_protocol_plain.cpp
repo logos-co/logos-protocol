@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -248,6 +249,12 @@ struct SubscriptionState {
 };
 
 struct ClientState {
+    struct StatusNotification {
+        int status = 0;
+        unsigned long long generation = 0;
+        std::string reason;
+    };
+
     std::recursive_mutex callbackMutex;
     std::mutex mutex;
     std::mutex connectionMutex;
@@ -259,6 +266,7 @@ struct ClientState {
     std::shared_ptr<TokenStore> tokens;
     std::vector<std::weak_ptr<SubscriptionState>> subscriptions;
     std::map<std::string, RpcValue> completions;
+    std::deque<StatusNotification> statusNotifications;
     std::atomic<bool> alive{true};
     std::atomic<unsigned long long> generation{0};
     lp_subscription_status_cb statusCallback = nullptr;
@@ -315,9 +323,18 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
             std::unique_lock<std::mutex> lock(state->mutex);
             state->subscriptionChanged.wait(lock, [&] {
                 return state->workerStop
+                    || !state->statusNotifications.empty()
                     || hasSubscriptionPhase(state, SubscriptionState::Phase::Pending);
             });
             if (state->workerStop) return;
+            if (!state->statusNotifications.empty()) {
+                auto notification = std::move(state->statusNotifications.front());
+                state->statusNotifications.pop_front();
+                lock.unlock();
+                reportSubscriptionStatus(state, notification.status,
+                    notification.generation, notification.reason.c_str());
+                continue;
+            }
         }
 
         std::string error;
@@ -332,6 +349,7 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
             std::unique_lock<std::mutex> lock(state->mutex);
             if (state->subscriptionChanged.wait_for(lock, retry, [&] {
                     return state->workerStop
+                        || !state->statusNotifications.empty()
                         || !hasSubscriptionPhase(state, SubscriptionState::Phase::Pending);
                 })) {
                 if (state->workerStop) return;
@@ -391,10 +409,11 @@ void connectionLost(const std::shared_ptr<ClientState>& state)
             }
         }
         generation = state->generation.load();
+        if (lost)
+            state->statusNotifications.push_back({held ? LP_SUB_HELD : LP_SUB_LOST,
+                                                  generation, "provider_unavailable"});
     }
     if (!lost) return;
-    reportSubscriptionStatus(state, held ? LP_SUB_HELD : LP_SUB_LOST,
-                             generation, "provider_unavailable");
     state->subscriptionChanged.notify_all();
 }
 

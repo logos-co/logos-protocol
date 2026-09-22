@@ -12,11 +12,14 @@
 
 #include <QCoreApplication>
 #include <QEventLoop>
+#include <QJsonValue>
+#include <QRemoteObjectHost>
 #include <QTimer>
 #include <QThread>
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <string>
 
@@ -52,6 +55,42 @@ public:
     EventCallback listener;
 };
 
+class RealQroProvider final : public QObject {
+    Q_OBJECT
+public:
+    Q_INVOKABLE QVariant callRemoteMethod(const QString&, const QString& method,
+                                          const QVariantList& args)
+    {
+        ++calls;
+        if (method == QStringLiteral("deferred")) {
+            const QString id = QStringLiteral("call-%1").arg(++nextId);
+            QTimer::singleShot(20, this, [this, id] {
+                emit eventResponse(QStringLiteral("__logos_call_complete__"),
+                                   {id, QStringLiteral("completed")});
+            });
+            return QVariantMap{{QStringLiteral("__logos_pending_call__"), id}};
+        }
+        if (method == QStringLiteral("never"))
+            return QVariantMap{{QStringLiteral("__logos_pending_call__"),
+                                QStringLiteral("never")}};
+        if (method == QStringLiteral("undefined"))
+            return QVariant::fromValue(QJsonValue(QJsonValue::Undefined));
+        if (method == QStringLiteral("nestedResult"))
+            return QVariantList{QVariant::fromValue(LogosResult{true, 42, QVariant{}})};
+        if (method == QStringLiteral("argumentType") && !args.isEmpty())
+            return QString::fromLatin1(args[0].typeName());
+        return QStringLiteral("immediate");
+    }
+
+    std::atomic<int> calls{0};
+
+signals:
+    void eventResponse(const QString&, const QVariantList&);
+
+private:
+    int nextId = 0;
+};
+
 std::string adapterSocket()
 {
 #ifdef _WIN32
@@ -59,6 +98,27 @@ std::string adapterSocket()
 #else
     return "local:/tmp/logos_qt_remote_plain_adapter_" + std::to_string(::getpid());
 #endif
+}
+
+QString realQroSocket()
+{
+    static std::atomic<unsigned> serial{0};
+    return QStringLiteral("local:logos_qt_remote_plain_real_%1_%2")
+        .arg(QCoreApplication::applicationPid()).arg(serial.fetch_add(1));
+}
+
+bool spinUntil(const std::function<bool()>& done, int timeoutMs = 3000)
+{
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(5);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [&] {
+        if (done()) loop.quit();
+    });
+    QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+    poll.start();
+    loop.exec();
+    return done();
 }
 
 TEST(QtRemotePlainAdapterTest, ConfigRoundTripsAndFactorySelectsAQtFreeConnection)
@@ -141,6 +201,141 @@ TEST(QtRemotePlainAdapterTest, ExistingModuleProxyCallsTokensAndEventsUseThePlai
     object->release();
     tokens.clearAllTokens();
 }
+
+TEST(QtRemotePlainAdapterTest, RealQroCallsKeepDeferredControlAndNestedTypes)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    RealQroProvider provider;
+    QRemoteObjectHost host;
+    const QString url = realQroSocket();
+    ASSERT_TRUE(host.setHostUrl(QUrl(url)));
+    ASSERT_TRUE(host.enableRemoting(&provider, QStringLiteral("fixture")));
+
+    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(url);
+    auto acquisition = std::async(std::launch::async, [&] {
+        return connection.requestObject(QStringLiteral("fixture"), 1000);
+    });
+    ASSERT_TRUE(spinUntil([&] {
+        return acquisition.wait_for(std::chrono::milliseconds(0))
+            == std::future_status::ready;
+    }));
+    LogosObject* object = acquisition.get();
+    ASSERT_NE(object, nullptr);
+
+    const auto invoke = [&](const QString& method, const QVariantList& args = {}) {
+        auto call = std::async(std::launch::async, [&, method, args] {
+            return object->callMethod(QStringLiteral("secret"), method, args, 500);
+        });
+        EXPECT_TRUE(spinUntil([&] {
+            return call.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+        }));
+        return call.get();
+    };
+
+    const QJsonValue undefined = invoke(QStringLiteral("undefined")).value<QJsonValue>();
+    EXPECT_TRUE(undefined.isUndefined());
+    EXPECT_FALSE(undefined.isNull());
+
+    const QVariantList nested = invoke(QStringLiteral("nestedResult")).toList();
+    ASSERT_EQ(nested.size(), 1);
+    EXPECT_STREQ(nested[0].typeName(), "LogosResult");
+    EXPECT_EQ(nested[0].value<LogosResult>().value.toInt(), 42);
+    EXPECT_EQ(invoke(QStringLiteral("argumentType"),
+                     {QVariant::fromValue(LogosResult{true, 42, QVariant{}})}).toString(),
+              QStringLiteral("LogosResult"));
+
+    std::promise<std::pair<QVariant, logos::CallError>> eventResult;
+    auto eventFuture = eventResult.get_future();
+    object->onEvent(QStringLiteral("tick"), [&](const QString&, const QVariantList&) {
+        logos::CallError error;
+        QVariant value = dynamic_cast<LogosObjectErrorChannel*>(object)->callMethodWithError(
+            QStringLiteral("secret"), QStringLiteral("deferred"), {}, 500, &error);
+        eventResult.set_value({std::move(value), std::move(error)});
+    });
+    emit provider.eventResponse(QStringLiteral("tick"), {});
+    ASSERT_TRUE(spinUntil([&] {
+        return eventFuture.wait_for(std::chrono::milliseconds(0))
+            == std::future_status::ready;
+    }));
+    const auto [eventValue, eventError] = eventFuture.get();
+    EXPECT_EQ(eventValue.toString(), QStringLiteral("completed"));
+    EXPECT_TRUE(eventError.ok());
+    object->release();
+}
+
+TEST(QtRemotePlainAdapterTest, AsyncResultsReturnToQtThreadAndRespectRelease)
+{
+    RealQroProvider provider;
+    QRemoteObjectHost host;
+    const QString url = realQroSocket();
+    ASSERT_TRUE(host.setHostUrl(QUrl(url)));
+    ASSERT_TRUE(host.enableRemoting(&provider, QStringLiteral("fixture")));
+    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(url);
+
+    const auto acquire = [&] {
+        auto pending = std::async(std::launch::async, [&] {
+            return connection.requestObject(QStringLiteral("fixture"), 1000);
+        });
+        EXPECT_TRUE(spinUntil([&] {
+            return pending.wait_for(std::chrono::milliseconds(0))
+                == std::future_status::ready;
+        }));
+        return pending.get();
+    };
+    LogosObject* object = acquire();
+    ASSERT_NE(object, nullptr);
+
+    struct Delivery {
+        QVariant value;
+        logos::CallError error;
+        bool onQtThread = false;
+    };
+    const auto invokeAsync = [&](const QString& method, int timeoutMs) {
+        auto promise = std::make_shared<std::promise<Delivery>>();
+        auto future = promise->get_future();
+        dynamic_cast<LogosObjectErrorChannel*>(object)->callMethodAsyncWithError(
+            QStringLiteral("secret"), method, {}, timeoutMs,
+            [promise](QVariant value, const logos::CallError& error) {
+                promise->set_value({std::move(value), error,
+                    QThread::currentThread() == QCoreApplication::instance()->thread()});
+            });
+        EXPECT_TRUE(spinUntil([&] {
+            return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+        }));
+        return future.get();
+    };
+
+    const Delivery immediate = invokeAsync(QStringLiteral("immediate"), 500);
+    EXPECT_TRUE(immediate.onQtThread);
+    EXPECT_EQ(immediate.value.toString(), QStringLiteral("immediate"));
+    EXPECT_TRUE(immediate.error.ok());
+
+    const Delivery deferred = invokeAsync(QStringLiteral("deferred"), 500);
+    EXPECT_TRUE(deferred.onQtThread);
+    EXPECT_EQ(deferred.value.toString(), QStringLiteral("completed"));
+    EXPECT_TRUE(deferred.error.ok());
+
+    const Delivery timeout = invokeAsync(QStringLiteral("never"), 50);
+    EXPECT_TRUE(timeout.onQtThread);
+    EXPECT_FALSE(timeout.value.isValid());
+    EXPECT_FALSE(timeout.error.ok());
+
+    object->release();
+    object = acquire();
+    ASSERT_NE(object, nullptr);
+    std::atomic<bool> delivered{false};
+    const int callsBefore = provider.calls.load();
+    object->callMethodAsync(QStringLiteral("secret"), QStringLiteral("immediate"), {}, 500,
+                            [&](QVariant) { delivered = true; });
+    object->release();
+    ASSERT_TRUE(spinUntil([&] { return provider.calls.load() > callsBefore; }));
+    QEventLoop settle;
+    QTimer::singleShot(100, &settle, &QEventLoop::quit);
+    settle.exec();
+    EXPECT_FALSE(delivered.load());
+}
 #endif
 
 } // namespace
+
+#include "test_qt_remote_plain_adapter.moc"
