@@ -143,6 +143,39 @@ set_target_properties(logos_protocol_plain_shared PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# PE exports no C++ symbols unless they are named explicitly. Generate the
+# plain runtime's export table from its matching static archive so consumers can
+# call both the lp_* C ABI and the transport-config helpers without maintaining
+# a hand-written symbol list.
+if(WIN32)
+    set(_lpp_nm "${CMAKE_NM}")
+    if(NOT _lpp_nm)
+        find_program(_lpp_nm NAMES "${CMAKE_CXX_COMPILER_TARGET}-nm" x86_64-w64-mingw32-nm nm)
+    endif()
+    if(NOT _lpp_nm)
+        message(FATAL_ERROR
+            "nm not found, so liblogos_protocol_plain.dll cannot be given an export list")
+    endif()
+
+    set(_lpp_def "${CMAKE_CURRENT_BINARY_DIR}/logos_protocol_plain_shared_exports.def")
+    add_custom_command(
+        OUTPUT "${_lpp_def}"
+        COMMAND ${CMAKE_COMMAND} -E env sh
+                "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
+                "${_lpp_nm}" "${_lpp_def}"
+                "$<TARGET_FILE:logos_protocol_plain>" "*"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
+                logos_protocol_plain
+        COMMENT "Generating liblogos_protocol_plain export definition"
+        VERBATIM
+    )
+    add_custom_target(logos_protocol_plain_shared_exports DEPENDS "${_lpp_def}")
+    add_dependencies(logos_protocol_plain_shared logos_protocol_plain_shared_exports)
+    target_link_options(logos_protocol_plain_shared PRIVATE "${_lpp_def}")
+    set_property(TARGET logos_protocol_plain_shared APPEND PROPERTY
+                 LINK_DEPENDS "${_lpp_def}")
+endif()
+
 if(LOGOS_PROTOCOL_BUILD_QT)
 set(PROTOCOL_SOURCES
     logos_protocol.h
