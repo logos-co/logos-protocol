@@ -51,6 +51,54 @@ std::string windowsError(const char* operation)
         + std::to_string(static_cast<unsigned long>(::GetLastError())) + ")";
 }
 
+std::string windowsError(const char* operation, DWORD code)
+{
+    return std::string(operation) + " failed (Windows error "
+        + std::to_string(static_cast<unsigned long>(code)) + ")";
+}
+
+bool overlappedWrite(HANDLE handle, const std::uint8_t* data, DWORD size,
+                     DWORD& written, std::string* error)
+{
+    OVERLAPPED operation{};
+    operation.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!operation.hEvent) {
+        setError(error, windowsError("CreateEvent"));
+        return false;
+    }
+    bool success = ::WriteFile(handle, data, size, &written, &operation) != FALSE;
+    if (!success) {
+        const DWORD code = ::GetLastError();
+        if (code == ERROR_IO_PENDING) {
+            success = ::WaitForSingleObject(operation.hEvent, INFINITE) == WAIT_OBJECT_0
+                && ::GetOverlappedResult(handle, &operation, &written, FALSE) != FALSE;
+            if (!success)
+                setError(error, windowsError("WriteFile", ::GetLastError()));
+        } else {
+            setError(error, windowsError("WriteFile", code));
+        }
+    }
+    ::CloseHandle(operation.hEvent);
+    return success;
+}
+
+bool overlappedRead(HANDLE handle, std::uint8_t* data, DWORD size, DWORD& received)
+{
+    OVERLAPPED operation{};
+    operation.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!operation.hEvent) return false;
+    bool success = ::ReadFile(handle, data, size, &received, &operation) != FALSE;
+    if (!success) {
+        const DWORD code = ::GetLastError();
+        if (code == ERROR_IO_PENDING) {
+            success = ::WaitForSingleObject(operation.hEvent, INFINITE) == WAIT_OBJECT_0
+                && ::GetOverlappedResult(handle, &operation, &received, FALSE) != FALSE;
+        }
+    }
+    ::CloseHandle(operation.hEvent);
+    return success;
+}
+
 bool writeAll(NativeHandle handle, const std::vector<std::uint8_t>& data,
               std::string* error)
 {
@@ -59,9 +107,8 @@ bool writeAll(NativeHandle handle, const std::vector<std::uint8_t>& data,
         DWORD written = 0;
         const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(
             data.size() - offset, std::numeric_limits<DWORD>::max()));
-        if (!::WriteFile(winHandle(handle), data.data() + offset, remaining,
-                         &written, nullptr) || written == 0) {
-            setError(error, windowsError("WriteFile"));
+        if (!overlappedWrite(winHandle(handle), data.data() + offset, remaining,
+                             written, error) || written == 0) {
             return false;
         }
         offset += written;
@@ -76,8 +123,8 @@ bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size)
         DWORD received = 0;
         const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(
             size - offset, std::numeric_limits<DWORD>::max()));
-        if (!::ReadFile(winHandle(handle), output + offset, remaining,
-                        &received, nullptr) || received == 0)
+        if (!overlappedRead(winHandle(handle), output + offset, remaining, received)
+            || received == 0)
             return false;
         offset += received;
     }
@@ -167,7 +214,8 @@ NativeHandle connectSocket(const std::string& path,
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         HANDLE pipe = ::CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                    0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                    0, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_OVERLAPPED, nullptr);
         if (pipe != INVALID_HANDLE_VALUE)
             return reinterpret_cast<NativeHandle>(pipe);
 
@@ -733,14 +781,31 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         while (running) {
 #ifdef _WIN32
             HANDLE pipe = ::CreateNamedPipeA(
-                path.c_str(), PIPE_ACCESS_DUPLEX,
+                path.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES, 64u << 10, 64u << 10, 0, nullptr);
             if (pipe == INVALID_HANDLE_VALUE) break;
             const NativeHandle candidate = reinterpret_cast<NativeHandle>(pipe);
             listener = candidate;
-            const bool connected = ::ConnectNamedPipe(pipe, nullptr)
-                || ::GetLastError() == ERROR_PIPE_CONNECTED;
+            OVERLAPPED operation{};
+            operation.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
+            bool connected = false;
+            if (operation.hEvent) {
+                connected = ::ConnectNamedPipe(pipe, &operation) != FALSE;
+                if (!connected) {
+                    const DWORD code = ::GetLastError();
+                    if (code == ERROR_PIPE_CONNECTED) {
+                        connected = true;
+                    } else if (code == ERROR_IO_PENDING) {
+                        DWORD transferred = 0;
+                        connected = ::WaitForSingleObject(operation.hEvent, INFINITE)
+                                == WAIT_OBJECT_0
+                            && ::GetOverlappedResult(pipe, &operation,
+                                                     &transferred, FALSE) != FALSE;
+                    }
+                }
+                ::CloseHandle(operation.hEvent);
+            }
             const NativeHandle owned = listener.exchange(kInvalidHandle);
             if (owned == kInvalidHandle) break;
             if (!connected) {
