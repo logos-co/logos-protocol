@@ -40,7 +40,7 @@
 # inside an inline function stays per-image on PE no matter what. Do not
 # "simplify" this filter away.
 #
-# Usage: gen-shared-exports.sh <nm> <out.def> <archive> <obj,obj,...|*> [...]
+# Usage: gen-shared-exports.sh <nm> <out.def> <archive> <obj,obj,...|ALL> [...]
 
 set -eu
 
@@ -55,7 +55,7 @@ while [ "$#" -gt 0 ]; do
     [ -f "$archive" ] || { echo "gen-shared-exports: missing archive $archive" >&2; exit 1; }
     "$NM" -A --defined-only "$archive" | awk -v members="$members" -v arch="$archive" '
     BEGIN {
-        if (members == "*") { all = 1 }
+        if (members == "ALL" || members == "*") { all = 1 }
         else { n = split(members, a, ","); for (i = 1; i <= n; i++) want[a[i]] = 1 }
     }
     {
