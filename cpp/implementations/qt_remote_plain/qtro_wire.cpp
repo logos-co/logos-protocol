@@ -229,7 +229,8 @@ Variant Variant::logosResult(bool success, Variant resultValue, Variant resultEr
 bool Variant::operator==(const Variant& other) const
 {
     return type == other.type && isNull == other.isNull
-        && value == other.value && customType == other.customType;
+        && value == other.value && customType == other.customType
+        && jsonUndefined == other.jsonUndefined;
 }
 
 void Writer::u8(std::uint8_t value) { m_data.push_back(value); }
@@ -364,24 +365,26 @@ void Writer::variant(const Variant& input)
         return;
     }
     case MetaType::JsonValue: {
-        if (input.value.isNull()) {
-            u8(1); // QJsonValue::Null
+        if (input.jsonUndefined) {
+            u8(0x80); // QJsonValue::Undefined
+        } else if (input.value.isNull()) {
+            u8(0); // QJsonValue::Null
         } else if (input.value.isBool()) {
-            u8(2);
+            u8(1);
             boolean(input.value.asBool());
         } else if (input.value.isDouble() || input.value.isIntegral()) {
-            u8(3);
+            u8(2);
             real(input.value.isDouble() ? input.value.asDouble()
                                         : input.value.isUInt() ? static_cast<double>(input.value.asUInt())
                                                                : static_cast<double>(input.value.asInt()));
         } else if (input.value.isString()) {
-            u8(4);
+            u8(3);
             string(input.value.asString());
         } else if (input.value.isList()) {
-            u8(5);
+            u8(4);
             bytes(jsonBytes(input.value));
         } else {
-            u8(6);
+            u8(5);
             bytes(jsonBytes(input.value));
         }
         return;
@@ -642,13 +645,16 @@ Variant Reader::variant()
     }
     case MetaType::JsonValue: {
         switch (u8()) {
-        case 0:
-        case 1: result.value = plain::RpcValue{}; break;
-        case 2: result.value = plain::RpcValue{boolean()}; break;
-        case 3: result.value = plain::RpcValue{real()}; break;
-        case 4: result.value = plain::RpcValue{string().value_or(std::string{})}; break;
-        case 5:
-        case 6: result.value = parseJsonBytes(bytes().value_or(std::vector<std::uint8_t>{})); break;
+        case 0: result.value = plain::RpcValue{}; break;
+        case 1: result.value = plain::RpcValue{boolean()}; break;
+        case 2: result.value = plain::RpcValue{real()}; break;
+        case 3: result.value = plain::RpcValue{string().value_or(std::string{})}; break;
+        case 4:
+        case 5: result.value = parseJsonBytes(bytes().value_or(std::vector<std::uint8_t>{})); break;
+        case 0x80:
+            result.value = plain::RpcValue{};
+            result.jsonUndefined = true;
+            break;
         default: throw CodecError("invalid QJsonValue type");
         }
         break;

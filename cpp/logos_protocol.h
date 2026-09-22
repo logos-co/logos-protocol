@@ -277,9 +277,13 @@
 // hosts whose accepted credentials live outside the protocol token registry.
 // Also makes the already-supported empty event name public at the C ABI as the
 // wildcard subscription used by logoscore's `watch <module>` command.
-#define LOGOS_PROTOCOL_VERSION_MINOR 11
+// 0.12: staged provider publication. A native host can expose the token-only
+// handshake during initialization and publish the business object only after
+// the module context is ready. lp_string_copy() lets a host transfer module
+// results into protocol-owned storage before crossing an allocator boundary.
+#define LOGOS_PROTOCOL_VERSION_MINOR 12
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.11.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.12.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -359,6 +363,12 @@ LP_API int lp_protocol_abi_major(void);
 
 /** Free a string returned by this library. Safe to call with NULL. */
 LP_API void lp_string_free(char* s);
+
+/** Copy a NUL-terminated string into memory owned by this protocol library.
+ *  The caller frees the result with lp_string_free(). Returns NULL for a NULL
+ *  input or allocation failure. This is the allocator-boundary bridge for
+ *  hosts that receive strings from independently-built module runtimes. */
+LP_API char* lp_string_copy(const char* s);
 
 /* ---------------------------------------------------------------------------
  * Process-global mode / transport defaults
@@ -948,6 +958,15 @@ LP_API const char* lp_current_caller_json(void);
 LP_API lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json);
 LP_API void lp_provider_destroy(lp_provider* provider);
+/** Start the provider endpoint and publish only the token-handshake object.
+ *  Call lp_provider_register with the same callbacks after module
+ *  initialization to publish the business object. Existing callers may skip
+ *  this staged form and call lp_provider_register directly. */
+LP_API int lp_provider_prepare(lp_provider* provider,
+                         lp_dispatch_cb dispatch,
+                         lp_getmethods_cb get_methods,
+                         lp_token_cb on_token,
+                         void* user_data);
 LP_API int lp_provider_register(lp_provider* provider,
                          lp_dispatch_cb dispatch,
                          lp_getmethods_cb get_methods,

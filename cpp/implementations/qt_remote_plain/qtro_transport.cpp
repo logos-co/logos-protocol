@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -295,6 +297,79 @@ std::string localSocketPath(std::string_view localUrlOrPath)
 #endif
 }
 
+namespace {
+
+// QtRO delivers signals independently of the socket reader. A callback may
+// synchronously call the same remote object, so the reader must remain free to
+// consume that call's reply while the callback is running.
+struct CallbackExecutor : std::enable_shared_from_this<CallbackExecutor> {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::condition_variable exitedChanged;
+    std::deque<std::function<void()>> jobs;
+    bool stopping = false;
+    bool exited = false;
+    std::thread::id worker;
+
+    static std::shared_ptr<CallbackExecutor> start()
+    {
+        auto executor = std::make_shared<CallbackExecutor>();
+        std::thread([executor] { executor->run(); }).detach();
+        return executor;
+    }
+
+    bool post(std::function<void()> job)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping) return false;
+            jobs.push_back(std::move(job));
+        }
+        changed.notify_one();
+        return true;
+    }
+
+    void stop()
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        stopping = true;
+        jobs.clear();
+        changed.notify_all();
+        if (worker == std::this_thread::get_id()) return;
+        exitedChanged.wait(lock, [&] { return exited; });
+    }
+
+    void run()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            worker = std::this_thread::get_id();
+        }
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                changed.wait(lock, [&] { return stopping || !jobs.empty(); });
+                if (stopping) break;
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            try {
+                job();
+            } catch (...) {
+                // A user callback must not terminate the transport worker.
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            exited = true;
+        }
+        exitedChanged.notify_all();
+    }
+};
+
+} // namespace
+
 struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     struct Pending {
         std::condition_variable cv;
@@ -318,7 +393,9 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     std::map<std::int32_t, std::shared_ptr<Pending>> pending;
     std::int32_t nextSerial = 1;
     EventHandler eventHandler;
+    InternalEventHandler internalEventHandler;
     DisconnectHandler disconnectHandler;
+    std::shared_ptr<CallbackExecutor> eventExecutor;
     bool disconnectReported = false;
     std::thread::id readerThread;
 
@@ -437,12 +514,23 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
             (void)reader.i32();
             (void)reader.i32();
             EventHandler callback;
+            InternalEventHandler internalCallback;
+            std::shared_ptr<CallbackExecutor> executor;
             {
                 std::lock_guard<std::mutex> lock(mu);
                 callback = eventHandler;
+                internalCallback = internalEventHandler;
+                executor = eventExecutor;
             }
-            if (callKind == 0 && callback)
-                callback(frame.name, index, std::move(args));
+            const bool consumed = callKind == 0 && internalCallback
+                && internalCallback(frame.name, index, args);
+            if (callKind == 0 && !consumed && callback && executor) {
+                const std::string object = std::move(frame.name);
+                executor->post([callback = std::move(callback), object,
+                                index, args = std::move(args)]() mutable {
+                    callback(object, index, std::move(args));
+                });
+            }
             break;
         }
         case PacketType::Ping:
@@ -503,6 +591,7 @@ bool Client::connect(const std::string& localUrlOrPath,
     const std::string path = localSocketPath(localUrlOrPath);
     const NativeHandle socket = connectSocket(path, timeout, error);
     if (socket == kInvalidHandle) return false;
+    auto executor = CallbackExecutor::start();
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         m_impl->fd = socket;
@@ -515,6 +604,7 @@ bool Client::connect(const std::string& localUrlOrPath,
         m_impl->definitions.clear();
         m_impl->requested.clear();
         m_impl->disconnectReported = false;
+        m_impl->eventExecutor = std::move(executor);
     }
     auto state = m_impl;
     std::thread([state] { state->readLoop(); }).detach();
@@ -535,15 +625,20 @@ bool Client::connect(const std::string& localUrlOrPath,
 
 void Client::close()
 {
+    std::shared_ptr<CallbackExecutor> executor;
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
-        if (m_impl->readerExited && m_impl->fd.load() == kInvalidHandle) return;
+        if (m_impl->readerExited && m_impl->fd.load() == kInvalidHandle
+            && !m_impl->eventExecutor) return;
         m_impl->running = false;
+        executor = std::move(m_impl->eventExecutor);
     }
     closeHandle(m_impl->fd);
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    if (m_impl->readerThread == std::this_thread::get_id()) return;
-    m_impl->changed.wait_for(lock, std::chrono::seconds(2), [&] { return m_impl->readerExited; });
+    if (m_impl->readerThread != std::this_thread::get_id())
+        m_impl->changed.wait(lock, [&] { return m_impl->readerExited; });
+    lock.unlock();
+    if (executor) executor->stop();
 }
 
 bool Client::isConnected() const
@@ -656,6 +751,12 @@ void Client::setEventHandler(EventHandler handler)
     m_impl->eventHandler = std::move(handler);
 }
 
+void Client::setInternalEventHandler(InternalEventHandler handler)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    m_impl->internalEventHandler = std::move(handler);
+}
+
 void Client::setDisconnectHandler(DisconnectHandler handler)
 {
     std::lock_guard<std::mutex> lock(m_impl->mu);
@@ -668,6 +769,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         std::atomic<NativeHandle> fd;
         std::mutex sendMu;
         std::set<std::string> acquired;
+        std::thread::id worker;
     };
 
     mutable std::mutex mu;
@@ -675,6 +777,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::atomic<NativeHandle> listener{kInvalidHandle};
     std::atomic<bool> running{false};
     bool acceptExited = true;
+    std::size_t activeInvocations = 0;
     std::string path;
     std::map<std::string, Object> objects;
     std::vector<std::shared_ptr<Connection>> connections;
@@ -699,6 +802,10 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
 
     void connectionLoop(const std::shared_ptr<Connection>& connection)
     {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            connection->worker = std::this_thread::get_id();
+        }
         std::vector<std::uint8_t> bytes;
         std::string error;
         while (running && readPacket(connection->fd.load(), bytes, &error)) {
@@ -753,14 +860,42 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                         }
                     }
                     if (found && callKind == 0 && object.invoke) {
-                        Variant result;
-                        try {
-                            result = object.invoke(methodIndex, arguments);
-                        } catch (...) {
-                            result = Variant::fromRpc(plain::RpcValue{});
+                        {
+                            std::lock_guard<std::mutex> lock(mu);
+                            ++activeInvocations;
                         }
-                        if (serial >= 0)
-                            (void)send(connection, invokeReplyPacket(frame.name, serial, result));
+                        auto state = shared_from_this();
+                        const std::string objectName = std::move(frame.name);
+                        try {
+                            std::thread([state, connection, object = std::move(object),
+                                         objectName, methodIndex, serial,
+                                         arguments = std::move(arguments)]() mutable {
+                                Variant result;
+                                try {
+                                    result = object.invoke(methodIndex, arguments);
+                                } catch (...) {
+                                    result = Variant::fromRpc(plain::RpcValue{});
+                                }
+                                if (serial >= 0)
+                                    (void)state->send(connection,
+                                        invokeReplyPacket(objectName, serial, result));
+                                {
+                                    std::lock_guard<std::mutex> lock(state->mu);
+                                    --state->activeInvocations;
+                                }
+                                state->changed.notify_all();
+                            }).detach();
+                        } catch (...) {
+                            {
+                                std::lock_guard<std::mutex> lock(mu);
+                                --activeInvocations;
+                            }
+                            changed.notify_all();
+                            if (serial >= 0)
+                                (void)send(connection, invokeReplyPacket(
+                                    objectName, serial,
+                                    Variant::fromRpc(plain::RpcValue{})));
+                        }
                     }
                 }
             } catch (...) {
@@ -918,7 +1053,8 @@ void Server::stop()
     std::string path;
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
-        if (!m_impl->running && m_impl->listener.load() == kInvalidHandle) return;
+        if (!m_impl->running && m_impl->listener.load() == kInvalidHandle
+            && m_impl->connections.empty() && m_impl->activeInvocations == 0) return;
         m_impl->running = false;
         connections = m_impl->connections;
         path = m_impl->path;
@@ -926,8 +1062,12 @@ void Server::stop()
     closeHandle(m_impl->listener);
     for (const auto& connection : connections) closeHandle(connection->fd);
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    m_impl->changed.wait_for(lock, std::chrono::seconds(2), [&] {
-        return m_impl->acceptExited && m_impl->connections.empty();
+    const auto caller = std::this_thread::get_id();
+    m_impl->changed.wait(lock, [&] {
+        return m_impl->acceptExited
+            && m_impl->activeInvocations == 0
+            && std::all_of(m_impl->connections.begin(), m_impl->connections.end(),
+                [&](const auto& connection) { return connection->worker == caller; });
     });
     lock.unlock();
 #ifndef _WIN32

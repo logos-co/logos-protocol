@@ -64,6 +64,10 @@ struct Variant {
     bool isNull = true;
     plain::RpcValue value;
     std::string customType;
+    // QJsonValue::Undefined and QJsonValue::Null both have no RpcValue
+    // payload, but Qt gives them distinct wire tags (0x80 and 0). Preserve the
+    // distinction so a decoded value can be emitted byte-for-byte.
+    bool jsonUndefined = false;
 
     static Variant fromRpc(plain::RpcValue value);
     static Variant logosResult(bool success, Variant value, Variant error);

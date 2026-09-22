@@ -1,5 +1,6 @@
 #include "logos_protocol.h"
 #include "logos_codec.h"
+#include "implementations/qt_remote_plain/qtro_transport.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -56,12 +57,15 @@ char* dispatch(const char* method, const char* argsJson, void*)
         return copyString(nlohmann::json("plain:" + args.at(0).get<std::string>()).dump());
     if (std::strcmp(method, "echoBytes") == 0)
         return copyString(args.at(0).dump());
+    if (std::strcmp(method, "mapCollision") == 0
+        || std::strcmp(method, "resultCollision") == 0)
+        return copyString(R"({"success":true,"value":42,"error":null})");
     return copyString("null");
 }
 
 char* methods(void*)
 {
-    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]},{"type":"method","name":"echoBytes","signature":"echoBytes(QByteArray)","returnType":"QByteArray","isInvokable":true,"parameters":[]}])json");
+    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]},{"type":"method","name":"echoBytes","signature":"echoBytes(QByteArray)","returnType":"QByteArray","isInvokable":true,"parameters":[]},{"type":"method","name":"mapCollision","signature":"mapCollision()","returnType":"QVariantMap","isInvokable":true,"parameters":[]},{"type":"method","name":"resultCollision","signature":"resultCollision()","returnType":"LogosResult","isInvokable":true,"parameters":[]}])json");
 }
 
 int token(const char* module, const char* value, void* userData)
@@ -101,6 +105,111 @@ bool waitUntil(const std::function<bool()>& predicate,
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return predicate();
+}
+
+struct ReentrantEventResult {
+    lp_client* client = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool done = false;
+    int status = LP_ERR_INTERNAL;
+    std::string value;
+};
+
+struct BlockingEventResult {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool release = false;
+};
+
+void onBlockingEvent(const char*, const char*, void* userData)
+{
+    auto* result = static_cast<BlockingEventResult*>(userData);
+    std::unique_lock<std::mutex> lock(result->mutex);
+    result->entered = true;
+    result->changed.notify_all();
+    result->changed.wait(lock, [&] { return result->release; });
+}
+
+struct DeferredFixture {
+    lp_provider* provider = nullptr;
+};
+
+char* deferredDispatch(const char* method, const char*, void* userData)
+{
+    auto* fixture = static_cast<DeferredFixture*>(userData);
+    if (std::strcmp(method, "deferred") != 0) return copyString("null");
+    lp_provider* provider = fixture->provider;
+    std::thread([provider] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        (void)lp_provider_emit_event(
+            provider, "__logos_call_complete__", R"(["deferred-1","complete"])");
+    }).detach();
+    return copyString(R"({"__logos_pending_call__":"deferred-1"})");
+}
+
+char* deferredMethods(void*)
+{
+    return copyString(R"json([{"type":"method","name":"deferred","signature":"deferred()","returnType":"string","isInvokable":true,"parameters":[]}])json");
+}
+
+struct DestroyEventResult {
+    lp_client* client = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool done = false;
+};
+
+struct BlockingDispatchFixture {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool release = false;
+};
+
+char* blockingDispatch(const char*, const char*, void* userData)
+{
+    auto* fixture = static_cast<BlockingDispatchFixture*>(userData);
+    std::unique_lock<std::mutex> lock(fixture->mutex);
+    fixture->entered = true;
+    fixture->changed.notify_all();
+    fixture->changed.wait(lock, [&] { return fixture->release; });
+    return copyString("true");
+}
+
+char* blockingMethods(void*)
+{
+    return copyString(R"json([{"type":"method","name":"block","signature":"block()","returnType":"bool","isInvokable":true,"parameters":[]}])json");
+}
+
+void onDestroyingEvent(const char*, const char*, void* userData)
+{
+    auto* result = static_cast<DestroyEventResult*>(userData);
+    lp_client_destroy(result->client);
+    {
+        std::lock_guard<std::mutex> lock(result->mutex);
+        result->done = true;
+    }
+    result->changed.notify_all();
+}
+
+void onReentrantEvent(const char*, const char*, void* userData)
+{
+    auto* result = static_cast<ReentrantEventResult*>(userData);
+    char* value = nullptr;
+    char* error = nullptr;
+    const int status = lp_invoke(
+        result->client, "echo", R"(["from-event"])", 1000, &value, &error);
+    {
+        std::lock_guard<std::mutex> lock(result->mutex);
+        result->status = status;
+        result->value = value ? value : "";
+        result->done = true;
+    }
+    lp_string_free(value);
+    lp_string_free(error);
+    result->changed.notify_all();
 }
 
 struct StatusResult {
@@ -232,6 +341,264 @@ TEST(QtRemotePlainCabiTest, ProviderCanValidatePersistentTokensOnDemand)
     lp_string_free(result);
     lp_string_free(error);
     lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
+{
+    setInstanceId("qtro_cabi_reentrant_event_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("reentrant_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("reentrant_fixture", "secret"), LP_OK);
+
+    lp_client* client = lp_client_create("reentrant_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    ReentrantEventResult event;
+    event.client = client;
+    lp_subscription* subscription = lp_subscribe(client, "tick", onReentrantEvent, &event);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+    ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(event.mutex);
+        ASSERT_TRUE(event.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return event.done;
+        }));
+    }
+    EXPECT_EQ(event.status, LP_OK);
+    EXPECT_EQ(nlohmann::json::parse(event.value), "plain:from-event");
+
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, SlowEventCallbackDoesNotBlockConcurrentReplies)
+{
+    setInstanceId("qtro_cabi_slow_event_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("slow_event_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("slow_event_fixture", "secret"), LP_OK);
+
+    lp_client* client = lp_client_create("slow_event_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    BlockingEventResult event;
+    lp_subscription* subscription = lp_subscribe(client, "tick", onBlockingEvent, &event);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+    ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(event.mutex);
+        ASSERT_TRUE(event.changed.wait_for(lock, std::chrono::seconds(1), [&] {
+            return event.entered;
+        }));
+    }
+
+    char* value = nullptr;
+    char* error = nullptr;
+    EXPECT_EQ(lp_invoke(client, "echo", R"(["while-blocked"])", 1000, &value, &error),
+              LP_OK) << (error ? error : "");
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(nlohmann::json::parse(value), "plain:while-blocked");
+    lp_string_free(value);
+    lp_string_free(error);
+
+    {
+        std::lock_guard<std::mutex> lock(event.mutex);
+        event.release = true;
+    }
+    event.changed.notify_all();
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, DeferredCompletionBypassesBlockedPublicCallback)
+{
+    setInstanceId("qtro_cabi_deferred_event_");
+    DeferredFixture fixture;
+    fixture.provider = lp_provider_create("deferred_event_fixture", nullptr);
+    ASSERT_NE(fixture.provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(fixture.provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(fixture.provider, deferredDispatch, deferredMethods,
+                                   token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("deferred_event_fixture", "secret"), LP_OK);
+
+    lp_client* client = lp_client_create("deferred_event_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    ReentrantEventResult event;
+    event.client = client;
+    auto invokeDeferred = [](const char*, const char*, void* userData) {
+        auto* result = static_cast<ReentrantEventResult*>(userData);
+        char* value = nullptr;
+        char* error = nullptr;
+        const int status = lp_invoke(result->client, "deferred", "[]", 1000,
+                                     &value, &error);
+        {
+            std::lock_guard<std::mutex> lock(result->mutex);
+            result->status = status;
+            result->value = value ? value : "";
+            result->done = true;
+        }
+        lp_string_free(value);
+        lp_string_free(error);
+        result->changed.notify_all();
+    };
+    lp_subscription* subscription = lp_subscribe(client, "tick", invokeDeferred, &event);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+    ASSERT_EQ(lp_provider_emit_event(fixture.provider, "tick", "[]"), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(event.mutex);
+        ASSERT_TRUE(event.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return event.done;
+        }));
+    }
+    EXPECT_EQ(event.status, LP_OK);
+    EXPECT_EQ(nlohmann::json::parse(event.value), "complete");
+
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(fixture.provider);
+}
+
+TEST(QtRemotePlainCabiTest, EventCallbackCanDestroyItsClient)
+{
+    setInstanceId("qtro_cabi_callback_destroy_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("destroy_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("destroy_fixture", "secret"), LP_OK);
+
+    DestroyEventResult event;
+    event.client = lp_client_create("destroy_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(event.client, nullptr);
+    lp_subscription* subscription = lp_subscribe(
+        event.client, "tick", onDestroyingEvent, &event);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] {
+        return lp_client_subscription_generation(event.client) == 1;
+    }));
+    ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(event.mutex);
+        ASSERT_TRUE(event.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return event.done;
+        }));
+    }
+
+    lp_unsubscribe(subscription);
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, ProviderDestroyWaitsForOutstandingDispatch)
+{
+    setInstanceId("qtro_cabi_provider_destroy_");
+    BlockingDispatchFixture fixture;
+    lp_provider* provider = lp_provider_create("provider_destroy_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, blockingDispatch, blockingMethods,
+                                   nullptr, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("provider_destroy_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create(
+        "provider_destroy_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    std::thread call([&] {
+        char* value = nullptr;
+        char* error = nullptr;
+        (void)lp_invoke(client, "block", "[]", 2000, &value, &error);
+        lp_string_free(value);
+        lp_string_free(error);
+    });
+    {
+        std::unique_lock<std::mutex> lock(fixture.mutex);
+        ASSERT_TRUE(fixture.changed.wait_for(lock, std::chrono::seconds(1), [&] {
+            return fixture.entered;
+        }));
+    }
+
+    std::atomic<bool> destroyed{false};
+    std::thread destroyer([&] {
+        lp_provider_destroy(provider);
+        destroyed = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(destroyed.load());
+    {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        fixture.release = true;
+    }
+    fixture.changed.notify_all();
+    destroyer.join();
+    EXPECT_TRUE(destroyed.load());
+    call.join();
+    lp_client_destroy(client);
+}
+
+TEST(QtRemotePlainCabiTest, ProviderPublishesBusinessObjectOnlyAfterActivation)
+{
+    setInstanceId("qtro_cabi_staged_provider_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("staged_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_prepare(provider, dispatch, methods, token, &fixture), LP_OK);
+
+    logos::qt_remote_plain::Client wire;
+    std::string error;
+    ASSERT_TRUE(wire.connect("local:logos_staged_fixture_" +
+        std::string(std::getenv("LOGOS_INSTANCE_ID")), std::chrono::seconds(1), &error)) << error;
+    EXPECT_TRUE(wire.acquire("staged_fixture__handshake", std::chrono::seconds(1), &error))
+        << error;
+    error.clear();
+    EXPECT_FALSE(wire.acquire("staged_fixture", std::chrono::milliseconds(100), &error));
+
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    error.clear();
+    EXPECT_TRUE(wire.acquire("staged_fixture", std::chrono::seconds(1), &error)) << error;
+
+    wire.close();
+    lp_provider_destroy(provider);
+}
+
+TEST(QtRemotePlainCabiTest, DeclaredReturnTypeDisambiguatesMapAndLogosResult)
+{
+    setInstanceId("qtro_cabi_result_contract_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("result_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+
+    logos::qt_remote_plain::Client wire;
+    std::string error;
+    ASSERT_TRUE(wire.connect("local:logos_result_fixture_" +
+        std::string(std::getenv("LOGOS_INSTANCE_ID")), std::chrono::seconds(1), &error)) << error;
+    auto call = [&](const char* method) {
+        return wire.call("result_fixture", "callRemoteMethod(QString,QString,QVariantList)",
+            {logos::qt_remote_plain::Variant::fromRpc(logos::plain::RpcValue{"secret"}),
+             logos::qt_remote_plain::Variant::fromRpc(logos::plain::RpcValue{method}),
+             logos::qt_remote_plain::Variant::fromRpc(logos::plain::RpcValue{logos::plain::RpcList{}})},
+            std::chrono::seconds(1), &error);
+    };
+    const auto map = call("mapCollision");
+    ASSERT_TRUE(map.has_value()) << error;
+    EXPECT_EQ(map->type, logos::qt_remote_plain::MetaType::VariantMap);
+    const auto result = call("resultCollision");
+    ASSERT_TRUE(result.has_value()) << error;
+    EXPECT_EQ(result->type, logos::qt_remote_plain::MetaType::User);
+    EXPECT_EQ(result->customType, "LogosResult");
+
+    wire.close();
     lp_provider_destroy(provider);
 }
 

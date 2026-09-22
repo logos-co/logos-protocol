@@ -5,6 +5,9 @@
 
 #include <QBuffer>
 #include <QDataStream>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QJsonValue>
 #include <QMetaMethod>
 #include <QVariant>
 
@@ -87,6 +90,137 @@ TEST(QtRemotePlainCompatTest, InvokePacketMatchesQt692ForCurrentValueProfile)
         stream << qint32(17) << qint32(-1);
     });
     EXPECT_EQ(invokePacket("chat_module", 0, 3, args, 17, -1), stdBytes(expected));
+}
+
+TEST(QtRemotePlainCompatTest, EveryQJsonValueAlternativeMatchesQt692)
+{
+    RpcList array;
+    array.items = {RpcValue{true}, RpcValue{42.5}, RpcValue{"x"}};
+    RpcMap object;
+    object.emplace("answer", RpcValue{std::int64_t{42}});
+
+    const std::vector<std::pair<QJsonValue, Variant>> cases{
+        {QJsonValue(QJsonValue::Undefined),
+         Variant{MetaType::JsonValue, false, RpcValue{}, {}, true}},
+        {QJsonValue(QJsonValue::Null),
+         Variant{MetaType::JsonValue, false, RpcValue{}}},
+        {QJsonValue(true),
+         Variant{MetaType::JsonValue, false, RpcValue{true}}},
+        {QJsonValue(42.5),
+         Variant{MetaType::JsonValue, false, RpcValue{42.5}}},
+        {QJsonValue(QStringLiteral("hello")),
+         Variant{MetaType::JsonValue, false, RpcValue{"hello"}}},
+        {QJsonValue(QJsonArray{true, 42.5, QStringLiteral("x")}),
+         Variant{MetaType::JsonValue, false, RpcValue{std::move(array)}}},
+        {QJsonValue(QJsonObject{{QStringLiteral("answer"), 42}}),
+         Variant{MetaType::JsonValue, false, RpcValue{std::move(object)}}},
+    };
+
+    for (const auto& [qtValue, plainValue] : cases) {
+        QByteArray qt;
+        QDataStream stream(&qt, QIODevice::WriteOnly);
+        stream.setVersion(QDataStream::Qt_6_2);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        stream << QVariant::fromValue(qtValue);
+
+        Writer writer;
+        writer.variant(plainValue);
+        EXPECT_EQ(writer.data(), stdBytes(qt));
+
+        const auto bytes = stdBytes(qt);
+        Reader reader(bytes);
+        EXPECT_EQ(reader.variant(), plainValue);
+        EXPECT_EQ(reader.remaining(), 0u);
+    }
+}
+
+TEST(QtRemotePlainCompatTest, QJsonValuesConsumeCompletePacketsAndNestedContainers)
+{
+    RpcList array;
+    array.items = {RpcValue{true}, RpcValue{42.5}, RpcValue{"x"}};
+    RpcMap objectValue;
+    objectValue.emplace("answer", RpcValue{std::int64_t{42}});
+    const std::vector<std::pair<QJsonValue, Variant>> cases{
+        {QJsonValue(QJsonValue::Undefined),
+         Variant{MetaType::JsonValue, false, RpcValue{}, {}, true}},
+        {QJsonValue(QJsonValue::Null),
+         Variant{MetaType::JsonValue, false, RpcValue{}}},
+        {QJsonValue(true), Variant{MetaType::JsonValue, false, RpcValue{true}}},
+        {QJsonValue(42.5), Variant{MetaType::JsonValue, false, RpcValue{42.5}}},
+        {QJsonValue(QStringLiteral("hello")),
+         Variant{MetaType::JsonValue, false, RpcValue{"hello"}}},
+        {QJsonValue(QJsonArray{true, 42.5, QStringLiteral("x")}),
+         Variant{MetaType::JsonValue, false, RpcValue{array}}},
+        {QJsonValue(QJsonObject{{QStringLiteral("answer"), 42}}),
+         Variant{MetaType::JsonValue, false, RpcValue{objectValue}}},
+    };
+    const QString object = QStringLiteral("fixture");
+
+    QVariantList qtList;
+    QVariantMap qtMap;
+    RpcList expectedList;
+    RpcMap expectedMap;
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const auto& [qtValue, plainValue] = cases[i];
+        const QVariant qtVariant = QVariant::fromValue(qtValue);
+
+        const auto expectedReply = qtPacket(7, &object, [&](QDataStream& stream) {
+            stream << qint32(17) << qtVariant;
+        });
+        EXPECT_EQ(invokeReplyPacket("fixture", 17, plainValue), stdBytes(expectedReply));
+
+        const auto expectedEvent = qtPacket(6, &object, [&](QDataStream& stream) {
+            stream << qint32(0) << qint32(0) << quint32(1) << qtVariant
+                   << qint32(-1) << qint32(-1);
+        });
+        EXPECT_EQ(invokePacket("fixture", 0, 0, {plainValue}), stdBytes(expectedEvent));
+
+        qtList.push_back(qtVariant);
+        qtMap.insert(QString::number(i), qtVariant);
+        expectedList.items.push_back(plainValue.value);
+        expectedMap.emplace(std::to_string(i), plainValue.value);
+    }
+
+    QByteArray encodedList;
+    QDataStream listStream(&encodedList, QIODevice::WriteOnly);
+    listStream.setVersion(QDataStream::Qt_6_2);
+    listStream.setByteOrder(QDataStream::LittleEndian);
+    listStream << QVariant{qtList};
+    const auto listBytes = stdBytes(encodedList);
+    Reader listReader(listBytes);
+    const Variant decodedList = listReader.variant();
+    EXPECT_EQ(decodedList.type, MetaType::VariantList);
+    EXPECT_EQ(decodedList.value, RpcValue{std::move(expectedList)});
+    EXPECT_EQ(listReader.remaining(), 0u);
+
+    QByteArray encodedMap;
+    QDataStream mapStream(&encodedMap, QIODevice::WriteOnly);
+    mapStream.setVersion(QDataStream::Qt_6_2);
+    mapStream.setByteOrder(QDataStream::LittleEndian);
+    mapStream << QVariant{qtMap};
+    const auto mapBytes = stdBytes(encodedMap);
+    Reader mapReader(mapBytes);
+    const Variant decodedMap = mapReader.variant();
+    EXPECT_EQ(decodedMap.type, MetaType::VariantMap);
+    EXPECT_EQ(decodedMap.value, RpcValue{std::move(expectedMap)});
+    EXPECT_EQ(mapReader.remaining(), 0u);
+
+    QByteArray encodedResult;
+    QDataStream resultStream(&encodedResult, QIODevice::WriteOnly);
+    resultStream.setVersion(QDataStream::Qt_6_2);
+    resultStream.setByteOrder(QDataStream::LittleEndian);
+    resultStream << quint32(static_cast<std::uint32_t>(MetaType::User)) << quint8(0)
+                 << QByteArray("LogosResult\0", 12) << true
+                 << QVariant::fromValue(QJsonValue(QStringLiteral("nested")))
+                 << QVariant::fromValue(QJsonValue(QJsonValue::Null));
+    const auto resultBytes = stdBytes(encodedResult);
+    Reader resultReader(resultBytes);
+    const Variant decodedResult = resultReader.variant();
+    EXPECT_EQ(decodedResult.type, MetaType::User);
+    EXPECT_EQ(decodedResult.customType, "LogosResult");
+    EXPECT_EQ(decodedResult.value.asMap().find("value")->asString(), "nested");
+    EXPECT_TRUE(decodedResult.value.asMap().find("error")->isNull());
+    EXPECT_EQ(resultReader.remaining(), 0u);
 }
 
 TEST(QtRemotePlainCompatTest, FixedModuleProxyDefinitionMatchesItsMetaObject)
