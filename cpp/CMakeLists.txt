@@ -93,6 +93,9 @@ set_target_properties(logos_qt_remote_plain_transport PROPERTIES POSITION_INDEPE
 add_library(logos_protocol_plain STATIC
     logos_protocol_plain.cpp
     logos_protocol.h
+    logos_transport_config_json.cpp
+    logos_transport_config_json.h
+    logos_transport_config.h
 )
 target_compile_features(logos_protocol_plain PUBLIC cxx_std_17)
 target_include_directories(logos_protocol_plain PUBLIC
@@ -107,6 +110,37 @@ target_link_libraries(logos_protocol_plain PUBLIC
 set_target_properties(logos_protocol_plain PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# Shared form of the same Qt-free runtime. Hosts and liblogos must use one
+# process-wide token registry; linking the static archive into both a parent
+# executable and liblogos would create two independent registries. The shared
+# target also provides an explicit PE export surface for Windows consumers.
+add_library(logos_protocol_plain_shared SHARED
+    logos_protocol_plain.cpp
+    logos_protocol.h
+    logos_transport_config_json.cpp
+    logos_transport_config_json.h
+    logos_transport_config.h
+)
+target_compile_features(logos_protocol_plain_shared PUBLIC cxx_std_17)
+target_include_directories(logos_protocol_plain_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(logos_protocol_plain_shared PUBLIC
+    logos_qt_remote_plain_transport
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+)
+target_compile_definitions(logos_protocol_plain_shared
+    PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
+set_target_properties(logos_protocol_plain_shared PROPERTIES
+    OUTPUT_NAME logos_protocol_plain
+    POSITION_INDEPENDENT_CODE ON
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 if(LOGOS_PROTOCOL_BUILD_QT)
@@ -391,6 +425,14 @@ install(TARGETS logos_socket_paths logos_qt_remote_plain_transport logos_protoco
     INCLUDES DESTINATION include
 )
 
+install(TARGETS logos_protocol_plain_shared
+    EXPORT logos-protocolTargets
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+    INCLUDES DESTINATION include
+)
+
 install(EXPORT logos-protocolTargets
     FILE logos-protocolTargets.cmake
     NAMESPACE logos-protocol::
@@ -405,7 +447,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.1.0
+    VERSION 0.11.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES

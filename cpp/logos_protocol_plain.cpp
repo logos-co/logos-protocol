@@ -525,6 +525,8 @@ struct lp_provider {
     lp_dispatch_cb dispatch = nullptr;
     lp_getmethods_cb getMethods = nullptr;
     lp_token_cb onToken = nullptr;
+    lp_validate_token_cb validateToken = nullptr;
+    void* validatorUserData = nullptr;
     void* userData = nullptr;
     std::mutex mutex;
     std::map<std::string, std::string> inbound;
@@ -537,12 +539,20 @@ namespace {
 std::string providerCaller(lp_provider* provider, const std::string& token)
 {
     if (token.empty()) return {};
-    std::lock_guard<std::mutex> lock(provider->mutex);
-    if (!provider->credential.empty() && provider->credential == token)
-        return R"({"kind":"host"})";
-    for (const auto& entry : provider->inbound)
-        if (entry.second == token)
-            return json{{"kind", "module"}, {"name", entry.first}}.dump();
+    lp_validate_token_cb validate = nullptr;
+    void* validatorData = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        if (!provider->credential.empty() && provider->credential == token)
+            return R"({"kind":"host"})";
+        for (const auto& entry : provider->inbound)
+            if (entry.second == token)
+                return json{{"kind", "module"}, {"name", entry.first}}.dump();
+        validate = provider->validateToken;
+        validatorData = provider->validatorUserData;
+    }
+    if (validate && validate(token.c_str(), "local", validatorData) == LP_OK)
+        return R"({"kind":"external"})";
     return {};
 }
 
@@ -772,7 +782,7 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
 lp_subscription* lp_subscribe(lp_client* client, const char* eventName,
                               lp_event_cb callback, void* userData)
 {
-    if (!client || !eventName || !*eventName || !callback
+    if (!client || !eventName || !callback
         || std::strcmp(eventName, kCompletionEvent) == 0) return nullptr;
     auto state = std::make_shared<SubscriptionState>();
     state->event = eventName;
@@ -1109,6 +1119,17 @@ int lp_provider_save_token(lp_provider* provider, const char* moduleName,
     if (std::strcmp(moduleName, "core") == 0
         || std::strcmp(moduleName, "capability_module") == 0)
         provider->credential = token;
+    return LP_OK;
+}
+
+int lp_provider_set_token_validator(lp_provider* provider,
+                                    lp_validate_token_cb validate,
+                                    void* userData)
+{
+    if (!provider) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->validateToken = validate;
+    provider->validatorUserData = userData;
     return LP_OK;
 }
 

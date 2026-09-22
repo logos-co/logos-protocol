@@ -447,7 +447,7 @@ lp_subscription* lp_subscribe(lp_client* client,
                               lp_event_cb cb,
                               void* user_data)
 {
-    if (!client || !client->client || !event_name || !*event_name || !cb)
+    if (!client || !client->client || !event_name || !cb)
         return nullptr;
 
     // Deliberately NOT requestObject() + onEvent().
@@ -988,6 +988,16 @@ int lp_provider_save_token(lp_provider* provider,
 {
     (void)module_name;
     (void)token;
+    if (!provider) return LP_ERR_INVALID_ARG;
+    return LP_ERR_UNSUPPORTED;
+}
+
+int lp_provider_set_token_validator(lp_provider* provider,
+                                    lp_validate_token_cb validate,
+                                    void* user_data)
+{
+    (void)validate;
+    (void)user_data;
     if (!provider) return LP_ERR_INVALID_ARG;
     return LP_ERR_UNSUPPORTED;
 }

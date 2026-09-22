@@ -273,9 +273,13 @@
 // module hosts. The existing qt_remote implementation remains unchanged and
 // shares the wire on Unix; Windows plain peers use named pipes on both sides.
 // Every existing C ABI symbol keeps its signature and behaviour.
-#define LOGOS_PROTOCOL_VERSION_MINOR 10
+// 0.11: a dynamically evaluated provider token validator for long-running
+// hosts whose accepted credentials live outside the protocol token registry.
+// Also makes the already-supported empty event name public at the C ABI as the
+// wildcard subscription used by logoscore's `watch <module>` command.
+#define LOGOS_PROTOCOL_VERSION_MINOR 11
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.10.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.11.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -529,7 +533,8 @@ LP_API int lp_invoke_async(lp_client* client,
  * inside its own init() can still be missed; if that event matters, expose a
  * method the subscriber can call after subscribing.
  *
- * Returns NULL only for a null/empty client, event name or callback.
+ * An empty event name subscribes to every non-reserved event on the target.
+ * Returns NULL only for a null client, event-name pointer, or callback.
  */
 LP_API lp_subscription* lp_subscribe(lp_client* client,
                               const char* event_name,
@@ -924,6 +929,15 @@ typedef char* (*lp_getmethods_cb)(void* user_data);
 typedef int (*lp_token_cb)(const char* module_name, const char* token,
                            void* user_data);
 
+/** Validate a credential not present in the provider's in-memory token map.
+ *  `transport_protocol` uses the public names "local", "tcp", or "tcp_ssl".
+ *  Return LP_OK to accept it. The callback may read persistent state and is
+ *  evaluated for every otherwise-unknown token, so revocation takes effect
+ *  without restarting the provider. */
+typedef int (*lp_validate_token_cb)(const char* token,
+                                    const char* transport_protocol,
+                                    void* user_data);
+
 /** Identity authenticated for the provider dispatch currently running on this
  *  thread, as the canonical caller JSON document. The pointer is borrowed and
  *  remains valid only until the dispatch callback returns. Outside a provider
@@ -945,6 +959,9 @@ LP_API int lp_provider_emit_event(lp_provider* provider,
 LP_API int lp_provider_save_token(lp_provider* provider,
                            const char* module_name,
                            const char* token);
+LP_API int lp_provider_set_token_validator(lp_provider* provider,
+                           lp_validate_token_cb validate,
+                           void* user_data);
 
 #ifdef __cplusplus
 }
