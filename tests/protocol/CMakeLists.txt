@@ -1,3 +1,4 @@
+if(LOGOS_PROTOCOL_BUILD_QT)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
 # ── which of these tests are detectors, and how that was checked ─────────────
@@ -466,6 +467,7 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+endif()
 
 # A genuinely Qt-free executable for the codec's bounds, frame and semantic
 # round trips. Keeping it separate prevents an accidental Qt include or link
@@ -503,6 +505,7 @@ gtest_discover_tests(qt_remote_plain_cabi_tests)
 #
 # Everything here links the same library and exercises the same code paths; only
 # main() differs. See test_main_noqt.cpp.
+if(LOGOS_PROTOCOL_BUILD_QT)
 add_executable(protocol_noqt_tests
     test_main_noqt.cpp
     # The async delivery hop, in a process with no Qt event loop. It read
@@ -537,3 +540,4 @@ target_link_libraries(protocol_noqt_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_noqt_tests)
+endif()
