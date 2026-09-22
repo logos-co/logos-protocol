@@ -163,7 +163,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E env sh
                 "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
                 "${_lpp_nm}" "${_lpp_def}"
-                "$<TARGET_FILE:logos_protocol_plain>" "*"
+                "$<TARGET_FILE:logos_protocol_plain>" "ALL"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
                 logos_protocol_plain
         COMMENT "Generating liblogos_protocol_plain export definition"
@@ -418,7 +418,7 @@ if(WIN32)
     endif()
 
     # Generated from the STATIC archive, which is built from the same sources.
-    # "*" means every member: ld chooses archive members for reasons unrelated to
+    # "ALL" means every member: ld chooses archive members for reasons unrelated to
     # our symbols, so a partial set is a downstream undefined reference.
     set(_lp_def "${CMAKE_CURRENT_BINARY_DIR}/logos_protocol_shared_exports.def")
     add_custom_command(
@@ -426,7 +426,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E env sh
                 "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
                 "${_lp_nm}" "${_lp_def}"
-                "$<TARGET_FILE:logos_protocol>" "*"
+                "$<TARGET_FILE:logos_protocol>" "ALL"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh" logos_protocol
         COMMENT "Generating liblogos_protocol export definition"
         VERBATIM
