@@ -10,7 +10,9 @@
 #include <mutex>
 #include <string>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -19,13 +21,16 @@ using namespace logos::qt_remote_plain;
 
 namespace {
 
-#ifndef _WIN32
-
 std::string transportSocketPath()
 {
     static std::atomic<unsigned> serial{0};
+#ifdef _WIN32
+    return "local:logos_qtro_transport_" + std::to_string(::_getpid())
+        + "_" + std::to_string(serial.fetch_add(1));
+#else
     return "/tmp/logos_qtro_transport_" + std::to_string(::getpid())
         + "_" + std::to_string(serial.fetch_add(1));
+#endif
 }
 
 TEST(QtRemotePlainTransportTest, PlainClientAndServerCallAndEmitWithoutQt)
@@ -85,20 +90,17 @@ TEST(QtRemotePlainTransportTest, PlainClientAndServerCallAndEmitWithoutQt)
 
 TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
 {
+#ifdef _WIN32
+    EXPECT_EQ(localSocketPath("local:logos_test"), R"(\\.\pipe\logos_test)");
+    EXPECT_EQ(localSocketPath(R"(local:\\.\pipe\logos_test)"),
+              R"(\\.\pipe\logos_test)");
+#else
     const char* temp = std::getenv("TMPDIR");
     std::string expected = temp && *temp ? temp : "/tmp";
     while (expected.size() > 1 && expected.back() == '/') expected.pop_back();
     EXPECT_EQ(localSocketPath("local:logos_test"), expected + "/logos_test");
     EXPECT_EQ(localSocketPath("local:/tmp/logos_test"), "/tmp/logos_test");
-}
-
-#else
-
-TEST(QtRemotePlainTransportTest, WindowsUsesJointlyRebuiltPlainTransport)
-{
-    GTEST_SKIP() << "Windows does not need Qt 6.9/6.11 QtRO wire compatibility";
-}
-
 #endif
+}
 
 } // namespace

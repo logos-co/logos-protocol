@@ -15,7 +15,9 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -105,12 +107,20 @@ bool sawStatus(StatusResult& result, int status, unsigned long long generation)
         != result.edges.end();
 }
 
+void setInstanceId(const std::string& prefix)
+{
+#ifdef _WIN32
+    const std::string instance = prefix + std::to_string(::_getpid());
+    ASSERT_EQ(::_putenv_s("LOGOS_INSTANCE_ID", instance.c_str()), 0);
+#else
+    const std::string instance = prefix + std::to_string(::getpid());
+    ASSERT_EQ(::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1), 0);
+#endif
+}
+
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
 {
-#ifndef _WIN32
-    const std::string instance = "qtro_cabi_" + std::to_string(::getpid());
-    ::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1);
-#endif
+    setInstanceId("qtro_cabi_");
     Fixture fixture;
     lp_provider* provider = lp_provider_create(
         "plain_fixture", R"([{"protocol":"qt_remote_plain"}])");
@@ -166,10 +176,7 @@ TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
 
 TEST(QtRemotePlainCabiTest, DeferredSubscriptionReconnectsAndManualPolicyHolds)
 {
-#ifndef _WIN32
-    const std::string instance = "qtro_cabi_restart_" + std::to_string(::getpid());
-    ::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1);
-#endif
+    setInstanceId("qtro_cabi_restart_");
     ASSERT_EQ(lp_token_save("restart_fixture", "secret"), LP_OK);
     lp_client* client = lp_client_create(
         "restart_fixture", "caller",
