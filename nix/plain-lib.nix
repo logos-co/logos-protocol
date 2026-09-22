@@ -7,8 +7,8 @@ pkgs.stdenv.mkDerivation {
 
   inherit src;
   nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
-  buildInputs = [ pkgs.nlohmann_json ];
-  propagatedBuildInputs = [ pkgs.nlohmann_json ];
+  buildInputs = [ pkgs.boost pkgs.openssl pkgs.nlohmann_json ];
+  propagatedBuildInputs = [ pkgs.boost pkgs.openssl pkgs.nlohmann_json ];
   inherit (common) meta;
 
   cmakeDir = "../cpp";

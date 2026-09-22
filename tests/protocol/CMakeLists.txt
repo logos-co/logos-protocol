@@ -504,6 +504,7 @@ add_executable(qt_remote_plain_cabi_tests
     # Windows builds where LOGOS_PROTOCOL_BUILD_QT is disabled.
     test_protocol_version.cpp
     test_qt_remote_plain_cabi.cpp
+    test_plain_network_cabi.cpp
 )
 target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
     logos_protocol_plain

@@ -24,19 +24,33 @@ endif()
 # REQUIRED hard-fails ("Could not find a package configuration file provided by
 # boost_system"). Ask for it optionally and fall back to Boost::headers, which
 # carries the same header-only error_code either way.
-if(LOGOS_PROTOCOL_BUILD_QT)
-    find_package(Boost REQUIRED)
-    find_package(Boost QUIET OPTIONAL_COMPONENTS system)
-    if(TARGET Boost::system)
-        set(LOGOS_BOOST_SYSTEM Boost::system)
-    else()
-        set(LOGOS_BOOST_SYSTEM Boost::headers)
-    endif()
-    message(STATUS "Boost.System target: ${LOGOS_BOOST_SYSTEM} (Boost ${Boost_VERSION})")
-    find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED)
+find_package(Boost QUIET OPTIONAL_COMPONENTS system)
+if(TARGET Boost::system)
+    set(LOGOS_BOOST_SYSTEM Boost::system)
+else()
+    set(LOGOS_BOOST_SYSTEM Boost::headers)
 endif()
+message(STATUS "Boost.System target: ${LOGOS_BOOST_SYSTEM} (Boost ${Boost_VERSION})")
+find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
+
+if(WIN32)
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
+else()
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
+endif()
+
+set(LOGOS_PLAIN_NETWORK_SOURCES
+    implementations/plain/rpc_message.cpp
+    implementations/plain/json_mapping.cpp
+    implementations/plain/json_codec.cpp
+    implementations/plain/cbor_codec.cpp
+    implementations/plain/rpc_framing.cpp
+    implementations/plain/rpc_server.cpp
+    implementations/plain/io_context_pool.cpp
+)
 
 add_library(logos_socket_paths STATIC
     logos_socket_paths.cpp
@@ -92,6 +106,9 @@ set_target_properties(logos_qt_remote_plain_transport PROPERTIES POSITION_INDEPE
 # logos_protocol and reach the same wire through the adapter below.
 add_library(logos_protocol_plain STATIC
     logos_protocol_plain.cpp
+    logos_protocol_plain_network.cpp
+    logos_protocol_plain_network.h
+    ${LOGOS_PLAIN_NETWORK_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
@@ -104,8 +121,13 @@ target_include_directories(logos_protocol_plain PUBLIC
 )
 target_link_libraries(logos_protocol_plain PUBLIC
     logos_qt_remote_plain_transport
+    Boost::headers
+    ${LOGOS_BOOST_SYSTEM}
+    OpenSSL::SSL
+    OpenSSL::Crypto
     nlohmann_json::nlohmann_json
     Threads::Threads
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
 set_target_properties(logos_protocol_plain PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -118,6 +140,9 @@ set_target_properties(logos_protocol_plain PROPERTIES
 # target also provides an explicit PE export surface for Windows consumers.
 add_library(logos_protocol_plain_shared SHARED
     logos_protocol_plain.cpp
+    logos_protocol_plain_network.cpp
+    logos_protocol_plain_network.h
+    ${LOGOS_PLAIN_NETWORK_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
@@ -130,8 +155,13 @@ target_include_directories(logos_protocol_plain_shared PUBLIC
 )
 target_link_libraries(logos_protocol_plain_shared PUBLIC
     logos_qt_remote_plain_transport
+    Boost::headers
+    ${LOGOS_BOOST_SYSTEM}
+    OpenSSL::SSL
+    OpenSSL::Crypto
     nlohmann_json::nlohmann_json
     Threads::Threads
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
 target_compile_definitions(logos_protocol_plain_shared
     PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
@@ -275,12 +305,6 @@ add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
 # "undefined reference to `AcceptEx'" out of
 # win_iocp_socket_service_base::start_accept_op. ws2_32 supplies core Winsock
 # and is listed explicitly rather than relied upon arriving via Qt::Network.
-if(WIN32)
-    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
-else()
-    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
-endif()
-
 target_link_libraries(logos_protocol PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects

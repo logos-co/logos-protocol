@@ -50,7 +50,7 @@
           plain-protocol = pkgs.symlinkJoin {
             name = "logos-protocol-plain";
             paths = [ plain-lib include ];
-            propagatedBuildInputs = [ pkgs.nlohmann_json ];
+            propagatedBuildInputs = [ pkgs.boost pkgs.openssl pkgs.nlohmann_json ];
           };
         in
         {
