@@ -97,7 +97,18 @@ TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
               R"(\\.\pipe\logos_test)");
 #else
     const char* temp = std::getenv("TMPDIR");
-    std::string expected = temp && *temp ? temp : "/tmp";
+    std::string expected = temp && *temp ? temp : "";
+#ifdef __APPLE__
+    if (expected.empty()) {
+        const std::size_t required = ::confstr(_CS_DARWIN_USER_TEMP_DIR, nullptr, 0);
+        if (required > 1) {
+            std::string buffer(required, '\0');
+            if (::confstr(_CS_DARWIN_USER_TEMP_DIR, buffer.data(), required) > 0)
+                expected = buffer.c_str();
+        }
+    }
+#endif
+    if (expected.empty()) expected = "/tmp";
     while (expected.size() > 1 && expected.back() == '/') expected.pop_back();
     EXPECT_EQ(localSocketPath("local:logos_test"), expected + "/logos_test");
     EXPECT_EQ(localSocketPath("local:/tmp/logos_test"), "/tmp/logos_test");

@@ -481,6 +481,20 @@ target_link_libraries(qt_remote_plain_regression_probe PRIVATE
 add_test(NAME QtRemotePlainRegression.adapter-shutdown
          COMMAND qt_remote_plain_regression_probe)
 set_tests_properties(QtRemotePlainRegression.adapter-shutdown PROPERTIES TIMEOUT 8)
+
+if(NOT WIN32)
+add_executable(qt_remote_plain_relative_path_probe
+    qt_remote_plain_relative_path_probe.cpp
+)
+target_link_libraries(qt_remote_plain_relative_path_probe PRIVATE
+    logos_qt_remote_plain_transport
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::Network
+)
+add_test(NAME QtRemotePlainRegression.relative-local-path
+         COMMAND qt_remote_plain_relative_path_probe)
+set_tests_properties(QtRemotePlainRegression.relative-local-path PROPERTIES TIMEOUT 5)
+endif()
 endif()
 
 # A genuinely Qt-free executable for the codec's bounds, frame and semantic

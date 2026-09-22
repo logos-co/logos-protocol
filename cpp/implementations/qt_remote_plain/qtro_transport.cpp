@@ -291,7 +291,24 @@ std::string localSocketPath(std::string_view localUrlOrPath)
 #else
     if (localUrlOrPath.front() == '/') return std::string(localUrlOrPath);
     const char* configured = std::getenv("TMPDIR");
-    std::string temp = configured && *configured ? configured : "/tmp";
+    std::string temp = configured && *configured ? configured : "";
+#ifdef __APPLE__
+    // QLocalServer uses QDir::tempPath() for relative names. On macOS that
+    // falls back to the per-user Darwin temp directory when TMPDIR is absent,
+    // not /tmp. A daemon launched by a service may have no TMPDIR even when an
+    // interactive shell does, so the two sides must make the same choice.
+    if (temp.empty()) {
+        const std::size_t required = ::confstr(_CS_DARWIN_USER_TEMP_DIR, nullptr, 0);
+        if (required > 1) {
+            std::string buffer(required, '\0');
+            if (::confstr(_CS_DARWIN_USER_TEMP_DIR, buffer.data(), required) > 0) {
+                buffer.resize(std::strlen(buffer.c_str()));
+                temp = std::move(buffer);
+            }
+        }
+    }
+#endif
+    if (temp.empty()) temp = "/tmp";
     while (temp.size() > 1 && temp.back() == '/') temp.pop_back();
     return temp + "/" + std::string(localUrlOrPath);
 #endif
