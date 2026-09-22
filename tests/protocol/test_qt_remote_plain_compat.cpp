@@ -1,4 +1,5 @@
 #include "implementations/qt_remote_plain/qtro_wire.h"
+#include "logos_types.h"
 #include "module_proxy.h"
 
 #include <gtest/gtest.h>
@@ -191,6 +192,9 @@ TEST(QtRemotePlainCompatTest, QJsonValuesConsumeCompletePacketsAndNestedContaine
     const Variant decodedList = listReader.variant();
     EXPECT_EQ(decodedList.type, MetaType::VariantList);
     EXPECT_EQ(decodedList.value, RpcValue{std::move(expectedList)});
+    ASSERT_EQ(decodedList.nestedValues.size(), cases.size());
+    for (std::size_t i = 0; i < cases.size(); ++i)
+        EXPECT_EQ(decodedList.nestedValues[i], cases[i].second);
     EXPECT_EQ(listReader.remaining(), 0u);
 
     QByteArray encodedMap;
@@ -203,6 +207,8 @@ TEST(QtRemotePlainCompatTest, QJsonValuesConsumeCompletePacketsAndNestedContaine
     const Variant decodedMap = mapReader.variant();
     EXPECT_EQ(decodedMap.type, MetaType::VariantMap);
     EXPECT_EQ(decodedMap.value, RpcValue{std::move(expectedMap)});
+    ASSERT_EQ(decodedMap.nestedValues.size(), cases.size());
+    EXPECT_EQ(decodedMap.nestedKeys.size(), decodedMap.nestedValues.size());
     EXPECT_EQ(mapReader.remaining(), 0u);
 
     QByteArray encodedResult;

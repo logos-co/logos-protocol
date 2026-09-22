@@ -68,6 +68,13 @@ struct Variant {
     // payload, but Qt gives them distinct wire tags (0x80 and 0). Preserve the
     // distinction so a decoded value can be emitted byte-for-byte.
     bool jsonUndefined = false;
+    // QVariant containers carry a complete QVariant for every child. RpcValue
+    // deliberately has no Qt metatype information, so keep the recursive wire
+    // variants alongside the language-neutral value. Maps use matching entries
+    // in nestedKeys/nestedValues; lists use nestedValues only. LogosResult keeps
+    // its value and error children in nestedValues.
+    std::vector<std::string> nestedKeys;
+    std::vector<Variant> nestedValues;
 
     static Variant fromRpc(plain::RpcValue value);
     static Variant logosResult(bool success, Variant value, Variant error);

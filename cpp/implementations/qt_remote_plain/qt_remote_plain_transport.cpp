@@ -18,6 +18,7 @@
 #include <QPointer>
 #include <QThread>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -72,9 +73,28 @@ Variant fromQVariant(const QVariant& value)
     case QMetaType::QString: out.type = MetaType::String; break;
     case QMetaType::QStringList: out.type = MetaType::StringList; break;
     case QMetaType::QByteArray: out.type = MetaType::ByteArray; break;
-    case QMetaType::QVariantList: out.type = MetaType::VariantList; break;
-    case QMetaType::QVariantMap: out.type = MetaType::VariantMap; break;
-    case QMetaType::QJsonValue: out.type = MetaType::JsonValue; break;
+    case QMetaType::QVariantList: {
+        out.type = MetaType::VariantList;
+        const QVariantList items = value.toList();
+        out.nestedValues.reserve(static_cast<std::size_t>(items.size()));
+        for (const QVariant& item : items) out.nestedValues.push_back(fromQVariant(item));
+        break;
+    }
+    case QMetaType::QVariantMap: {
+        out.type = MetaType::VariantMap;
+        const QVariantMap entries = value.toMap();
+        out.nestedKeys.reserve(static_cast<std::size_t>(entries.size()));
+        out.nestedValues.reserve(static_cast<std::size_t>(entries.size()));
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            out.nestedKeys.push_back(it.key().toStdString());
+            out.nestedValues.push_back(fromQVariant(it.value()));
+        }
+        break;
+    }
+    case QMetaType::QJsonValue:
+        out.type = MetaType::JsonValue;
+        out.jsonUndefined = value.toJsonValue().isUndefined();
+        break;
     case QMetaType::QJsonObject: out.type = MetaType::JsonObject; break;
     case QMetaType::QJsonArray: out.type = MetaType::JsonArray; break;
     case QMetaType::QJsonDocument: out.type = MetaType::JsonDocument; break;
@@ -128,10 +148,29 @@ QVariant toQVariant(const Variant& value)
             out.append(QString::fromStdString(child.asString()));
         return out;
     }
-    case MetaType::VariantList:
-    case MetaType::VariantMap:
+    case MetaType::VariantList: {
+        if (value.nestedValues.size() == value.value.asList().items.size()) {
+            QVariantList out;
+            out.reserve(static_cast<qsizetype>(value.nestedValues.size()));
+            for (const Variant& child : value.nestedValues) out.append(toQVariant(child));
+            return out;
+        }
         return plain::rpcValueToQVariant(value.value);
-    case MetaType::JsonValue: return QVariant::fromValue(rpcToJson(value.value));
+    }
+    case MetaType::VariantMap: {
+        if (value.nestedKeys.size() == value.nestedValues.size()
+            && value.nestedKeys.size() == value.value.asMap().entries.size()) {
+            QVariantMap out;
+            for (std::size_t i = 0; i < value.nestedKeys.size(); ++i)
+                out.insert(QString::fromStdString(value.nestedKeys[i]),
+                           toQVariant(value.nestedValues[i]));
+            return out;
+        }
+        return plain::rpcValueToQVariant(value.value);
+    }
+    case MetaType::JsonValue:
+        return QVariant::fromValue(value.jsonUndefined
+            ? QJsonValue(QJsonValue::Undefined) : rpcToJson(value.value));
     case MetaType::JsonObject: return QVariant::fromValue(rpcToJson(value.value).toObject());
     case MetaType::JsonArray: return QVariant::fromValue(rpcToJson(value.value).toArray());
     case MetaType::JsonDocument: {
@@ -147,7 +186,10 @@ QVariant toQVariant(const Variant& value)
             const RpcValue* error = map.find("error");
             if (success && result && error)
                 return QVariant::fromValue(LogosResult{success->asBool(),
-                    plain::rpcValueToQVariant(*result), plain::rpcValueToQVariant(*error)});
+                    value.nestedValues.size() == 2 ? toQVariant(value.nestedValues[0])
+                                                   : plain::rpcValueToQVariant(*result),
+                    value.nestedValues.size() == 2 ? toQVariant(value.nestedValues[1])
+                                                   : plain::rpcValueToQVariant(*error)});
         }
         return {};
     }
@@ -163,59 +205,127 @@ QVariantList toQVariantList(const std::vector<Variant>& values)
     return result;
 }
 
-template <typename Fn>
-auto onObjectThread(QObject* object, Fn&& fn) -> decltype(fn())
-{
-    using Result = decltype(fn());
-    Result result{};
-    if (!object) return result;
-    if (object->thread() == QThread::currentThread()) return fn();
-    const bool invoked = QMetaObject::invokeMethod(object, [&] { result = fn(); },
-                                                    Qt::BlockingQueuedConnection);
-    return invoked ? result : Result{};
-}
-
-Variant invokePublished(QObject* object, bool handshake,
-                        std::int32_t index, const std::vector<Variant>& args)
+Variant invokePublishedDirect(QObject* object, bool handshake,
+                              std::int32_t index, const std::vector<Variant>& args)
 {
     QPointer<QObject> guarded(object);
-    return onObjectThread(object, [guarded, handshake, index, args] {
-        if (!guarded) return Variant{};
-        const QVariantList qargs = toQVariantList(args);
-        if (handshake) {
-            auto* proxy = qobject_cast<ModuleHandshakeProxy*>(guarded.data());
-            if (!proxy || index != 0 || qargs.size() != 3) return Variant{};
-            return fromQVariant(proxy->informModuleToken(qargs[0].toString(),
-                                                         qargs[1].toString(),
-                                                         qargs[2].toString()));
-        }
-        auto* proxy = qobject_cast<ModuleProxy*>(guarded.data());
-        if (!proxy) return Variant{};
-        switch (index) {
-        case 0:
-        case 1:
-            if (qargs.size() < 2) return Variant{};
-            return fromQVariant(proxy->callRemoteMethod(
-                qargs[0].toString(), qargs[1].toString(),
-                qargs.size() >= 3 ? qargs[2].toList() : QVariantList{}));
-        case 2:
-            if (qargs.size() != 4) return Variant{};
-            return fromQVariant(proxy->callRemoteMethod(
-                qargs[0].toString(), qargs[1].toString(), qargs[2].toList(),
-                qargs[3].toString()));
-        case 3:
-            if (qargs.size() != 3) return Variant{};
-            return fromQVariant(proxy->informModuleToken(
-                qargs[0].toString(), qargs[1].toString(), qargs[2].toString()));
-        case 4: return fromQVariant(proxy->getPluginMethods());
-        case 5: return fromQVariant(proxy->getPluginEvents());
-        case 6: return fromQVariant(proxy->getPluginInterface());
-        default: return Variant{};
-        }
-    });
+    if (!guarded) return {};
+    const QVariantList qargs = toQVariantList(args);
+    if (handshake) {
+        auto* proxy = qobject_cast<ModuleHandshakeProxy*>(guarded.data());
+        if (!proxy || index != 0 || qargs.size() != 3) return {};
+        return fromQVariant(proxy->informModuleToken(qargs[0].toString(),
+                                                     qargs[1].toString(),
+                                                     qargs[2].toString()));
+    }
+    auto* proxy = qobject_cast<ModuleProxy*>(guarded.data());
+    if (!proxy) return {};
+    switch (index) {
+    case 0:
+    case 1:
+        if (qargs.size() < 2) return {};
+        return fromQVariant(proxy->callRemoteMethod(
+            qargs[0].toString(), qargs[1].toString(),
+            qargs.size() >= 3 ? qargs[2].toList() : QVariantList{}));
+    case 2:
+        if (qargs.size() != 4) return {};
+        return fromQVariant(proxy->callRemoteMethod(
+            qargs[0].toString(), qargs[1].toString(), qargs[2].toList(),
+            qargs[3].toString()));
+    case 3:
+        if (qargs.size() != 3) return {};
+        return fromQVariant(proxy->informModuleToken(
+            qargs[0].toString(), qargs[1].toString(), qargs[2].toString()));
+    case 4: return fromQVariant(proxy->getPluginMethods());
+    case 5: return fromQVariant(proxy->getPluginEvents());
+    case 6: return fromQVariant(proxy->getPluginInterface());
+    default: return {};
+    }
 }
 
+class QtInvokeDispatcher {
+    struct Pending {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool done = false;
+        bool canceled = false;
+        Variant result;
+    };
+
+public:
+    Variant invoke(QObject* object, bool handshake, std::int32_t index,
+                   const std::vector<Variant>& args)
+    {
+        if (!object) return {};
+        if (object->thread() == QThread::currentThread())
+            return invokePublishedDirect(object, handshake, index, args);
+
+        auto pending = std::make_shared<Pending>();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_active) return {};
+            m_pending.push_back(pending);
+        }
+        const QPointer<QObject> guarded(object);
+        const bool queued = QMetaObject::invokeMethod(object,
+            [guarded, pending, handshake, index, args] {
+                std::unique_lock<std::mutex> lock(pending->mutex);
+                if (!pending->canceled)
+                    pending->result = invokePublishedDirect(
+                        guarded.data(), handshake, index, args);
+                pending->done = true;
+                lock.unlock();
+                pending->changed.notify_all();
+            }, Qt::QueuedConnection);
+        if (!queued) {
+            std::lock_guard<std::mutex> lock(pending->mutex);
+            pending->canceled = true;
+            pending->done = true;
+            pending->changed.notify_all();
+        }
+
+        std::unique_lock<std::mutex> lock(pending->mutex);
+        pending->changed.wait(lock, [&] { return pending->done || pending->canceled; });
+        const bool canceled = pending->canceled;
+        Variant result = std::move(pending->result);
+        lock.unlock();
+        reap();
+        return canceled ? Variant{} : result;
+    }
+
+    void cancel()
+    {
+        std::vector<std::shared_ptr<Pending>> pending;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_active = false;
+            for (auto& weak : m_pending)
+                if (auto call = weak.lock()) pending.push_back(std::move(call));
+            m_pending.clear();
+        }
+        for (const auto& call : pending) {
+            std::unique_lock<std::mutex> lock(call->mutex);
+            call->canceled = true;
+            lock.unlock();
+            call->changed.notify_all();
+        }
+    }
+
+private:
+    void reap()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_pending.erase(std::remove_if(m_pending.begin(), m_pending.end(),
+            [](const auto& weak) { return weak.expired(); }), m_pending.end());
+    }
+
+    std::mutex m_mutex;
+    bool m_active = true;
+    std::vector<std::weak_ptr<Pending>> m_pending;
+};
+
 struct HandleState {
+    std::recursive_mutex callbackMutex;
     std::mutex mutex;
     std::condition_variable completionChanged;
     std::map<QString, std::vector<LogosObject::EventCallback>> callbacks;
@@ -235,6 +345,9 @@ QtRemotePlainTransportHost::QtRemotePlainTransportHost(const QString& url)
 QtRemotePlainTransportHost::~QtRemotePlainTransportHost()
 {
     for (const auto& entry : m_eventConnections) QObject::disconnect(entry.second);
+    for (const auto& entry : m_destroyConnections) QObject::disconnect(entry.second);
+    for (const auto& entry : m_cancelInvocations) entry.second();
+    m_server.stop();
 }
 
 bool QtRemotePlainTransportHost::publishObject(const QString& name, QObject* object)
@@ -243,30 +356,28 @@ bool QtRemotePlainTransportHost::publishObject(const QString& name, QObject* obj
     const bool handshake = qobject_cast<ModuleHandshakeProxy*>(object) != nullptr;
     if (!handshake && !qobject_cast<ModuleProxy*>(object)) return false;
     const std::string key = name.toStdString();
+    auto dispatcher = std::make_shared<QtInvokeDispatcher>();
     Server::Object published{
         key,
         handshake ? moduleHandshakeProxyDefinition() : moduleProxyDefinition(),
-        [guarded = QPointer<QObject>(object), handshake](std::int32_t index,
-                                                        const std::vector<Variant>& args) {
-            return invokePublished(guarded.data(), handshake, index, args);
+        [guarded = QPointer<QObject>(object), handshake, dispatcher](
+            std::int32_t index, const std::vector<Variant>& args) {
+            return dispatcher->invoke(guarded.data(), handshake, index, args);
         }};
     std::string error;
     if (!m_server.publish(std::move(published), &error)) {
         qWarning() << "QtRemotePlainTransportHost: publish failed:" << error.c_str();
         return false;
     }
+    m_cancelInvocations[key] = [dispatcher] { dispatcher->cancel(); };
+    m_destroyConnections[key] = QObject::connect(
+        object, &QObject::destroyed, [dispatcher] { dispatcher->cancel(); });
     if (!handshake) {
         auto* proxy = qobject_cast<ModuleProxy*>(object);
         m_eventConnections[key] = QObject::connect(
             proxy, &ModuleProxy::eventResponse, proxy,
             [this, key](const QString& eventName, const QVariantList& data) {
-                std::vector<Variant> wireData;
-                wireData.reserve(static_cast<std::size_t>(data.size()));
-                for (const QVariant& item : data) wireData.push_back(fromQVariant(item));
-                Variant list;
-                list.type = MetaType::VariantList;
-                list.isNull = false;
-                list.value = plain::qvariantToRpcValue(data);
+                Variant list = fromQVariant(data);
                 std::string error;
                 (void)m_server.emitSignal(key, 0,
                     {fromQVariant(eventName), std::move(list)}, &error);
@@ -278,6 +389,14 @@ bool QtRemotePlainTransportHost::publishObject(const QString& name, QObject* obj
 void QtRemotePlainTransportHost::unpublishObject(const QString& name)
 {
     const std::string key = name.toStdString();
+    if (auto it = m_cancelInvocations.find(key); it != m_cancelInvocations.end()) {
+        it->second();
+        m_cancelInvocations.erase(it);
+    }
+    if (auto it = m_destroyConnections.find(key); it != m_destroyConnections.end()) {
+        QObject::disconnect(it->second);
+        m_destroyConnections.erase(it);
+    }
     if (auto it = m_eventConnections.find(key); it != m_eventConnections.end()) {
         QObject::disconnect(it->second);
         m_eventConnections.erase(it);
@@ -363,12 +482,19 @@ public:
             logos::CallError error;
             QVariant value = temporary.callMethodWithError(
                 authToken, methodName, args, timeoutMs, &error);
-            bool active = false;
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                active = state->active;
-            }
-            if (active && callback) callback(std::move(value), error);
+            auto deliver = [state, callback = std::move(callback),
+                            value = std::move(value), error = std::move(error)]() mutable {
+                std::lock_guard<std::recursive_mutex> callbackLock(state->callbackMutex);
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (!state->active) return;
+                }
+                if (callback) callback(std::move(value), error);
+            };
+            if (QCoreApplication* app = QCoreApplication::instance())
+                QMetaObject::invokeMethod(app, std::move(deliver), Qt::QueuedConnection);
+            else
+                deliver();
         }).detach();
     }
 
@@ -408,6 +534,7 @@ public:
 
     void release() override
     {
+        std::lock_guard<std::recursive_mutex> callbackLock(m_state->callbackMutex);
         {
             std::lock_guard<std::mutex> lock(m_state->mutex);
             m_state->active = false;
@@ -432,6 +559,32 @@ QtRemotePlainTransportConnection::QtRemotePlainTransportConnection(const QString
     : m_shared(std::make_shared<Shared>()), m_url(url.toStdString())
 {
     std::weak_ptr<Shared> weak = m_shared;
+    m_shared->client->setInternalEventHandler(
+        [weak](const std::string& object, std::int32_t signal,
+               const std::vector<Variant>& arguments) {
+            auto shared = weak.lock();
+            if (!shared || signal != 0 || arguments.size() != 2) return false;
+            const QString eventName = toQVariant(arguments[0]).toString();
+            if (!logos::isReservedEventName(eventName)) return false;
+            const QVariantList data = toQVariant(arguments[1]).toList();
+            if (data.size() != 2) return true;
+            std::vector<std::shared_ptr<HandleState>> states;
+            {
+                std::lock_guard<std::mutex> lock(shared->mutex);
+                auto& entries = shared->handles[object];
+                for (auto it = entries.begin(); it != entries.end();) {
+                    if (auto state = it->lock()) { states.push_back(std::move(state)); ++it; }
+                    else it = entries.erase(it);
+                }
+            }
+            for (const auto& state : states) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->active) continue;
+                state->completions[data[0].toString()] = data[1];
+                state->completionChanged.notify_all();
+            }
+            return true;
+        });
     m_shared->client->setEventHandler(
         [weak](const std::string& object, std::int32_t signal,
                std::vector<Variant> arguments) {
@@ -453,11 +606,6 @@ QtRemotePlainTransportConnection::QtRemotePlainTransportConnection(const QString
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     if (!state->active) continue;
-                    if (logos::isReservedEventName(eventName) && data.size() == 2) {
-                        state->completions[data[0].toString()] = data[1];
-                        state->completionChanged.notify_all();
-                        continue;
-                    }
                     callbacks = state->callbacks[eventName];
                     const auto wildcard = state->callbacks[QString{}];
                     callbacks.insert(callbacks.end(), wildcard.begin(), wildcard.end());

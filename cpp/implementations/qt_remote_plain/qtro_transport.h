@@ -61,6 +61,7 @@ public:
     void setDisconnectHandler(DisconnectHandler handler);
 
 private:
+    void closeConnection(bool waitForCallbacks);
     struct Impl;
     std::shared_ptr<Impl> m_impl;
 };

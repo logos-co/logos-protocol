@@ -7,6 +7,7 @@
 #include <QMetaObject>
 #include <QString>
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +30,8 @@ public:
 private:
     Server m_server;
     std::unordered_map<std::string, QMetaObject::Connection> m_eventConnections;
+    std::unordered_map<std::string, QMetaObject::Connection> m_destroyConnections;
+    std::unordered_map<std::string, std::function<void()>> m_cancelInvocations;
 };
 
 class QtRemotePlainTransportConnection final : public LogosTransportConnection {

@@ -5,6 +5,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <type_traits>
+#include <unordered_map>
 
 namespace logos::qt_remote_plain {
 namespace {
@@ -211,8 +212,21 @@ Variant Variant::fromRpc(plain::RpcValue input)
     else if (input.isDouble()) out.type = MetaType::Double;
     else if (input.isString()) out.type = MetaType::String;
     else if (input.isBytes()) out.type = MetaType::ByteArray;
-    else if (input.isList()) out.type = MetaType::VariantList;
-    else if (input.isMap()) out.type = MetaType::VariantMap;
+    else if (input.isList()) {
+        out.type = MetaType::VariantList;
+        out.nestedValues.reserve(input.asList().items.size());
+        for (const auto& child : input.asList().items)
+            out.nestedValues.push_back(fromRpc(child));
+    }
+    else if (input.isMap()) {
+        out.type = MetaType::VariantMap;
+        out.nestedKeys.reserve(input.asMap().entries.size());
+        out.nestedValues.reserve(input.asMap().entries.size());
+        for (const auto& entry : input.asMap().entries) {
+            out.nestedKeys.push_back(entry.first);
+            out.nestedValues.push_back(fromRpc(entry.second));
+        }
+    }
     out.value = std::move(input);
     return out;
 }
@@ -221,16 +235,21 @@ Variant Variant::logosResult(bool success, Variant resultValue, Variant resultEr
 {
     plain::RpcMap map;
     map.emplace("success", plain::RpcValue{success});
-    map.emplace("value", std::move(resultValue.value));
-    map.emplace("error", std::move(resultError.value));
-    return Variant{MetaType::User, false, plain::RpcValue{std::move(map)}, "LogosResult"};
+    map.emplace("value", resultValue.value);
+    map.emplace("error", resultError.value);
+    Variant out{MetaType::User, false, plain::RpcValue{std::move(map)}, "LogosResult"};
+    out.nestedValues.push_back(std::move(resultValue));
+    out.nestedValues.push_back(std::move(resultError));
+    return out;
 }
 
 bool Variant::operator==(const Variant& other) const
 {
     return type == other.type && isNull == other.isNull
         && value == other.value && customType == other.customType
-        && jsonUndefined == other.jsonUndefined;
+        && jsonUndefined == other.jsonUndefined
+        && nestedKeys == other.nestedKeys
+        && nestedValues == other.nestedValues;
 }
 
 void Writer::u8(std::uint8_t value) { m_data.push_back(value); }
@@ -348,8 +367,9 @@ void Writer::variant(const Variant& input)
         if (list.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantList is too large");
         u32(static_cast<std::uint32_t>(list.size()));
-        for (const auto& value : list)
-            variant(Variant::fromRpc(value));
+        const bool typed = input.nestedValues.size() == list.size();
+        for (std::size_t i = 0; i < list.size(); ++i)
+            variant(typed ? input.nestedValues[i] : Variant::fromRpc(list[i]));
         return;
     }
     case MetaType::VariantMap: {
@@ -357,10 +377,23 @@ void Writer::variant(const Variant& input)
         if (entries.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantMap is too large");
         u32(static_cast<std::uint32_t>(entries.size()));
+        const bool typed = input.nestedKeys.size() == input.nestedValues.size()
+            && input.nestedKeys.size() == entries.size();
+        std::unordered_map<std::string, const Variant*> typedValues;
+        if (typed) {
+            typedValues.reserve(input.nestedKeys.size());
+            for (std::size_t i = 0; i < input.nestedKeys.size(); ++i)
+                typedValues.emplace(input.nestedKeys[i], &input.nestedValues[i]);
+        }
         for (const auto& [unused, entry] : entries) {
             (void)unused;
             string(entry->first);
-            variant(Variant::fromRpc(entry->second));
+            const Variant* child = nullptr;
+            if (typed) {
+                const auto it = typedValues.find(entry->first);
+                if (it != typedValues.end()) child = it->second;
+            }
+            variant(child ? *child : Variant::fromRpc(entry->second));
         }
         return;
     }
@@ -399,8 +432,11 @@ void Writer::variant(const Variant& input)
             throw CodecError("unsupported QVariant custom type: " + input.customType);
         const auto& map = input.value.asMap();
         boolean(requiredMapValue(map, "success").asBool());
-        variant(Variant::fromRpc(requiredMapValue(map, "value")));
-        variant(Variant::fromRpc(requiredMapValue(map, "error")));
+        const bool typed = input.nestedValues.size() == 2;
+        variant(typed ? input.nestedValues[0]
+                      : Variant::fromRpc(requiredMapValue(map, "value")));
+        variant(typed ? input.nestedValues[1]
+                      : Variant::fromRpc(requiredMapValue(map, "error")));
         return;
     }
     }
@@ -620,8 +656,12 @@ Variant Reader::variant()
             throw CodecError("QVariantList exceeds transport limit");
         plain::RpcList list;
         list.items.reserve(count);
-        for (std::uint32_t i = 0; i < count; ++i)
-            list.items.push_back(variant().value);
+        result.nestedValues.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            Variant child = variant();
+            list.items.push_back(child.value);
+            result.nestedValues.push_back(std::move(child));
+        }
         result.value = plain::RpcValue{std::move(list)};
         break;
     }
@@ -637,8 +677,10 @@ Variant Reader::variant()
             // consume the QVariant bytes while the reader still points at the
             // QString key.
             auto key = string().value_or(std::string{});
-            auto value = variant().value;
-            map.emplace(std::move(key), std::move(value));
+            Variant child = variant();
+            map.emplace(key, child.value);
+            result.nestedKeys.push_back(std::move(key));
+            result.nestedValues.push_back(std::move(child));
         }
         result.value = plain::RpcValue{std::move(map)};
         break;
@@ -669,8 +711,12 @@ Variant Reader::variant()
             throw CodecError("unsupported QVariant custom type: " + result.customType);
         plain::RpcMap map;
         map.emplace("success", plain::RpcValue{boolean()});
-        map.emplace("value", variant().value);
-        map.emplace("error", variant().value);
+        Variant value = variant();
+        Variant error = variant();
+        map.emplace("value", value.value);
+        map.emplace("error", error.value);
+        result.nestedValues.push_back(std::move(value));
+        result.nestedValues.push_back(std::move(error));
         result.value = plain::RpcValue{std::move(map)};
         break;
     }
