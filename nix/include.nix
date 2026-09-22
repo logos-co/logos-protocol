@@ -21,6 +21,7 @@ pkgs.stdenv.mkDerivation {
 
     mkdir -p $out/include/cpp/implementations/qt_local
     mkdir -p $out/include/cpp/implementations/qt_remote
+    mkdir -p $out/include/cpp/implementations/qt_remote_plain
     mkdir -p $out/include/cpp/implementations/mock
     mkdir -p $out/include/cpp/implementations/plain
 
@@ -29,7 +30,7 @@ pkgs.stdenv.mkDerivation {
       cp "$file" $out/include/cpp/
     done
 
-    for dir in qt_local qt_remote mock plain; do
+    for dir in qt_local qt_remote qt_remote_plain mock plain; do
       for file in cpp/implementations/$dir/*; do
         cp "$file" $out/include/cpp/implementations/$dir/
       done

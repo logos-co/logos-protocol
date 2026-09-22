@@ -12,6 +12,7 @@ const char* protocolToString(LogosProtocol p)
 {
     switch (p) {
     case LogosProtocol::LocalSocket: return "local";
+    case LogosProtocol::QtRemotePlain: return "qt_remote_plain";
     case LogosProtocol::Tcp:         return "tcp";
     case LogosProtocol::TcpSsl:      return "tcp_ssl";
     }
@@ -20,6 +21,7 @@ const char* protocolToString(LogosProtocol p)
 
 LogosProtocol protocolFromString(const std::string& s)
 {
+    if (s == "qt_remote_plain") return LogosProtocol::QtRemotePlain;
     if (s == "tcp")     return LogosProtocol::Tcp;
     if (s == "tcp_ssl") return LogosProtocol::TcpSsl;
     return LogosProtocol::LocalSocket;
@@ -48,7 +50,7 @@ std::string transportSetToJsonString(const LogosTransportSet& set)
     for (const auto& cfg : set) {
         json o;
         o["protocol"] = protocolToString(cfg.protocol);
-        if (cfg.protocol != LogosProtocol::LocalSocket) {
+        if (cfg.protocol == LogosProtocol::Tcp || cfg.protocol == LogosProtocol::TcpSsl) {
             o["host"]  = cfg.host;
             o["port"]  = cfg.port;
             o["codec"] = codecToString(cfg.codec);

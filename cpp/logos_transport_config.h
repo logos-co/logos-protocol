@@ -16,6 +16,7 @@
 
 enum class LogosProtocol {
     LocalSocket,   // QLocalSocket via QRemoteObjects (existing code path)
+    QtRemotePlain, // QtRO 2.0-compatible local IPC implemented without Qt
     Tcp,           // Plain TCP (Boost.Asio + JSON framing)
     TcpSsl,        // TCP + TLS (Boost.Asio + OpenSSL + JSON framing)
     // Noise, Quic — future work
@@ -46,8 +47,8 @@ struct LogosTransportConfig {
     bool verifyPeer = true;
 
     // Wire-format codec used for RPC framing on this transport. Only
-    // meaningful for plain-C++ transports (Tcp / TcpSsl); LocalSocket
-    // ignores it and uses QRemoteObjects' own wire format.
+    // meaningful for JSON-RPC transports (Tcp / TcpSsl); LocalSocket and
+    // QtRemotePlain use the QtRO wire profile.
     LogosWireCodec codec = LogosWireCodec::Json;
 };
 
