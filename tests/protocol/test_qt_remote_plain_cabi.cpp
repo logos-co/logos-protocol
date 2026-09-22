@@ -1,4 +1,5 @@
 #include "logos_protocol.h"
+#include "logos_codec.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,12 +54,14 @@ char* dispatch(const char* method, const char* argsJson, void*)
     const auto args = nlohmann::json::parse(argsJson);
     if (std::strcmp(method, "echo") == 0)
         return copyString(nlohmann::json("plain:" + args.at(0).get<std::string>()).dump());
+    if (std::strcmp(method, "echoBytes") == 0)
+        return copyString(args.at(0).dump());
     return copyString("null");
 }
 
 char* methods(void*)
 {
-    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]}])json");
+    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]},{"type":"method","name":"echoBytes","signature":"echoBytes(QByteArray)","returnType":"QByteArray","isInvokable":true,"parameters":[]}])json");
 }
 
 int token(const char* module, const char* value, void* userData)
@@ -154,6 +158,19 @@ TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
         << (error ? error : "");
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(nlohmann::json::parse(result), "plain:hello");
+    lp_string_free(result);
+    lp_string_free(error);
+
+    std::vector<std::uint8_t> allBytes(256);
+    std::iota(allBytes.begin(), allBytes.end(), std::uint8_t{0});
+    const auto taggedBytes = logos::bytesToJson(allBytes);
+    const auto bytesArgs = nlohmann::json::array({taggedBytes}).dump();
+    result = nullptr;
+    error = nullptr;
+    ASSERT_EQ(lp_invoke(client, "echoBytes", bytesArgs.c_str(), 1000, &result, &error), LP_OK)
+        << (error ? error : "");
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(nlohmann::json::parse(result), taggedBytes);
     lp_string_free(result);
     lp_string_free(error);
 
