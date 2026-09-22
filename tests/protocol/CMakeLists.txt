@@ -485,6 +485,10 @@ gtest_discover_tests(qt_remote_plain_wire_tests)
 # Public C ABI linked to the production Qt-free runtime.  Keep this in its own
 # executable so any accidental Qt dependency is visible in the link closure.
 add_executable(qt_remote_plain_cabi_tests
+    # Run the version and allocator-ownership C ABI checks against the plain
+    # implementation too. This executable is the one available in native
+    # Windows builds where LOGOS_PROTOCOL_BUILD_QT is disabled.
+    test_protocol_version.cpp
     test_qt_remote_plain_cabi.cpp
 )
 target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
