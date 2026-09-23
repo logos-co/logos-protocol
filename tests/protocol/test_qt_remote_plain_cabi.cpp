@@ -582,6 +582,51 @@ TEST(QtRemotePlainCabiTest, AProviderLimitedToOneCallRunsEveryCallOnOneThread)
     EXPECT_EQ(fixture.threads.size(), 1u);
 }
 
+struct AsyncThreads {
+    std::mutex mutex;
+    std::set<std::thread::id> callbackThreads;
+    std::atomic<int> done{0};
+    std::atomic<int> succeeded{0};
+};
+
+void onCountedResult(int success, const char*, void* userData)
+{
+    auto& threads = *static_cast<AsyncThreads*>(userData);
+    {
+        std::lock_guard<std::mutex> lock(threads.mutex);
+        threads.callbackThreads.insert(std::this_thread::get_id());
+    }
+    if (success) ++threads.succeeded;
+    ++threads.done;
+}
+
+// Detector: every lp_invoke_async call started a thread of its own.
+TEST(QtRemotePlainCabiTest, AsyncCallsShareABoundedSetOfThreads)
+{
+    setInstanceId("qtro_cabi_async_pool_");
+    AffinityFixture fixture;
+    lp_provider* provider = lp_provider_create("async_pool_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, affinityDispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("async_pool_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("async_pool_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    AsyncThreads threads;
+    constexpr int kCalls = 200;
+    for (int i = 0; i < kCalls; ++i)
+        ASSERT_EQ(lp_invoke_async(client, "work", "[]", 10000, onCountedResult, &threads), LP_OK);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (threads.done.load() < kCalls && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+
+    EXPECT_EQ(threads.succeeded.load(), kCalls);
+    EXPECT_LE(threads.callbackThreads.size(), 16u);
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");

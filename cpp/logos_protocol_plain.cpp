@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -314,7 +315,37 @@ struct ClientState {
     bool workerStop = false;
     std::thread subscriptionWorker;
     std::thread eventWorker;
+    // lp_invoke_async calls start in order on a few threads that exit when idle.
+    std::mutex asyncMutex;
+    std::condition_variable asyncChanged;
+    std::deque<std::function<void()>> asyncCalls;
+    std::size_t asyncWorkers = 0;
+    std::size_t asyncIdle = 0;
+    bool asyncStop = false;
 };
+
+constexpr std::size_t kMaxAsyncWorkers = 16;
+constexpr std::chrono::seconds kAsyncWorkerIdle{5};
+
+void asyncWorkerLoop(const std::shared_ptr<ClientState>& state)
+{
+    std::unique_lock<std::mutex> lock(state->asyncMutex);
+    for (;;) {
+        ++state->asyncIdle;
+        state->asyncChanged.wait_for(lock, kAsyncWorkerIdle, [&] {
+            return state->asyncStop || !state->asyncCalls.empty();
+        });
+        --state->asyncIdle;
+        if (state->asyncStop || state->asyncCalls.empty()) break;
+        std::function<void()> call = std::move(state->asyncCalls.front());
+        state->asyncCalls.pop_front();
+        lock.unlock();
+        call();
+        call = nullptr;
+        lock.lock();
+    }
+    --state->asyncWorkers;
+}
 
 // Destruction from a user callback cannot join workers that might be waiting
 // to acquire callbackMutex. The workers retain ClientState until they exit.
@@ -1205,6 +1236,13 @@ void lp_client_destroy(lp_client* client)
         std::lock_guard<std::mutex> lock(client->state->mutex);
         client->state->workerStop = true;
     }
+    {
+        // Calls that have not started never will; running ones finish unseen.
+        std::lock_guard<std::mutex> lock(client->state->asyncMutex);
+        client->state->asyncStop = true;
+        client->state->asyncCalls.clear();
+    }
+    client->state->asyncChanged.notify_all();
     client->state->completionChanged.notify_all();
     client->state->subscriptionChanged.notify_all();
     client->state->eventsChanged.notify_all();
@@ -1267,7 +1305,7 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
     if (args.is_discarded() || !args.is_array()) return LP_ERR_INVALID_ARG;
     auto state = client->state;
     const std::string methodName = method;
-    std::thread([state, methodName, args, timeout, callback, userData] {
+    std::function<void()> call = [state, methodName, args, timeout, callback, userData] {
         std::string error;
         auto result = invoke(state, methodName, args, timeoutMs(timeout), error);
         std::lock_guard<std::recursive_mutex> lock(state->callbackMutex);
@@ -1278,7 +1316,25 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
                         error, state->target);
         CallbackScope scope(state.get());
         callback(result ? 1 : 0, text.c_str(), userData);
-    }).detach();
+    };
+    {
+        std::lock_guard<std::mutex> lock(state->asyncMutex);
+        if (state->asyncStop) return LP_ERR_INVALID_ARG;
+        state->asyncCalls.push_back(std::move(call));
+        if (state->asyncIdle < state->asyncCalls.size()
+            && state->asyncWorkers < kMaxAsyncWorkers) {
+            try {
+                std::thread([state] { asyncWorkerLoop(state); }).detach();
+                ++state->asyncWorkers;
+            } catch (...) {
+                if (state->asyncWorkers == 0) {
+                    state->asyncCalls.pop_back();
+                    return LP_ERR_INTERNAL;
+                }
+            }
+        }
+    }
+    state->asyncChanged.notify_one();
     return LP_OK;
 }
 
