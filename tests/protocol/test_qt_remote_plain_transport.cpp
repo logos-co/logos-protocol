@@ -140,6 +140,36 @@ TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
     EXPECT_FALSE(error.empty());
 }
 
+// Detector: a call that looked its object up after a RemoveObject raced it
+// threw std::out_of_range, which the C ABI turned into a terminate.
+TEST(QtRemotePlainTransportTest, ACallRacingAnUnpublishFailsInsteadOfThrowing)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+
+    std::atomic<bool> churning{true};
+    std::thread churn([&] {
+        while (churning) {
+            server.unpublish("fixture");
+            (void)server.publish(echoFixture());
+        }
+    });
+    for (int i = 0; i < 500; ++i) {
+        std::string callError;
+        EXPECT_NO_THROW((void)client.call("fixture", "echo(QString)",
+            {Variant::fromRpc(RpcValue{"x"})}, std::chrono::milliseconds(200), &callError));
+    }
+    churning = false;
+    churn.join();
+    client.close();
+    server.stop();
+}
+
 TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
 {
 #ifdef _WIN32
