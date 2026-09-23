@@ -89,6 +89,57 @@ TEST(QtRemotePlainTransportTest, PlainClientAndServerCallAndEmitWithoutQt)
     server.stop();
 }
 
+Server::Object echoFixture()
+{
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {"Fixture", {}, {{"echo(QString)", "QString", {"value"}}}, {}};
+    object.invoke = [](std::int32_t, const std::vector<Variant>& arguments) {
+        return Variant::fromRpc(RpcValue{"plain:" + arguments.at(0).value.asString()});
+    };
+    return object;
+}
+
+// Detector: the client tried once, so a provider still starting (or
+// restarting) failed the call instantly where QtRO would have waited for it.
+TEST(QtRemotePlainTransportTest, AClientReachesAServerThatStartsWithinItsTimeout)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::thread starter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        std::string error;
+        EXPECT_TRUE(server.start(path, &error)) << error;
+    });
+
+    Client client;
+    std::string error;
+    const bool connected = client.connect(path, std::chrono::seconds(3), &error);
+    starter.join();
+    ASSERT_TRUE(connected) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    const auto result = client.call("fixture", "echo(QString)",
+        {Variant::fromRpc(RpcValue{"late"})}, std::chrono::seconds(2), &error);
+    ASSERT_TRUE(result.has_value()) << error;
+    EXPECT_EQ(result->value.asString(), "plain:late");
+    client.close();
+    server.stop();
+}
+
+TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
+{
+    const std::string path = transportSocketPath();
+    Client client;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect(path, std::chrono::milliseconds(400), &error));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(350));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_FALSE(error.empty());
+}
+
 TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
 {
 #ifdef _WIN32

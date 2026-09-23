@@ -484,10 +484,16 @@ NativeHandle connectSocket(const std::string& path,
     }
 }
 #else
-NativeHandle connectSocket(const std::string& path,
-                           std::chrono::milliseconds timeout,
-                           std::string* error)
+// Nothing listening at the path yet, as opposed to a failure retrying cannot fix.
+bool notListeningYet(int code)
 {
+    return code == ENOENT || code == ECONNREFUSED || code == EAGAIN;
+}
+
+NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
+                         std::string* error, bool* retry)
+{
+    *retry = false;
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         setError(error, "socket() failed: " + std::string(std::strerror(errno)));
@@ -511,13 +517,14 @@ NativeHandle connectSocket(const std::string& path,
         ::close(fd);
         return kInvalidHandle;
     }
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
     if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         const int connectError = errno;
         if (connectError != EINPROGRESS || !waitForSocket(fd, POLLOUT, deadline, error,
                                                            "local socket connection")) {
-            if (connectError != EINPROGRESS)
+            if (connectError != EINPROGRESS) {
                 setError(error, "connect(" + path + ") failed: " + std::string(std::strerror(connectError)));
+                *retry = notListeningYet(connectError);
+            }
             ::close(fd);
             return kInvalidHandle;
         }
@@ -526,6 +533,7 @@ NativeHandle connectSocket(const std::string& path,
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &result, &length) < 0 || result != 0) {
             setError(error, "connect(" + path + ") failed: "
                 + std::string(std::strerror(result == 0 ? errno : result)));
+            *retry = notListeningYet(result);
             ::close(fd);
             return kInvalidHandle;
         }
@@ -534,6 +542,25 @@ NativeHandle connectSocket(const std::string& path,
     // MSG_DONTWAIT on local stream sends when the peer stops reading.
     // readExact handles EAGAIN by waiting for readable data.
     return fd;
+}
+
+// Retries a provider that is not listening yet until the deadline, as QtRO
+// does, so one that is still starting or restarting is reached.
+NativeHandle connectSocket(const std::string& path,
+                           std::chrono::milliseconds timeout,
+                           std::string* error)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto pause = std::chrono::milliseconds(50);
+    for (;;) {
+        bool retry = false;
+        const NativeHandle fd = connectOnce(path, deadline, error, &retry);
+        const auto now = std::chrono::steady_clock::now();
+        if (fd != kInvalidHandle || !retry || now >= deadline) return fd;
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+            pause, deadline - now));
+        pause = std::min(pause * 2, std::chrono::milliseconds(250));
+    }
 }
 
 #endif
