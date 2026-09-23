@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -144,6 +146,79 @@ TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
     EXPECT_LT(elapsed, std::chrono::seconds(2));
     EXPECT_FALSE(error.empty());
 }
+
+// Detector (Windows): a second server on a live name started and shared it,
+// so a client could land on either.
+TEST(QtRemotePlainTransportTest, ASecondServerCannotTakeALiveEndpoint)
+{
+    const std::string path = transportSocketPath();
+    Server first;
+    ASSERT_TRUE(first.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(first.start(path, &error)) << error;
+
+    Server second;
+    EXPECT_FALSE(second.start(path, &error));
+    EXPECT_FALSE(error.empty());
+    for (int i = 0; i < 4; ++i) {
+        Client client;
+        ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+        EXPECT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+        client.close();
+    }
+    first.stop();
+}
+
+// Detector (Windows): start() succeeded before any pipe existed, so an
+// endpoint that could not be listened on still "started".
+TEST(QtRemotePlainTransportTest, StartFailsForAnEndpointThatCannotBeListenedOn)
+{
+#ifdef _WIN32
+    const std::string path = "local:" + std::string(300, 'x');
+#else
+    const std::string path = "/tmp/" + std::string(200, 'x');
+#endif
+    Server server;
+    std::string error;
+    EXPECT_FALSE(server.start(path, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_FALSE(server.isRunning());
+}
+
+// Detector (Windows): a stop() racing the accept thread's first pipe missed
+// it and then waited forever for a connect that never came.
+TEST(QtRemotePlainTransportTest, StopRightAfterStartReturns)
+{
+    for (int i = 0; i < 1000; ++i) {
+        auto server = std::make_shared<Server>();
+        std::string error;
+        ASSERT_TRUE(server->start(transportSocketPath(), &error)) << error;
+        std::promise<void> done;
+        auto stopped = done.get_future();
+        // Detached: a hung stop() must fail the test, not hang the binary.
+        std::thread([server, done = std::move(done)]() mutable {
+            server->stop();
+            done.set_value();
+        }).detach();
+        ASSERT_EQ(stopped.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+            << "stop() right after start() hung, iteration " << i;
+    }
+}
+
+#ifdef _WIN32
+// Detector: LOGOS_SOCKET_GROUP/MODE were ignored here, leaving the endpoint
+// more open than the operator asked for.
+TEST(QtRemotePlainTransportTest, SocketPermissionSettingsAreRefusedOnWindows)
+{
+    _putenv_s("LOGOS_SOCKET_MODE", "0660");
+    Server server;
+    std::string error;
+    const bool started = server.start(transportSocketPath(), &error);
+    _putenv_s("LOGOS_SOCKET_MODE", "");
+    EXPECT_FALSE(started);
+    EXPECT_NE(error.find("LOGOS_SOCKET"), std::string::npos) << error;
+}
+#endif
 
 // Detector: a call that looked its object up after a RemoveObject raced it
 // threw std::out_of_range, which the C ABI turned into a terminate.

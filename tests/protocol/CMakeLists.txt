@@ -617,3 +617,16 @@ target_link_libraries(protocol_noqt_tests PRIVATE
 
 gtest_discover_tests(protocol_noqt_tests)
 endif()
+
+# Which implementation each transport resolves to. Also the Qt-configured test
+# Windows runs (nix/tests-windows-qt.nix), where local must mean plain.
+if(LOGOS_PROTOCOL_BUILD_QT)
+add_executable(transport_resolution_tests test_transport_resolution.cpp)
+target_link_libraries(transport_resolution_tests PRIVATE
+    logos_protocol
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+)
+gtest_discover_tests(transport_resolution_tests)
+endif()

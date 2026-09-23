@@ -70,6 +70,17 @@ std::string windowsError(const char* operation, DWORD code)
         + std::to_string(static_cast<unsigned long>(code)) + ")";
 }
 
+// One listening instance. The first claims the name, so a second server
+// fails to start instead of silently sharing it.
+HANDLE createPipeInstance(const std::string& path, bool first)
+{
+    return ::CreateNamedPipeA(
+        path.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_UNLIMITED_INSTANCES, 64u << 10, 64u << 10, 0, nullptr);
+}
+
 bool overlappedWrite(HANDLE handle, const std::uint8_t* data, DWORD size,
                      DWORD& written, std::string* error,
                      const std::optional<Deadline>& deadline)
@@ -1233,7 +1244,13 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::size_t maxQueuedBytes = kDefaultMaxQueuedBytes;
     std::chrono::milliseconds stallTimeout = kDefaultStallTimeout;
     std::string path;
-#ifndef _WIN32
+    // The accept thread owns the listener and closes it; stop() only wakes it.
+    // Closing it underneath a thread about to accept on it can block forever.
+#ifdef _WIN32
+    HANDLE stopEvent = nullptr;
+#else
+    int wakeRead = -1;
+    int wakeWrite = -1;
     // The socket file this server bound, so stop() never removes a successor's.
     dev_t boundDevice = 0;
     ino_t boundInode = 0;
@@ -1534,13 +1551,14 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     {
         while (running) {
 #ifdef _WIN32
-            HANDLE pipe = ::CreateNamedPipeA(
-                path.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES, 64u << 10, 64u << 10, 0, nullptr);
-            if (pipe == INVALID_HANDLE_VALUE) break;
-            const NativeHandle candidate = reinterpret_cast<NativeHandle>(pipe);
-            listener = candidate;
+            if (listener.load() == kInvalidHandle) {
+                // The next instance could not be created: retry until stopped.
+                if (::WaitForSingleObject(stopEvent, 100) == WAIT_OBJECT_0) break;
+                const HANDLE retry = createPipeInstance(path, false);
+                if (retry != INVALID_HANDLE_VALUE) listener = reinterpret_cast<NativeHandle>(retry);
+                continue;
+            }
+            const HANDLE pipe = winHandle(listener.load());
             OVERLAPPED operation{};
             operation.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
             bool connected = false;
@@ -1551,28 +1569,45 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                     if (code == ERROR_PIPE_CONNECTED) {
                         connected = true;
                     } else if (code == ERROR_IO_PENDING) {
+                        const HANDLE waits[] = {operation.hEvent, stopEvent};
+                        if (::WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0)
+                            ::CancelIoEx(pipe, &operation);
                         DWORD transferred = 0;
-                        connected = ::WaitForSingleObject(operation.hEvent, INFINITE)
-                                == WAIT_OBJECT_0
-                            && ::GetOverlappedResult(pipe, &operation,
-                                                     &transferred, FALSE) != FALSE;
+                        connected = ::GetOverlappedResult(pipe, &operation, &transferred, TRUE)
+                            != FALSE;
                     }
                 }
                 ::CloseHandle(operation.hEvent);
             }
-            const NativeHandle owned = listener.exchange(kInvalidHandle);
-            if (owned == kInvalidHandle) break;
+            if (!running) break;
+            // The next instance exists before this one can close, so the name
+            // never lapses for another server to claim.
+            const HANDLE next = createPipeInstance(path, false);
+            const NativeHandle accepted = listener.exchange(
+                next == INVALID_HANDLE_VALUE ? kInvalidHandle : reinterpret_cast<NativeHandle>(next));
             if (!connected) {
-                std::atomic<NativeHandle> failed{owned};
+                std::atomic<NativeHandle> failed{accepted};
                 closeHandle(failed);
-                if (running) continue;
+                ::WaitForSingleObject(stopEvent, 10);
+                continue;
+            }
+#else
+            pollfd waits[2] = {{static_cast<int>(listener.load()), POLLIN, 0},
+                               {wakeRead, POLLIN, 0}};
+            if (::poll(waits, 2, -1) < 0) {
+                if (errno == EINTR) continue;
                 break;
             }
-            const NativeHandle accepted = owned;
-#else
+            if (waits[1].revents != 0) break;
+            if ((waits[0].revents & POLLIN) == 0) {
+                if (waits[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+                continue;
+            }
             const NativeHandle accepted = ::accept(listener.load(), nullptr, nullptr);
             if (accepted < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK
+                    || errno == ECONNABORTED)
+                    continue;
                 break;
             }
             setCloseOnExec(static_cast<int>(accepted));
@@ -1611,6 +1646,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
             std::thread([state, connection] { state->writerLoop(connection); }).detach();
             std::thread([state, connection] { state->connectionLoop(connection); }).detach();
         }
+        closeHandle(listener);
         {
             std::lock_guard<std::mutex> lock(mu);
             acceptExited = true;
@@ -1631,9 +1667,33 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
         return false;
     }
 #ifdef _WIN32
+    std::string permissionError;
+    if (!logos::applySocketPerms(path, &permissionError)) {
+        setError(error, permissionError);
+        return false;
+    }
+    // Claimed here, so a failure is start()'s to report and a stop() right
+    // after has an instance to cancel.
+    const HANDLE first = createPipeInstance(path, true);
+    if (first == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        setError(error, code == ERROR_ACCESS_DENIED
+            ? "cannot listen on " + path + ": another server holds the name, or access is denied"
+            : windowsError(("CreateNamedPipe(" + path + ")").c_str(), code));
+        return false;
+    }
+    const HANDLE stopEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent) {
+        const DWORD code = ::GetLastError();
+        ::CloseHandle(first);
+        setError(error, windowsError("CreateEvent", code));
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         m_impl->path = path;
+        m_impl->listener = reinterpret_cast<NativeHandle>(first);
+        m_impl->stopEvent = stopEvent;
         m_impl->running = true;
         m_impl->acceptExited = false;
     }
@@ -1669,12 +1729,26 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
     }
     struct stat bound {};
     (void)::lstat(path.c_str(), &bound);
+    int wake[2];
+    if (::pipe(wake) != 0) {
+        const std::string reason = std::strerror(errno);
+        ::close(fd);
+        ::unlink(path.c_str());
+        setError(error, "pipe() failed: " + reason);
+        return false;
+    }
+    for (const int end : wake) setCloseOnExec(end);
+    (void)::fcntl(wake[1], F_SETFL, ::fcntl(wake[1], F_GETFL, 0) | O_NONBLOCK);
+    // poll() says when to accept; a peer gone by then must not block it.
+    (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         m_impl->path = path;
         m_impl->boundDevice = bound.st_dev;
         m_impl->boundInode = bound.st_ino;
         m_impl->listener = fd;
+        m_impl->wakeRead = wake[0];
+        m_impl->wakeWrite = wake[1];
         m_impl->running = true;
         m_impl->acceptExited = false;
     }
@@ -1688,6 +1762,11 @@ void Server::stop()
 {
     std::vector<std::shared_ptr<Impl::Connection>> connections;
     std::string path;
+#ifdef _WIN32
+    HANDLE stopEvent = nullptr;
+#else
+    int wakeWrite = -1;
+#endif
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         if (!m_impl->running && m_impl->listener.load() == kInvalidHandle
@@ -1699,10 +1778,17 @@ void Server::stop()
         // Calls that have not started are dropped with their connections.
         m_impl->activeInvocations -= m_impl->calls.size();
         m_impl->calls.clear();
+#ifdef _WIN32
+        stopEvent = m_impl->stopEvent;
+#else
+        wakeWrite = m_impl->wakeWrite;
+#endif
     }
     m_impl->callsChanged.notify_all();
-    closeHandle(m_impl->listener);
-#ifndef _WIN32
+#ifdef _WIN32
+    if (stopEvent) ::SetEvent(stopEvent);
+#else
+    if (wakeWrite >= 0) (void)!::write(wakeWrite, "", 1);
     // Now, not after the handlers finish: by then a successor may have bound
     // the path. And only the file this server bound.
     struct stat current {};
@@ -1723,6 +1809,17 @@ void Server::stop()
             && std::all_of(m_impl->connections.begin(), m_impl->connections.end(),
                 [&](const auto& connection) { return connection->worker == caller; });
     });
+#ifdef _WIN32
+    if (m_impl->stopEvent) {
+        ::CloseHandle(m_impl->stopEvent);
+        m_impl->stopEvent = nullptr;
+    }
+#else
+    for (int* end : {&m_impl->wakeRead, &m_impl->wakeWrite}) {
+        if (*end >= 0) ::close(*end);
+        *end = -1;
+    }
+#endif
     lock.unlock();
 }
 
