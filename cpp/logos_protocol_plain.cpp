@@ -288,7 +288,7 @@ struct ClientState {
 
     std::recursive_mutex callbackMutex;
     std::mutex mutex;
-    std::mutex connectionMutex;
+    std::timed_mutex connectionMutex;
     std::condition_variable completionChanged;
     std::condition_variable subscriptionChanged;
     std::condition_variable eventsChanged;
@@ -314,22 +314,37 @@ struct ClientState {
     std::thread eventWorker;
 };
 
+// Destruction from a user callback cannot join workers that might be waiting
+// to acquire callbackMutex. The workers retain ClientState until they exit.
+thread_local const ClientState* activeCallbackState = nullptr;
+
+struct CallbackScope {
+    explicit CallbackScope(const ClientState* state)
+        : previous(activeCallbackState) { activeCallbackState = state; }
+    ~CallbackScope() { activeCallbackState = previous; }
+    const ClientState* previous;
+};
+
 void connectionLost(const std::shared_ptr<ClientState>& state);
+
+void recordNetworkCompletion(const std::shared_ptr<ClientState>& state,
+                             const EventMessage& message)
+{
+    if (message.object != state->target || message.eventName != kCompletionEvent) return;
+    if (message.data.size() == 2 && message.data[0].isString()) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->alive) return;
+            state->completions[message.data[0].asString()] = message.data[1];
+        }
+        state->completionChanged.notify_all();
+    }
+}
 
 void deliverNetworkEvent(const std::shared_ptr<ClientState>& state,
                          const EventMessage& message)
 {
-    if (message.object != state->target) return;
-    if (message.eventName == kCompletionEvent) {
-        if (message.data.size() == 2 && message.data[0].isString()) {
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->completions[message.data[0].asString()] = message.data[1];
-            }
-            state->completionChanged.notify_all();
-        }
-        return;
-    }
+    if (message.object != state->target || message.eventName == kCompletionEvent) return;
     std::lock_guard<std::recursive_mutex> callbackLock(state->callbackMutex);
     if (!state->alive) return;
     std::vector<std::shared_ptr<SubscriptionState>> subscriptions;
@@ -349,8 +364,10 @@ void deliverNetworkEvent(const std::shared_ptr<ClientState>& state,
     for (const auto& sub : subscriptions) {
         std::lock_guard<std::recursive_mutex> subLock(sub->callbackMutex);
         if (sub->active && (sub->event.empty() || sub->event == message.eventName)
-            && sub->callback)
+            && sub->callback) {
+            CallbackScope scope(state.get());
             sub->callback(message.eventName.c_str(), text.c_str(), sub->userData);
+        }
         if (!state->alive) break;
     }
 }
@@ -396,7 +413,10 @@ void reportSubscriptionStatus(const std::shared_ptr<ClientState>& state,
     }
     if (!callback) return;
     std::lock_guard<std::recursive_mutex> callbackLock(state->callbackMutex);
-    if (state->alive) callback(status, generation, reason, userData);
+    if (state->alive) {
+        CallbackScope scope(state.get());
+        callback(status, generation, reason, userData);
+    }
 }
 
 bool hasSubscriptionPhase(const std::shared_ptr<ClientState>& state,
@@ -416,23 +436,51 @@ bool hasSubscriptionPhase(const std::shared_ptr<ClientState>& state,
 bool ensureConnected(const std::shared_ptr<ClientState>& state,
                      int timeout, std::string& error)
 {
-    std::lock_guard<std::mutex> connectionLock(state->connectionMutex);
+    if (timeout <= 0 || !state->alive) {
+        error = "connection timed out";
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
+    std::unique_lock<std::timed_mutex> connectionLock(state->connectionMutex,
+                                                      std::defer_lock);
+    if (!connectionLock.try_lock_until(deadline)) {
+        error = "connection timed out";
+        return false;
+    }
+    if (!state->alive) {
+        error = "client destroyed";
+        return false;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        error = "connection timed out";
+        return false;
+    }
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         if (state->networkWire && state->networkWire->isOpen()) return true;
         if (state->networkWire) state->networkWire->stop("reconnecting");
-        auto wire = logos::plain::abi::connect(state->targetConfig, error);
+        auto wire = logos::plain::abi::connect(
+            state->targetConfig, remaining, error, &state->alive);
         if (!wire) return false;
+        if (!state->alive) {
+            wire->stop("client destroyed");
+            error = "client destroyed";
+            return false;
+        }
         std::weak_ptr<ClientState> weak = state;
         wire->setErrorHandler([weak](const std::string&) {
             if (auto locked = weak.lock()) connectionLost(locked);
         });
         wire->sendSubscribe({state->target, kCompletionEvent},
             [weak](EventMessage event) {
-                if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
+                if (auto locked = weak.lock()) recordNetworkCompletion(locked, event);
             });
         wire->sendSubscribe({state->target, ""},
             [weak](EventMessage event) {
+                if (event.eventName == kCompletionEvent) return;
                 if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
             });
         state->networkWire = std::move(wire);
@@ -440,7 +488,7 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
     }
     if (state->wire->isConnected()) return true;
     return state->wire->connect(endpoint(state->target),
-                                std::chrono::milliseconds(timeout), &error);
+                                remaining, &error);
 }
 
 void subscriptionLoop(const std::shared_ptr<ClientState>& state)
@@ -468,7 +516,7 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         std::string error;
         bool acquired = ensureConnected(state, 250, error);
         if (acquired && state->targetConfig.protocol == LogosProtocol::QtRemotePlain) {
-            std::lock_guard<std::mutex> connectionLock(state->connectionMutex);
+            std::lock_guard<std::timed_mutex> connectionLock(state->connectionMutex);
             acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
                                              &error);
         }
@@ -520,10 +568,23 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
                                     const json& args, const std::string& token,
                                     int timeout, std::string& error)
 {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
     if (!ensureConnected(state, timeout, error)) return std::nullopt;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        error = "invocation timed out";
+        return std::nullopt;
+    }
     std::shared_ptr<RpcConnectionBase> wire;
     {
-        std::lock_guard<std::mutex> lock(state->connectionMutex);
+        std::unique_lock<std::timed_mutex> lock(state->connectionMutex,
+                                                std::defer_lock);
+        if (!lock.try_lock_until(deadline)) {
+            error = "invocation timed out";
+            return std::nullopt;
+        }
         wire = state->networkWire;
     }
     if (!wire || !wire->isOpen()) {
@@ -538,7 +599,7 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
     for (const auto& arg : args) request.args.push_back(jsonToRpc(arg));
     const auto id = request.id;
     auto future = wire->sendCall(std::move(request));
-    if (future.wait_for(std::chrono::milliseconds(timeout)) != std::future_status::ready) {
+    if (future.wait_until(deadline) != std::future_status::ready) {
         wire->cancelPending(id);
         error = "invocation timed out";
         return std::nullopt;
@@ -603,10 +664,14 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
 std::string mintToken(const std::shared_ptr<ClientState>& state,
                       int timeout, std::string& error)
 {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
     const std::string credential = tokenGet(state->tokens, "capability_module");
     if (state->capabilityConfig.protocol == LogosProtocol::Tcp
         || state->capabilityConfig.protocol == LogosProtocol::TcpSsl) {
-        auto wire = logos::plain::abi::connect(state->capabilityConfig, error);
+        auto wire = logos::plain::abi::connect(
+            state->capabilityConfig, std::chrono::milliseconds(timeout), error,
+            &state->alive);
         if (!wire) return {};
         CallMessage request;
         request.id = wire->nextId();
@@ -616,7 +681,7 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
         request.args = {RpcValue{state->origin}, RpcValue{state->target}};
         const auto id = request.id;
         auto future = wire->sendCall(std::move(request));
-        if (future.wait_for(std::chrono::milliseconds(timeout)) != std::future_status::ready) {
+        if (future.wait_until(deadline) != std::future_status::ready) {
             wire->cancelPending(id);
             wire->stop("capability request timed out");
             error = "capability request timed out";
@@ -656,12 +721,20 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         error = "arguments must be a JSON array";
         return std::nullopt;
     }
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
+    const auto remaining = [&] {
+        return std::max(0, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count()));
+    };
     std::string token = tokenGet(state->tokens, state->target);
     if (token.empty() && state->target != "capability_module")
-        token = mintToken(state, timeout, error);
+        token = mintToken(state, remaining(), error);
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
-        auto result = networkCall(state, state->target, method, args, token, timeout, error);
+        auto result = networkCall(state, state->target, method, args, token,
+                                  remaining(), error);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
             if (!value || !value->isMap()) return false;
             const RpcValue* status = value->asMap().find(kStatusKey);
@@ -672,10 +745,10 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                 std::lock_guard<std::mutex> lock(state->tokens->mutex);
                 state->tokens->outbound.erase(state->target);
             }
-            token = mintToken(state, timeout, error);
+            token = mintToken(state, remaining(), error);
             if (!token.empty())
                 result = networkCall(state, state->target, method, args,
-                                     token, timeout, error);
+                                     token, remaining(), error);
         }
         if (unauthorized(result)) {
             error = "token not recognized";
@@ -686,7 +759,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         std::string completion;
         if (pendingId(wrapped, completion)) {
             std::unique_lock<std::mutex> lock(state->mutex);
-            if (!state->completionChanged.wait_for(lock, std::chrono::milliseconds(timeout), [&] {
+            if (!state->completionChanged.wait_until(lock, deadline, [&] {
                     return !state->alive || state->completions.count(completion) != 0;
                 })) {
                 error = "deferred invocation timed out";
@@ -704,19 +777,19 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     auto result = directCall(state, state->target,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
-         std::move(arguments)}, timeout, error);
+         std::move(arguments)}, remaining(), error);
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
         {
             std::lock_guard<std::mutex> lock(state->tokens->mutex);
             state->tokens->outbound.erase(state->target);
         }
-        token = mintToken(state, timeout, error);
+        token = mintToken(state, remaining(), error);
         if (!token.empty()) {
             arguments = Variant::fromRpc(jsonToRpc(args));
             result = directCall(state, state->target,
                 "callRemoteMethod(QString,QString,QVariantList)",
                 {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
-                 std::move(arguments)}, timeout, error);
+                 std::move(arguments)}, remaining(), error);
         }
     }
     if (result && isUnauthorized(*result)) {
@@ -727,7 +800,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         std::string completion;
         if (pendingId(*result, completion)) {
             std::unique_lock<std::mutex> lock(state->mutex);
-            if (!state->completionChanged.wait_for(lock, std::chrono::milliseconds(timeout), [&] {
+            if (!state->completionChanged.wait_until(lock, deadline, [&] {
                     return !state->alive || state->completions.count(completion) != 0;
                 })) {
                 error = "deferred invocation timed out";
@@ -1084,8 +1157,10 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
             const std::string text = (data.is_array() ? data : json::array()).dump();
             for (const auto& sub : subscriptions) {
                 std::lock_guard<std::recursive_mutex> subLock(sub->callbackMutex);
-                if (sub->active && (sub->event.empty() || sub->event == event) && sub->callback)
+                if (sub->active && (sub->event.empty() || sub->event == event) && sub->callback) {
+                    CallbackScope scope(state.get());
                     sub->callback(event.c_str(), text.c_str(), sub->userData);
+                }
                 if (!state->alive) break;
             }
         });
@@ -1102,6 +1177,7 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
 void lp_client_destroy(lp_client* client)
 {
     if (!client) return;
+    const bool fromCallback = activeCallbackState == client->state.get();
     {
         std::lock_guard<std::recursive_mutex> lock(client->state->callbackMutex);
         client->state->alive = false;
@@ -1113,17 +1189,23 @@ void lp_client_destroy(lp_client* client)
     client->state->completionChanged.notify_all();
     client->state->subscriptionChanged.notify_all();
     client->state->eventsChanged.notify_all();
-    if (client->state->networkWire)
-        client->state->networkWire->stop("client destroyed");
+    std::shared_ptr<RpcConnectionBase> networkWire;
+    {
+        std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
+        networkWire = std::move(client->state->networkWire);
+    }
+    if (networkWire) networkWire->stop("client destroyed");
     client->state->wire->close();
     if (client->state->subscriptionWorker.joinable()) {
-        if (client->state->subscriptionWorker.get_id() == std::this_thread::get_id())
+        if (fromCallback
+            || client->state->subscriptionWorker.get_id() == std::this_thread::get_id())
             client->state->subscriptionWorker.detach();
         else
             client->state->subscriptionWorker.join();
     }
     if (client->state->eventWorker.joinable()) {
-        if (client->state->eventWorker.get_id() == std::this_thread::get_id())
+        if (fromCallback
+            || client->state->eventWorker.get_id() == std::this_thread::get_id())
             client->state->eventWorker.detach();
         else
             client->state->eventWorker.join();
@@ -1418,7 +1500,7 @@ int lp_inform_module_token(lp_client* client, const char* authToken,
             return LP_ERR_INTERNAL;
         std::shared_ptr<RpcConnectionBase> wire;
         {
-            std::lock_guard<std::mutex> lock(client->state->connectionMutex);
+            std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
             wire = client->state->networkWire;
         }
         wire->sendToken({authToken, moduleName, token});

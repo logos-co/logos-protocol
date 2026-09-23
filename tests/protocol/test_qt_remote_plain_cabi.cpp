@@ -219,6 +219,7 @@ struct StatusResult {
 
 struct DisconnectDuringEventResult {
     lp_client* client = nullptr;
+    bool destroyInCallback = false;
     std::mutex mutex;
     std::condition_variable changed;
     bool entered = false;
@@ -243,6 +244,7 @@ void onDisconnectingEvent(const char*, const char*, void* userData)
                     200, &value, &error);
     lp_string_free(value);
     lp_string_free(error);
+    if (result->destroyInCallback) lp_client_destroy(result->client);
     result->done = true;
 }
 
@@ -273,6 +275,7 @@ void setInstanceId(const std::string& prefix)
 }
 
 void runDisconnectDuringEvent(bool withStatus, bool manualRestart,
+                              bool destroyInCallback,
                               const std::string& id)
 {
     setInstanceId(id);
@@ -292,6 +295,7 @@ void runDisconnectDuringEvent(bool withStatus, bool manualRestart,
             client, onDisconnectStatus, nullptr), 1);
     DisconnectDuringEventResult event;
     event.client = client;
+    event.destroyInCallback = destroyInCallback;
     lp_subscription* subscription = lp_subscribe(
         client, "tick", onDisconnectingEvent, &event);
     ASSERT_NE(subscription, nullptr);
@@ -312,7 +316,7 @@ void runDisconnectDuringEvent(bool withStatus, bool manualRestart,
     event.changed.notify_all();
     ASSERT_TRUE(waitUntil([&] { return event.done.load(); }, std::chrono::seconds(2)));
     lp_unsubscribe(subscription);
-    lp_client_destroy(client);
+    if (!destroyInCallback) lp_client_destroy(client);
 }
 
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
@@ -450,22 +454,37 @@ TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 
 TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithStatusAndAutomaticRestartFinishes)
 {
-    runDisconnectDuringEvent(true, false, "dsa");
+    runDisconnectDuringEvent(true, false, false, "dsa");
 }
 
 TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithStatusAndManualRestartFinishes)
 {
-    runDisconnectDuringEvent(true, true, "dsm");
+    runDisconnectDuringEvent(true, true, false, "dsm");
 }
 
 TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithoutStatusAndAutomaticRestartFinishes)
 {
-    runDisconnectDuringEvent(false, false, "dna");
+    runDisconnectDuringEvent(false, false, false, "dna");
 }
 
 TEST(QtRemotePlainCabiTest, DisconnectDuringCallbackWithoutStatusAndManualRestartFinishes)
 {
-    runDisconnectDuringEvent(false, true, "dnm");
+    runDisconnectDuringEvent(false, true, false, "dnm");
+}
+
+TEST(QtRemotePlainCabiTest, CallbackCanDestroyClientAfterDisconnectWithAutomaticRestart)
+{
+    runDisconnectDuringEvent(true, false, true, "dda");
+}
+
+TEST(QtRemotePlainCabiTest, CallbackCanDestroyClientAfterDisconnectWithManualRestart)
+{
+    runDisconnectDuringEvent(true, true, true, "ddm");
+}
+
+TEST(QtRemotePlainCabiTest, CallbackCanDestroyClientAfterDisconnectWithoutStatusCallback)
+{
+    runDisconnectDuringEvent(false, false, true, "ddn");
 }
 
 TEST(QtRemotePlainCabiTest, SlowEventCallbackDoesNotBlockConcurrentReplies)

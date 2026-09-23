@@ -12,9 +12,13 @@
 
 #include <openssl/ssl.h>
 
+#include <algorithm>
 #include <set>
 #include <future>
+#include <chrono>
+#include <mutex>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace logos::plain::abi {
@@ -47,37 +51,192 @@ boost::asio::ssl::context tlsContext(const LogosTransportConfig& config, bool se
     return context;
 }
 
+struct DialResult {
+    std::shared_ptr<RpcConnectionBase> connection;
+    std::string error;
+};
+
+template <typename Stream>
+class DialAttempt : public std::enable_shared_from_this<DialAttempt<Stream>> {
+public:
+    DialAttempt(boost::asio::io_context& io, const LogosTransportConfig& config,
+                std::shared_ptr<boost::asio::ssl::context> context)
+        : io_(io), resolver_(io), context_(std::move(context)),
+          stream_(makeStream(io, context_)), codec_(codecFor(config.codec)),
+          host_(config.host), port_(std::to_string(config.port))
+    {
+        if constexpr (std::is_same_v<Stream, SslStream>) {
+            if (!SSL_set_tlsext_host_name(stream_.native_handle(), host_.c_str()))
+                throw std::runtime_error("TLS SNI setup failed");
+            if (config.verifyPeer)
+                stream_.set_verify_callback(
+                    boost::asio::ssl::host_name_verification(host_));
+        }
+    }
+
+    std::future<DialResult> future() { return result_.get_future(); }
+
+    void start()
+    {
+        auto self = this->shared_from_this();
+        resolver_.async_resolve(host_, port_,
+            [self](const boost::system::error_code& ec,
+                   boost::asio::ip::tcp::resolver::results_type addresses) {
+                if (ec) { self->finishError(ec.message()); return; }
+                boost::asio::async_connect(self->stream_.lowest_layer(), addresses,
+                    [self](const boost::system::error_code& connectError,
+                           const boost::asio::ip::tcp::endpoint&) {
+                        if (connectError) {
+                            self->finishError(connectError.message());
+                            return;
+                        }
+                        self->connected();
+                    });
+            });
+    }
+
+    void abandon()
+    {
+        std::shared_ptr<RpcConnectionBase> connection;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            abandoned_ = true;
+            connection = connection_;
+            if (!delivered_) {
+                delivered_ = true;
+                result_.set_value({{}, "connection timed out"});
+            }
+        }
+        if (connection) {
+            connection->stop("connection timed out");
+            return;
+        }
+        auto self = this->shared_from_this();
+        boost::asio::post(io_, [self] {
+            self->resolver_.cancel();
+            boost::system::error_code ignored;
+            self->stream_.lowest_layer().cancel(ignored);
+            self->stream_.lowest_layer().close(ignored);
+        });
+    }
+
+private:
+    static Stream makeStream(boost::asio::io_context& io,
+                             const std::shared_ptr<boost::asio::ssl::context>& context)
+    {
+        if constexpr (std::is_same_v<Stream, SslStream>) return Stream(io, *context);
+        else return Stream(io);
+    }
+
+    void connected()
+    {
+        if constexpr (std::is_same_v<Stream, SslStream>) {
+            auto self = this->shared_from_this();
+            stream_.async_handshake(boost::asio::ssl::stream_base::client,
+                [self](const boost::system::error_code& ec) {
+                    if (ec) self->finishError(ec.message());
+                    else self->finishSuccess();
+                });
+        } else finishSuccess();
+    }
+
+    void finishError(std::string error)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (delivered_) return;
+        delivered_ = true;
+        result_.set_value({{}, std::move(error)});
+    }
+
+    void finishSuccess()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (delivered_ || abandoned_) return;
+        if constexpr (std::is_same_v<Stream, SslStream>)
+            connection_ = std::make_shared<SslConnection>(std::move(stream_), codec_);
+        else
+            connection_ = std::make_shared<TcpConnection>(std::move(stream_), codec_);
+        connection_->start();
+        delivered_ = true;
+        result_.set_value({connection_, {}});
+    }
+
+    boost::asio::io_context& io_;
+    boost::asio::ip::tcp::resolver resolver_;
+    std::shared_ptr<boost::asio::ssl::context> context_;
+    Stream stream_;
+    std::shared_ptr<IWireCodec> codec_;
+    std::string host_;
+    std::string port_;
+    std::promise<DialResult> result_;
+    std::mutex mutex_;
+    bool abandoned_ = false;
+    bool delivered_ = false;
+    std::shared_ptr<RpcConnectionBase> connection_;
+};
+
+template <typename Stream>
+std::shared_ptr<RpcConnectionBase> dial(boost::asio::io_context& io,
+                                       const LogosTransportConfig& config,
+                                       std::chrono::milliseconds timeout,
+                                       std::string& error,
+                                       const std::atomic<bool>* alive,
+                                       std::shared_ptr<boost::asio::ssl::context> context = {})
+{
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        error = "connection timed out";
+        return {};
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto attempt = std::make_shared<DialAttempt<Stream>>(io, config, std::move(context));
+    auto future = attempt->future();
+    attempt->start();
+    for (;;) {
+        if (alive && !alive->load()) {
+            attempt->abandon();
+            error = "client destroyed";
+            return {};
+        }
+        const auto nextCheck = std::min(deadline,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
+        if (future.wait_until(nextCheck) == std::future_status::ready) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            attempt->abandon();
+            error = "connection timed out";
+            return {};
+        }
+    }
+    auto result = future.get();
+    if (alive && !alive->load()) {
+        attempt->abandon();
+        error = "client destroyed";
+        return {};
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        attempt->abandon();
+        error = "connection timed out";
+        return {};
+    }
+    error = std::move(result.error);
+    return std::move(result.connection);
+}
+
 } // namespace
 
 std::shared_ptr<RpcConnectionBase> connect(const LogosTransportConfig& config,
-                                           std::string& error)
+                                           std::chrono::milliseconds timeout,
+                                           std::string& error,
+                                           const std::atomic<bool>* alive)
 {
     try {
         auto& io = IoContextPool::shared().ioContext();
-        boost::asio::ip::tcp::resolver resolver(io);
-        const auto addresses = resolver.resolve(config.host, std::to_string(config.port));
-        if (config.protocol == LogosProtocol::Tcp) {
-            TcpStream socket(io);
-            boost::asio::connect(socket, addresses);
-            auto result = std::make_shared<TcpConnection>(
-                std::move(socket), codecFor(config.codec));
-            result->start();
-            return result;
-        }
+        if (config.protocol == LogosProtocol::Tcp)
+            return dial<TcpStream>(io, config, timeout, error, alive);
         if (config.protocol == LogosProtocol::TcpSsl) {
-            auto context = tlsContext(config, false);
-            SslStream stream(io, context);
-            if (!SSL_set_tlsext_host_name(stream.native_handle(), config.host.c_str()))
-                throw std::runtime_error("TLS SNI setup failed");
-            if (config.verifyPeer)
-                stream.set_verify_callback(
-                    boost::asio::ssl::host_name_verification(config.host));
-            boost::asio::connect(stream.lowest_layer(), addresses);
-            stream.handshake(boost::asio::ssl::stream_base::client);
-            auto result = std::make_shared<SslConnection>(
-                std::move(stream), codecFor(config.codec));
-            result->start();
-            return result;
+            auto context = std::make_shared<boost::asio::ssl::context>(
+                tlsContext(config, false));
+            return dial<SslStream>(io, config, timeout, error, alive,
+                                   std::move(context));
         }
         error = "unsupported network transport";
     } catch (const std::exception& ex) {

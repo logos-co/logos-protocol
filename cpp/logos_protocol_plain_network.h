@@ -5,6 +5,8 @@
 #include "implementations/plain/rpc_server.h"
 
 #include <functional>
+#include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -16,7 +18,9 @@
 namespace logos::plain::abi {
 
 std::shared_ptr<RpcConnectionBase> connect(const LogosTransportConfig& config,
-                                           std::string& error);
+                                           std::chrono::milliseconds timeout,
+                                           std::string& error,
+                                           const std::atomic<bool>* alive = nullptr);
 
 class ServerEndpoint final : public IncomingCallHandler {
 public:
