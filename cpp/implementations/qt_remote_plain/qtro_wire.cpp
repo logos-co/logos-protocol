@@ -1,6 +1,7 @@
 #include "qtro_wire.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -23,6 +24,10 @@ void appendLittle(std::vector<std::uint8_t>& out, UInt value)
         out.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
 }
 
+constexpr std::uint32_t kReplacement = 0xfffd;
+
+// Invalid input becomes U+FFFD, as QString::fromUtf8 and toUtf8 do; Qt peers
+// legitimately send strings with lone surrogates.
 std::vector<std::uint16_t> utf8ToUtf16(std::string_view input)
 {
     std::vector<std::uint16_t> out;
@@ -43,20 +48,21 @@ std::vector<std::uint16_t> utf8ToUtf16(std::string_view input)
         } else if ((first & 0xf8) == 0xf0) {
             cp = first & 0x07;
             count = 4;
-        } else {
-            throw CodecError("invalid UTF-8 lead byte");
         }
-        if (i + count > input.size())
-            throw CodecError("truncated UTF-8 sequence");
-        for (std::size_t j = 1; j < count; ++j) {
+        bool valid = count != 0 && i + count <= input.size();
+        for (std::size_t j = 1; valid && j < count; ++j) {
             const auto next = static_cast<std::uint8_t>(input[i + j]);
-            if ((next & 0xc0) != 0x80)
-                throw CodecError("invalid UTF-8 continuation byte");
+            valid = (next & 0xc0) == 0x80;
             cp = (cp << 6) | (next & 0x3f);
         }
         const std::uint32_t minimum[] = {0, 0, 0x80, 0x800, 0x10000};
-        if (cp < minimum[count] || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
-            throw CodecError("invalid UTF-8 code point");
+        if (valid && (cp < minimum[count] || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)))
+            valid = false;
+        if (!valid) {
+            out.push_back(static_cast<std::uint16_t>(kReplacement));
+            ++i;
+            continue;
+        }
         if (cp <= 0xffff) {
             out.push_back(static_cast<std::uint16_t>(cp));
         } else {
@@ -69,19 +75,21 @@ std::vector<std::uint16_t> utf8ToUtf16(std::string_view input)
     return out;
 }
 
-std::string utf16ToUtf8(const std::vector<std::uint16_t>& input)
+std::string utf16ToUtf8(const std::vector<std::uint16_t>& input, bool* lossy = nullptr)
 {
     std::string out;
     out.reserve(input.size());
     for (std::size_t i = 0; i < input.size(); ++i) {
         std::uint32_t cp = input[i];
         if (cp >= 0xd800 && cp <= 0xdbff) {
-            if (++i >= input.size() || input[i] < 0xdc00 || input[i] > 0xdfff)
-                throw CodecError("invalid UTF-16 surrogate pair");
-            cp = 0x10000 + ((cp - 0xd800) << 10) + (input[i] - 0xdc00);
+            if (i + 1 < input.size() && input[i + 1] >= 0xdc00 && input[i + 1] <= 0xdfff)
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (input[++i] - 0xdc00);
+            else
+                cp = kReplacement;
         } else if (cp >= 0xdc00 && cp <= 0xdfff) {
-            throw CodecError("unexpected UTF-16 low surrogate");
+            cp = kReplacement;
         }
+        if (cp == kReplacement && input[i] != kReplacement && lossy) *lossy = true;
         if (cp < 0x80) {
             out.push_back(static_cast<char>(cp));
         } else if (cp < 0x800) {
@@ -147,17 +155,88 @@ plain::RpcValue jsonToRpc(const nlohmann::json& value)
 
 std::vector<std::uint8_t> jsonBytes(const plain::RpcValue& value)
 {
-    const std::string text = rpcToJson(value).dump();
+    const std::string text = rpcToJson(value).dump(
+        -1, ' ', false, nlohmann::json::error_handler_t::replace);
     return {text.begin(), text.end()};
 }
 
-plain::RpcValue parseJsonBytes(const std::vector<std::uint8_t>& bytes)
+// Qt writes a null QJsonDocument as a null QByteArray and reads an empty
+// buffer as a null document; `empty` is what that decodes to for the type.
+plain::RpcValue parseJsonBytes(const std::optional<std::vector<std::uint8_t>>& bytes,
+                               plain::RpcValue empty = {})
 {
-    const std::string text(bytes.begin(), bytes.end());
+    if (!bytes || bytes->empty())
+        return empty;
+    const std::string text(bytes->begin(), bytes->end());
     const auto parsed = nlohmann::json::parse(text, nullptr, false);
     if (parsed.is_discarded())
         throw CodecError("invalid QJson payload");
     return jsonToRpc(parsed);
+}
+
+std::string utf8Of(std::uint32_t cp)
+{
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = kReplacement;
+    std::string out;
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+    return out;
+}
+
+std::int64_t floorDiv(std::int64_t a, std::int64_t b)
+{
+    return a / b - ((a % b != 0) && ((a < 0) != (b < 0)) ? 1 : 0);
+}
+
+// QDate::toString(Qt::ISODate): proleptic Gregorian, years 1..9999 only.
+std::string isoDate(std::int64_t jd)
+{
+    if (jd < 1721426 || jd > 5373484) return {};
+    const std::int64_t a = jd + 32044;
+    const std::int64_t b = floorDiv(4 * a + 3, 146097);
+    const std::int64_t c = a - floorDiv(146097 * b, 4);
+    const std::int64_t d = floorDiv(4 * c + 3, 1461);
+    const std::int64_t e = c - floorDiv(1461 * d, 4);
+    const std::int64_t m = floorDiv(5 * e + 2, 153);
+    const std::int64_t day = e - floorDiv(153 * m + 2, 5) + 1;
+    const std::int64_t month = m + 3 - 12 * floorDiv(m, 10);
+    const std::int64_t year = 100 * b + d - 4800 + floorDiv(m, 10);
+    char text[16];
+    std::snprintf(text, sizeof(text), "%04d-%02d-%02d", static_cast<int>(year),
+                  static_cast<int>(month), static_cast<int>(day));
+    return text;
+}
+
+// QTime::toString(Qt::ISODateWithMs); a null time is -1 milliseconds.
+std::string isoTime(std::int32_t msecs)
+{
+    if (msecs < 0 || msecs >= 86400000) return {};
+    char text[16];
+    std::snprintf(text, sizeof(text), "%02d:%02d:%02d.%03d", msecs / 3600000,
+                  msecs / 60000 % 60, msecs / 1000 % 60, msecs % 1000);
+    return text;
+}
+
+std::string isoOffset(std::int32_t seconds)
+{
+    const char sign = seconds < 0 ? '-' : '+';
+    const std::int32_t magnitude = seconds < 0 ? -seconds : seconds;
+    char text[16];
+    std::snprintf(text, sizeof(text), "%c%02d:%02d", sign, magnitude / 3600, magnitude / 60 % 60);
+    return text;
 }
 
 std::vector<std::pair<std::vector<std::uint16_t>, const std::pair<std::string, plain::RpcValue>*>>
@@ -180,6 +259,69 @@ const plain::RpcValue& requiredMapValue(const plain::RpcMap& map, const char* ke
         throw CodecError(std::string("LogosResult is missing '") + key + "'");
     return *value;
 }
+
+// Checked accessors: a Variant whose value does not match its type must fail
+// the one frame being encoded, never escape as std::bad_variant_access.
+[[noreturn]] void mismatch(const char* expected)
+{
+    throw CodecError(std::string("QVariant value is not a ") + expected);
+}
+
+bool boolOf(const plain::RpcValue& value)
+{
+    if (!value.isBool()) mismatch("bool");
+    return value.asBool();
+}
+
+std::int64_t integerOf(const plain::RpcValue& value)
+{
+    if (value.isInt()) return value.asInt();
+    if (value.isUInt()) return static_cast<std::int64_t>(value.asUInt());
+    if (value.isBool()) return value.asBool() ? 1 : 0;
+    mismatch("integer");
+}
+
+std::uint64_t unsignedOf(const plain::RpcValue& value)
+{
+    if (value.isUInt()) return value.asUInt();
+    if (value.isInt()) return static_cast<std::uint64_t>(value.asInt());
+    if (value.isBool()) return value.asBool() ? 1 : 0;
+    mismatch("unsigned integer");
+}
+
+double realOf(const plain::RpcValue& value)
+{
+    if (value.isDouble()) return value.asDouble();
+    if (value.isInt()) return static_cast<double>(value.asInt());
+    if (value.isUInt()) return static_cast<double>(value.asUInt());
+    mismatch("number");
+}
+
+const std::string& stringOf(const plain::RpcValue& value)
+{
+    if (!value.isString()) mismatch("string");
+    return value.asString();
+}
+
+const plain::RpcList& listOf(const plain::RpcValue& value)
+{
+    if (!value.isList()) mismatch("list");
+    return value.asList();
+}
+
+const plain::RpcMap& mapOf(const plain::RpcValue& value)
+{
+    if (!value.isMap()) mismatch("map");
+    return value.asMap();
+}
+
+const std::vector<std::uint8_t>& bytesOf(const plain::RpcValue& value)
+{
+    if (!value.isBytes()) mismatch("byte array");
+    return value.asBytes().data;
+}
+
+constexpr std::size_t kMaxNesting = 64;
 
 Writer packetPrefix(PacketType type, std::string_view name)
 {
@@ -249,7 +391,8 @@ bool Variant::operator==(const Variant& other) const
         && value == other.value && customType == other.customType
         && jsonUndefined == other.jsonUndefined
         && nestedKeys == other.nestedKeys
-        && nestedValues == other.nestedValues;
+        && nestedValues == other.nestedValues
+        && raw == other.raw && opaque == other.opaque;
 }
 
 void Writer::u8(std::uint8_t value) { m_data.push_back(value); }
@@ -326,44 +469,91 @@ void Writer::variant(const Variant& input)
     u8(input.isNull ? 1 : 0);
     if (input.type == MetaType::User)
         byteString(input.customType, true);
+    if (input.opaque || !input.raw.empty()) {
+        raw(input.raw);
+        return;
+    }
 
     switch (input.type) {
     case MetaType::Invalid:
         return;
     case MetaType::Bool:
-        boolean(input.value.asBool());
+        boolean(boolOf(input.value));
         return;
     case MetaType::Int:
-        i32(static_cast<std::int32_t>(input.value.asInt()));
+        i32(static_cast<std::int32_t>(integerOf(input.value)));
         return;
     case MetaType::UInt:
-        u32(static_cast<std::uint32_t>(input.value.isUInt() ? input.value.asUInt() : input.value.asInt()));
+        u32(static_cast<std::uint32_t>(unsignedOf(input.value)));
         return;
     case MetaType::LongLong:
-        i64(input.value.asInt());
+    case MetaType::Long:
+        i64(integerOf(input.value));
         return;
     case MetaType::ULongLong:
-        u64(input.value.isUInt() ? input.value.asUInt() : static_cast<std::uint64_t>(input.value.asInt()));
+    case MetaType::ULong:
+        u64(unsignedOf(input.value));
         return;
     case MetaType::Double:
-        real(input.value.asDouble());
+    case MetaType::Float: // DoublePrecision streams write floats as doubles
+        real(realOf(input.value));
         return;
+    case MetaType::Short:
+        u16(static_cast<std::uint16_t>(static_cast<std::int16_t>(integerOf(input.value))));
+        return;
+    case MetaType::UShort:
+        u16(static_cast<std::uint16_t>(unsignedOf(input.value)));
+        return;
+    case MetaType::Char:
+    case MetaType::SChar:
+        u8(static_cast<std::uint8_t>(static_cast<std::int8_t>(integerOf(input.value))));
+        return;
+    case MetaType::UChar:
+        u8(static_cast<std::uint8_t>(unsignedOf(input.value)));
+        return;
+    case MetaType::Character:
+    case MetaType::Char16: {
+        const auto units = utf8ToUtf16(stringOf(input.value));
+        u16(units.empty() ? 0 : units.front());
+        return;
+    }
+    case MetaType::Char32: {
+        const auto units = utf8ToUtf16(stringOf(input.value));
+        std::uint32_t cp = units.empty() ? 0 : units.front();
+        if (cp >= 0xd800 && cp <= 0xdbff && units.size() > 1)
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (units[1] - 0xdc00);
+        u32(cp);
+        return;
+    }
     case MetaType::String:
-        string(input.value.asString());
+        string(stringOf(input.value));
+        return;
+    case MetaType::Url:
+        byteString(stringOf(input.value));
         return;
     case MetaType::ByteArray:
-        bytes(input.value.asBytes().data);
+        bytes(bytesOf(input.value));
         return;
     case MetaType::StringList: {
+        const auto& items = listOf(input.value).items;
         std::vector<std::string> strings;
-        strings.reserve(input.value.asList().items.size());
-        for (const auto& value : input.value.asList().items)
-            strings.push_back(value.asString());
+        strings.reserve(items.size());
+        for (const auto& value : items)
+            strings.push_back(stringOf(value));
         stringList(strings);
         return;
     }
+    case MetaType::ByteArrayList: {
+        const auto& items = listOf(input.value).items;
+        if (items.size() > std::numeric_limits<std::uint32_t>::max())
+            throw CodecError("QByteArrayList is too large");
+        u32(static_cast<std::uint32_t>(items.size()));
+        for (const auto& value : items)
+            bytes(bytesOf(value));
+        return;
+    }
     case MetaType::VariantList: {
-        const auto& list = input.value.asList().items;
+        const auto& list = listOf(input.value).items;
         if (list.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantList is too large");
         u32(static_cast<std::uint32_t>(list.size()));
@@ -372,8 +562,9 @@ void Writer::variant(const Variant& input)
             variant(typed ? input.nestedValues[i] : Variant::fromRpc(list[i]));
         return;
     }
-    case MetaType::VariantMap: {
-        const auto entries = sortedMapEntries(input.value.asMap());
+    case MetaType::VariantMap:
+    case MetaType::VariantHash: {
+        const auto entries = sortedMapEntries(mapOf(input.value));
         if (entries.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantMap is too large");
         u32(static_cast<std::uint32_t>(entries.size()));
@@ -407,9 +598,7 @@ void Writer::variant(const Variant& input)
             boolean(input.value.asBool());
         } else if (input.value.isDouble() || input.value.isIntegral()) {
             u8(2);
-            real(input.value.isDouble() ? input.value.asDouble()
-                                        : input.value.isUInt() ? static_cast<double>(input.value.asUInt())
-                                                               : static_cast<double>(input.value.asInt()));
+            real(realOf(input.value));
         } else if (input.value.isString()) {
             u8(3);
             string(input.value.asString());
@@ -430,8 +619,8 @@ void Writer::variant(const Variant& input)
     case MetaType::User: {
         if (input.customType != "LogosResult")
             throw CodecError("unsupported QVariant custom type: " + input.customType);
-        const auto& map = input.value.asMap();
-        boolean(requiredMapValue(map, "success").asBool());
+        const auto& map = mapOf(input.value);
+        boolean(boolOf(requiredMapValue(map, "success")));
         const bool typed = input.nestedValues.size() == 2;
         variant(typed ? input.nestedValues[0]
                       : Variant::fromRpc(requiredMapValue(map, "value")));
@@ -439,8 +628,14 @@ void Writer::variant(const Variant& input)
                       : Variant::fromRpc(requiredMapValue(map, "error")));
         return;
     }
+    case MetaType::Date:
+    case MetaType::Time:
+    case MetaType::DateTime:
+    case MetaType::Uuid:
+        throw CodecError("QVariant date/time and QUuid values need their serialized form");
     }
-    throw CodecError("unsupported QVariant metatype");
+    throw CodecError("unsupported QVariant metatype id "
+                     + std::to_string(static_cast<std::uint32_t>(input.type)));
 }
 
 void Writer::classDefinition(const ClassDefinition& value)
@@ -559,6 +754,11 @@ std::optional<std::vector<std::uint8_t>> Reader::bytes()
 
 std::optional<std::string> Reader::string()
 {
+    return string(nullptr);
+}
+
+std::optional<std::string> Reader::string(bool* lossy)
+{
     const auto byteCount = u32();
     if (byteCount == kNullSize)
         return std::nullopt;
@@ -569,7 +769,7 @@ std::optional<std::string> Reader::string()
     units.reserve(byteCount / 2);
     for (std::uint32_t i = 0; i < byteCount / 2; ++i)
         units.push_back(u16());
-    return utf16ToUtf8(units);
+    return utf16ToUtf8(units, lossy);
 }
 
 std::vector<std::string> Reader::stringList()
@@ -600,7 +800,7 @@ std::vector<std::string> Reader::byteStringList()
     return result;
 }
 
-Variant Reader::variant()
+Variant Reader::variantHeader()
 {
     Variant result;
     result.type = static_cast<MetaType>(u32());
@@ -611,6 +811,29 @@ Variant Reader::variant()
             throw CodecError("invalid QVariant custom type name");
         result.customType.assign(name->begin(), name->end() - 1);
     }
+    return result;
+}
+
+Variant Reader::variant()
+{
+    if (m_depth >= kMaxNesting)
+        throw CodecError("QVariant nesting exceeds transport limit");
+    ++m_depth;
+    struct Leave {
+        std::size_t& depth;
+        ~Leave() { --depth; }
+    } leave{m_depth};
+
+    Variant result = variantHeader();
+    const std::size_t dataStart = m_pos;
+    // Keep the serialized form where the RpcValue alone cannot reproduce it.
+    bool keepRaw = false;
+    const auto text = [&](bool& inexact) {
+        bool lossy = false;
+        auto value = string(&lossy);
+        inexact = !value || lossy;
+        return value.value_or(std::string{});
+    };
 
     switch (result.type) {
     case MetaType::Invalid:
@@ -626,27 +849,142 @@ Variant Reader::variant()
         result.value = plain::RpcValue::makeInteger(u32());
         break;
     case MetaType::LongLong:
+    case MetaType::Long: // QMetaType::save writes long as qlonglong
         result.value = plain::RpcValue{i64()};
         break;
     case MetaType::ULongLong:
+    case MetaType::ULong:
         result.value = plain::RpcValue::makeInteger(u64());
         break;
     case MetaType::Double:
+    case MetaType::Float: // DoublePrecision streams write floats as doubles
         result.value = plain::RpcValue{real()};
         break;
-    case MetaType::String:
-        result.value = plain::RpcValue{string().value_or(std::string{})};
+    case MetaType::Short:
+        result.value = plain::RpcValue{static_cast<std::int64_t>(static_cast<std::int16_t>(u16()))};
         break;
+    case MetaType::UShort:
+        result.value = plain::RpcValue{static_cast<std::int64_t>(u16())};
+        break;
+    case MetaType::Char:
+    case MetaType::SChar:
+        result.value = plain::RpcValue{static_cast<std::int64_t>(static_cast<std::int8_t>(u8()))};
+        break;
+    case MetaType::UChar:
+        result.value = plain::RpcValue{static_cast<std::int64_t>(u8())};
+        break;
+    case MetaType::Character:
+    case MetaType::Char16:
+        result.value = plain::RpcValue{utf16ToUtf8({u16()}, nullptr)};
+        keepRaw = true;
+        break;
+    case MetaType::Char32:
+        result.value = plain::RpcValue{utf8Of(u32())};
+        keepRaw = true;
+        break;
+    case MetaType::String: {
+        bool inexact = false;
+        result.value = plain::RpcValue{text(inexact)};
+        keepRaw = inexact;
+        break;
+    }
     case MetaType::ByteArray: {
-        plain::RpcBytes value;
-        value.data = bytes().value_or(std::vector<std::uint8_t>{});
-        result.value = plain::RpcValue{std::move(value)};
+        const auto value = bytes();
+        plain::RpcBytes data;
+        if (value) data.data = *value;
+        result.value = plain::RpcValue{std::move(data)};
+        keepRaw = !value;
+        break;
+    }
+    case MetaType::Url: { // QUrl::toEncoded(), null for an invalid URL
+        const auto encoded = bytes();
+        result.value = plain::RpcValue{encoded ? std::string(encoded->begin(), encoded->end())
+                                               : std::string{}};
+        keepRaw = true;
+        break;
+    }
+    case MetaType::Uuid: { // little endian fields: data1, data2, data3, data4[8]
+        const auto data1 = u32();
+        const auto data2 = u16();
+        const auto data3 = u16();
+        std::uint8_t data4[8];
+        for (auto& byte : data4) byte = u8();
+        char textValue[40];
+        std::snprintf(textValue, sizeof(textValue),
+                      "{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+                      data1, data2, data3, data4[0], data4[1], data4[2], data4[3],
+                      data4[4], data4[5], data4[6], data4[7]);
+        result.value = plain::RpcValue{std::string(textValue)};
+        keepRaw = true;
+        break;
+    }
+    case MetaType::Date:
+        result.value = plain::RpcValue{isoDate(i64())};
+        keepRaw = true;
+        break;
+    case MetaType::Time:
+        result.value = plain::RpcValue{isoTime(i32())};
+        keepRaw = true;
+        break;
+    case MetaType::DateTime: {
+        const std::string date = isoDate(i64());
+        const std::string time = isoTime(i32());
+        const auto spec = static_cast<std::int8_t>(u8());
+        std::string suffix;
+        if (spec == 1) { // Qt::UTC
+            suffix = "Z";
+        } else if (spec == 2) { // Qt::OffsetFromUTC
+            suffix = isoOffset(i32());
+        } else if (spec == 3) { // Qt::TimeZone, then a QTimeZone
+            bool ignored = false;
+            const std::string zone = text(ignored);
+            if (zone == "OffsetFromUtc") {
+                (void)text(ignored);
+                suffix = isoOffset(i32());
+                (void)text(ignored);
+                (void)text(ignored);
+                (void)i32();
+                (void)text(ignored);
+            } else if (zone == "AheadOfUtcBy") {
+                suffix = isoOffset(i32());
+            } else if (zone == "QTimeZone::UTC") {
+                suffix = "Z";
+            } else if (zone != "QTimeZone::LocalTime" && zone != "-No Time Zone Specified!") {
+                suffix = "[" + zone + "]";
+            }
+        }
+        result.value = plain::RpcValue{date.empty() || time.empty()
+                                           ? std::string{} : date + "T" + time + suffix};
+        keepRaw = true;
         break;
     }
     case MetaType::StringList: {
+        const auto count = u32();
+        if (count > kMaxContainerEntries)
+            throw CodecError("QStringList exceeds transport limit");
         plain::RpcList list;
-        for (auto& item : stringList())
-            list.items.emplace_back(std::move(item));
+        list.items.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            bool inexact = false;
+            list.items.emplace_back(text(inexact));
+            keepRaw = keepRaw || inexact;
+        }
+        result.value = plain::RpcValue{std::move(list)};
+        break;
+    }
+    case MetaType::ByteArrayList: {
+        const auto count = u32();
+        if (count > kMaxContainerEntries)
+            throw CodecError("QByteArrayList exceeds transport limit");
+        plain::RpcList list;
+        list.items.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto value = bytes();
+            plain::RpcBytes data;
+            if (value) data.data = *value;
+            list.items.emplace_back(std::move(data));
+            keepRaw = keepRaw || !value;
+        }
         result.value = plain::RpcValue{std::move(list)};
         break;
     }
@@ -665,7 +1003,8 @@ Variant Reader::variant()
         result.value = plain::RpcValue{std::move(list)};
         break;
     }
-    case MetaType::VariantMap: {
+    case MetaType::VariantMap:
+    case MetaType::VariantHash: {
         const auto count = u32();
         if (count > kMaxContainerEntries)
             throw CodecError("QVariantMap exceeds transport limit");
@@ -691,8 +1030,8 @@ Variant Reader::variant()
         case 1: result.value = plain::RpcValue{boolean()}; break;
         case 2: result.value = plain::RpcValue{real()}; break;
         case 3: result.value = plain::RpcValue{string().value_or(std::string{})}; break;
-        case 4:
-        case 5: result.value = parseJsonBytes(bytes().value_or(std::vector<std::uint8_t>{})); break;
+        case 4: result.value = parseJsonBytes(bytes(), plain::RpcValue{plain::RpcList{}}); break;
+        case 5: result.value = parseJsonBytes(bytes(), plain::RpcValue{plain::RpcMap{}}); break;
         case 0x80:
             result.value = plain::RpcValue{};
             result.jsonUndefined = true;
@@ -702,10 +1041,17 @@ Variant Reader::variant()
         break;
     }
     case MetaType::JsonObject:
-    case MetaType::JsonArray:
-    case MetaType::JsonDocument:
-        result.value = parseJsonBytes(bytes().value_or(std::vector<std::uint8_t>{}));
+        result.value = parseJsonBytes(bytes(), plain::RpcValue{plain::RpcMap{}});
         break;
+    case MetaType::JsonArray:
+        result.value = parseJsonBytes(bytes(), plain::RpcValue{plain::RpcList{}});
+        break;
+    case MetaType::JsonDocument: {
+        const auto payload = bytes();
+        result.value = parseJsonBytes(payload);
+        keepRaw = !payload || payload->empty();
+        break;
+    }
     case MetaType::User: {
         if (result.customType != "LogosResult")
             throw CodecError("unsupported QVariant custom type: " + result.customType);
@@ -724,7 +1070,29 @@ Variant Reader::variant()
         throw CodecError("unsupported QVariant metatype id "
                          + std::to_string(static_cast<std::uint32_t>(result.type)));
     }
+    if (keepRaw)
+        result.raw.assign(m_data + dataStart, m_data + m_pos);
     return result;
+}
+
+Variant Reader::variantUntil(std::size_t end)
+{
+    if (end > m_size || end < m_pos)
+        throw CodecError("QVariant bounds are outside the packet");
+    const std::size_t start = m_pos;
+    try {
+        Variant value = variant();
+        if (m_pos != end)
+            throw CodecError("QVariant does not end where the packet does");
+        return value;
+    } catch (const CodecError&) {
+        m_pos = start;
+        Variant value = variantHeader();
+        value.opaque = true;
+        value.raw.assign(m_data + m_pos, m_data + end);
+        m_pos = end;
+        return value;
+    }
 }
 
 ClassDefinition Reader::classDefinition()
