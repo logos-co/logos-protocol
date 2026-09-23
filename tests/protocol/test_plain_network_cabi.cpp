@@ -6,11 +6,19 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/io_context.hpp>
 
+#include <nlohmann/json.hpp>
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -61,6 +69,37 @@ struct DeferredState {
     int status = LP_ERR_INTERNAL;
     std::string value;
 };
+
+bool writeSelfSignedCert(const std::filesystem::path& certPath,
+                         const std::filesystem::path& keyPath)
+{
+    EVP_PKEY* key = EVP_EC_gen("P-256");
+    X509* cert = X509_new();
+    bool ok = key && cert;
+    if (ok) {
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+        X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+        X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
+        X509_set_pubkey(cert, key);
+        X509_NAME* name = X509_get_subject_name(cert);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("127.0.0.1"), -1, -1, 0);
+        X509_set_issuer_name(cert, name);
+        ok = X509_sign(cert, key, EVP_sha256()) > 0;
+    }
+    if (ok) {
+        FILE* keyFile = std::fopen(keyPath.string().c_str(), "wb");
+        FILE* certFile = std::fopen(certPath.string().c_str(), "wb");
+        ok = keyFile && certFile
+            && PEM_write_PrivateKey(keyFile, key, nullptr, nullptr, 0, nullptr, nullptr)
+            && PEM_write_X509(certFile, cert);
+        if (keyFile) std::fclose(keyFile);
+        if (certFile) std::fclose(certFile);
+    }
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    return ok;
+}
 
 char* deferredDispatch(const char* method, const char*, void* user)
 {
@@ -136,25 +175,40 @@ TEST(PlainNetworkCAbi, TcpCallAndEventWithoutQt)
     lp_provider_destroy(provider);
 }
 
-TEST(PlainNetworkCAbi, TcpDeferredCompletionBypassesPublicEventCallback)
+void runDeferredCompletionFromCallback(bool tls)
 {
     boost::asio::io_context io;
     boost::asio::ip::tcp::acceptor reservation(io,
         {boost::asio::ip::address_v4::loopback(), 0});
     const auto port = reservation.local_endpoint().port();
     reservation.close();
-    const std::string config = std::string(R"({"protocol":"tcp","host":"127.0.0.1","port":)")
-        + std::to_string(port) + "}";
+    const auto directory = std::filesystem::temp_directory_path()
+        / ("logos-plain-deferred-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (tls) {
+        std::filesystem::create_directories(directory);
+        ASSERT_TRUE(writeSelfSignedCert(directory / "cert.pem", directory / "key.pem"));
+    }
+    nlohmann::json clientConfig = {
+        {"protocol", tls ? "tcp_ssl" : "tcp"},
+        {"host", "127.0.0.1"}, {"port", port}, {"verify_peer", false}};
+    nlohmann::json serverConfig = clientConfig;
+    if (tls) {
+        serverConfig["cert_file"] = (directory / "cert.pem").string();
+        serverConfig["key_file"] = (directory / "key.pem").string();
+    }
+    const std::string clientJson = clientConfig.dump();
+    const std::string serverSet = nlohmann::json::array({serverConfig}).dump();
 
     DeferredState state;
-    state.provider = lp_provider_create("plain_network_deferred", ("[" + config + "]").c_str());
+    state.provider = lp_provider_create("plain_network_deferred", serverSet.c_str());
     ASSERT_NE(state.provider, nullptr);
     ASSERT_EQ(lp_provider_save_token(state.provider, "network_test", "secret"), LP_OK);
     ASSERT_EQ(lp_provider_register(state.provider, deferredDispatch, methods, token,
                                    &state), LP_OK);
     ASSERT_EQ(lp_token_save("plain_network_deferred", "secret"), LP_OK);
     state.client = lp_client_create("plain_network_deferred", "network_test",
-                                     config.c_str(), config.c_str());
+                                     clientJson.c_str(), clientJson.c_str());
     ASSERT_NE(state.client, nullptr);
 
     char* ordinary = nullptr;
@@ -183,6 +237,17 @@ TEST(PlainNetworkCAbi, TcpDeferredCompletionBypassesPublicEventCallback)
     lp_unsubscribe(subscription);
     lp_client_destroy(state.client);
     lp_provider_destroy(state.provider);
+    if (tls) std::filesystem::remove_all(directory);
+}
+
+TEST(PlainNetworkCAbi, TcpDeferredCompletionBypassesPublicEventCallback)
+{
+    runDeferredCompletionFromCallback(false);
+}
+
+TEST(PlainNetworkCAbi, TlsDeferredCompletionBypassesPublicEventCallback)
+{
+    runDeferredCompletionFromCallback(true);
 }
 
 TEST(PlainNetworkCAbi, SilentTlsPeerCannotOutliveInvocationDeadline)
@@ -198,7 +263,7 @@ TEST(PlainNetworkCAbi, SilentTlsPeerCannotOutliveInvocationDeadline)
     });
 
     const std::string config = std::string(R"({"protocol":"tcp_ssl","host":"127.0.0.1","port":)")
-        + std::to_string(port) + R"(,"verifyPeer":false})";
+        + std::to_string(port) + R"(,"verify_peer":false})";
     EXPECT_EQ(lp_token_save("plain_tls_deadline", "secret"), LP_OK);
     lp_client* client = lp_client_create("plain_tls_deadline", "network_test",
                                          config.c_str(), config.c_str());
@@ -232,7 +297,7 @@ TEST(PlainNetworkCAbi, ClientDestroyCancelsSubscriptionDialToSilentTlsPeer)
     });
 
     const std::string config = std::string(R"({"protocol":"tcp_ssl","host":"127.0.0.1","port":)")
-        + std::to_string(port) + R"(,"verifyPeer":false})";
+        + std::to_string(port) + R"(,"verify_peer":false})";
     lp_client* client = lp_client_create("plain_tls_subscription", "network_test",
                                          config.c_str(), config.c_str());
     EXPECT_NE(client, nullptr);
