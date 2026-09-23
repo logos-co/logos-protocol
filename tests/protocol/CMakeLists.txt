@@ -482,6 +482,33 @@ add_test(NAME QtRemotePlainRegression.adapter-shutdown
          COMMAND qt_remote_plain_regression_probe)
 set_tests_properties(QtRemotePlainRegression.adapter-shutdown PROPERTIES TIMEOUT 8)
 
+# ELF only: one process loading both shared protocol libraries, each ahead of
+# the other's consumer. Mach-O and PE bind every import to a named library.
+if(UNIX AND NOT APPLE)
+add_library(plain_consumer_probe SHARED protocol_consumer_probe.cpp)
+target_compile_definitions(plain_consumer_probe PRIVATE PROBE_FUNCTION=plainConsumerResolvesTo)
+target_link_libraries(plain_consumer_probe PRIVATE logos_protocol_plain_shared ${CMAKE_DL_LIBS})
+add_library(qt_consumer_probe SHARED protocol_consumer_probe.cpp)
+target_compile_definitions(qt_consumer_probe PRIVATE PROBE_FUNCTION=qtConsumerResolvesTo)
+target_link_libraries(qt_consumer_probe PRIVATE logos_protocol_shared ${CMAKE_DL_LIBS})
+# basecamp's order: the Qt library ahead of a plain consumer.
+add_executable(protocol_symbol_isolation_plain_tests test_protocol_symbol_isolation.cpp)
+target_compile_definitions(protocol_symbol_isolation_plain_tests PRIVATE
+    PROBE_FUNCTION=plainConsumerResolvesTo EXPECTED_LIBRARY="liblogos_protocol_plain.")
+target_link_options(protocol_symbol_isolation_plain_tests PRIVATE "LINKER:--no-as-needed")
+target_link_libraries(protocol_symbol_isolation_plain_tests PRIVATE
+    logos_protocol_shared plain_consumer_probe GTest::gtest_main)
+gtest_discover_tests(protocol_symbol_isolation_plain_tests)
+# The reverse order: the plain library ahead of a Qt consumer.
+add_executable(protocol_symbol_isolation_qt_tests test_protocol_symbol_isolation.cpp)
+target_compile_definitions(protocol_symbol_isolation_qt_tests PRIVATE
+    PROBE_FUNCTION=qtConsumerResolvesTo EXPECTED_LIBRARY="liblogos_protocol.")
+target_link_options(protocol_symbol_isolation_qt_tests PRIVATE "LINKER:--no-as-needed")
+target_link_libraries(protocol_symbol_isolation_qt_tests PRIVATE
+    logos_protocol_plain_shared qt_consumer_probe GTest::gtest_main)
+gtest_discover_tests(protocol_symbol_isolation_qt_tests)
+endif()
+
 if(NOT WIN32)
 add_executable(qt_remote_plain_relative_path_probe
     qt_remote_plain_relative_path_probe.cpp

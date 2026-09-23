@@ -173,6 +173,23 @@ set_target_properties(logos_protocol_plain_shared PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# One process can load both shared protocol libraries (basecamp: liblogos_core
+# links the plain one, logos-qt-host the Qt one) and both export the lp_* C
+# ABI. On ELF a version node binds each consumer's references to the library
+# it linked, and -Bsymbolic-functions keeps each library's own calls inside it.
+# Data stays shared, so inline singletons remain one per process.
+function(logos_protocol_isolate_elf_exports target node)
+    if(UNIX AND NOT APPLE)
+        set(_script "${CMAKE_CURRENT_BINARY_DIR}/${target}.version")
+        file(WRITE "${_script}" "${node} { global: *; };\n")
+        target_link_options(${target} PRIVATE
+            "LINKER:--version-script=${_script}" "LINKER:-Bsymbolic-functions")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_script}")
+    endif()
+endfunction()
+
+logos_protocol_isolate_elf_exports(logos_protocol_plain_shared LOGOS_PROTOCOL_PLAIN)
+
 # PE exports no C++ symbols unless they are named explicitly. Generate the
 # plain runtime's export table from its matching static archive so consumers can
 # call both the lp_* C ABI and the transport-config helpers without maintaining
@@ -411,6 +428,7 @@ set_target_properties(logos_protocol_shared PROPERTIES
     OUTPUT_NAME logos_protocol
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
+logos_protocol_isolate_elf_exports(logos_protocol_shared LOGOS_PROTOCOL)
 
 # ARCHIVE DESTINATION is NOT redundant here. On Windows a shared library's
 # import library (.dll.a) is the ARCHIVE artifact and the DLL itself is RUNTIME,
