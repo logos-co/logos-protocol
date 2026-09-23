@@ -63,6 +63,7 @@ void event(const char* name, const char* data, void* user)
 struct DeferredState {
     lp_provider* provider = nullptr;
     lp_client* client = nullptr;
+    std::atomic<bool> callbackStarted{false};
     std::mutex mutex;
     std::condition_variable changed;
     bool done = false;
@@ -114,6 +115,7 @@ char* deferredDispatch(const char* method, const char*, void* user)
 void callDeferredFromEvent(const char*, const char*, void* user)
 {
     auto& state = *static_cast<DeferredState*>(user);
+    if (state.callbackStarted.exchange(true)) return;
     char* value = nullptr;
     char* error = nullptr;
     const int status = lp_invoke(state.client, "deferred", "[]", 500,
@@ -230,9 +232,12 @@ void runDeferredCompletionFromCallback(bool tls)
             return state.done;
         })) break;
     }
-    EXPECT_TRUE(state.done);
-    EXPECT_EQ(state.status, LP_OK);
-    EXPECT_EQ(state.value, R"("completed")");
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        EXPECT_TRUE(state.done);
+        EXPECT_EQ(state.status, LP_OK);
+        EXPECT_EQ(state.value, R"("completed")");
+    }
 
     lp_unsubscribe(subscription);
     lp_client_destroy(state.client);
