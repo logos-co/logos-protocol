@@ -1656,6 +1656,56 @@ TEST(QtRemotePlainCabiTest, NonNegativeIntegersCrossAsQulonglong)
     EXPECT_EQ(argumentTypes[1], MetaType::LongLong);
 }
 
+// Detector: introspection asked only getPluginInterface(), which providers
+// built before logos-cpp-sdk #71 do not have, so it failed outright.
+TEST(QtRemotePlainCabiTest, IntrospectionFallsBackForProvidersBeforeGetPluginInterface)
+{
+    using logos::plain::RpcList;
+    using logos::plain::RpcMap;
+    using logos::plain::RpcValue;
+    using logos::qt_remote_plain::MetaType;
+    using logos::qt_remote_plain::Variant;
+    setInstanceId("qtro_cabi_legacy_introspection_");
+    const auto entries = [](const char* name, const char* type) {
+        RpcMap entry;
+        entry.emplace("name", RpcValue{name});
+        if (type) entry.emplace("type", RpcValue{type});
+        return Variant{MetaType::JsonArray, false, RpcValue{RpcList{{RpcValue{std::move(entry)}}}}, {}};
+    };
+    logos::qt_remote_plain::Server legacy;
+    logos::qt_remote_plain::Server::Object object;
+    object.name = "legacy_provider";
+    object.definition.typeName = "legacy_provider";
+    object.definition.methodDefinitions = {
+        {"callRemoteMethod(QString,QString,QVariantList)", "QVariant",
+         {"authToken", "methodName", "args"}},
+        {"informModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "token"}},
+        {"getPluginMethods()", "QJsonArray", {}},
+        {"getPluginEvents()", "QJsonArray", {}}};
+    object.invoke = [&](std::int32_t index, const std::vector<Variant>&) {
+        if (index == 2) return entries("legacyCall", "method");
+        if (index == 3) return entries("legacyEvent", nullptr);
+        return Variant{};
+    };
+    std::string error;
+    ASSERT_TRUE(legacy.start("local:logos_legacy_provider_"
+        + std::string(std::getenv("LOGOS_INSTANCE_ID")), &error)) << error;
+    ASSERT_TRUE(legacy.publish(std::move(object), &error)) << error;
+
+    lp_client* client = lp_client_create("legacy_provider", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    char* interface = lp_get_methods(client);
+    lp_client_destroy(client);
+    legacy.stop();
+    ASSERT_NE(interface, nullptr);
+    const auto described = nlohmann::json::parse(interface);
+    lp_string_free(interface);
+    ASSERT_EQ(described.size(), 2u);
+    EXPECT_EQ(described[0].at("name"), "legacyCall");
+    EXPECT_EQ(described[1].at("name"), "legacyEvent");
+    EXPECT_EQ(described[1].at("type"), "event");
+}
+
 TEST(QtRemotePlainCabiTest, DeferredSubscriptionReconnectsAndManualPolicyHolds)
 {
     setInstanceId("qtro_cabi_restart_");

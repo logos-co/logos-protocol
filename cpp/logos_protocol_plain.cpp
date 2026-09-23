@@ -750,6 +750,22 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
     return std::move(result.value);
 }
 
+// What getPluginInterface() answers, from the two calls a provider built before
+// logos-cpp-sdk #71 has instead: its methods, then its events.
+std::optional<json> legacyInterface(const std::optional<json>& methods,
+                                    const std::optional<json>& events)
+{
+    if (!methods || !methods->is_array()) return std::nullopt;
+    json entries = *methods;
+    if (events && events->is_array()) {
+        for (json entry : *events) {
+            if (entry.is_object() && !entry.contains("type")) entry["type"] = "event";
+            entries.push_back(std::move(entry));
+        }
+    }
+    return entries;
+}
+
 void connectionLost(const std::shared_ptr<ClientState>& state)
 {
     bool lost = false;
@@ -1703,17 +1719,46 @@ try {
 char* lp_get_methods(lp_client* client)
 try {
     if (!client) return nullptr;
+    const auto& state = client->state;
     std::string error;
-    if (client->state->targetConfig.protocol == LogosProtocol::Tcp
-        || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+    if (state->targetConfig.protocol == LogosProtocol::Tcp
+        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         std::string code;
-        auto result = networkCall(client->state, client->state->target,
-            "getPluginInterface", json::array(), {}, kDefaultTimeoutMs, error, code);
-        return result ? duplicate(dumpJson(rpcToJson(*result))) : nullptr;
+        auto result = networkCall(state, state->target, "getPluginInterface", json::array(), {},
+                                  kDefaultTimeoutMs, error, code);
+        if (result) return duplicate(dumpJson(rpcToJson(*result)));
+        if (code == "timeout" || code == "transport_error") return nullptr;
+        // The provider answered: one built before logos-cpp-sdk #71 lacks it.
+        const auto part = [&](const char* method) -> std::optional<json> {
+            auto value = networkCall(state, state->target, method, json::array(), {},
+                                     kDefaultTimeoutMs, error, code);
+            if (!value) return std::nullopt;
+            return rpcToJson(*value);
+        };
+        const auto legacy = legacyInterface(part("getPluginMethods"), part("getPluginEvents"));
+        return legacy ? duplicate(dumpJson(*legacy)) : nullptr;
     }
-    if (!ensureConnected(client->state, kDefaultTimeoutMs, error)) return nullptr;
-    auto result = client->state->wire->call(client->state->target, "getPluginInterface()", {},
-                                             std::chrono::milliseconds(kDefaultTimeoutMs), &error);
+    if (!ensureConnected(state, kDefaultTimeoutMs, error)) return nullptr;
+    Client& wire = *state->wire;
+    const auto timeout = std::chrono::milliseconds(kDefaultTimeoutMs);
+    if (!wire.acquire(state->target, timeout, &error)) return nullptr;
+    const auto definition = wire.definition(state->target);
+    const auto has = [&](const char* signature) {
+        return definition && std::any_of(definition->methodDefinitions.begin(),
+            definition->methodDefinitions.end(),
+            [&](const auto& method) { return method.signature == signature; });
+    };
+    if (!has("getPluginInterface()") && has("getPluginMethods()")) {
+        const auto part = [&](const char* signature) -> std::optional<json> {
+            if (!has(signature)) return json::array();
+            auto value = wire.call(state->target, signature, {}, timeout, &error);
+            if (!value) return std::nullopt;
+            return rpcToJson(value->value);
+        };
+        const auto legacy = legacyInterface(part("getPluginMethods()"), part("getPluginEvents()"));
+        return legacy ? duplicate(dumpJson(*legacy)) : nullptr;
+    }
+    auto result = wire.call(state->target, "getPluginInterface()", {}, timeout, &error);
     return result ? duplicate(dumpJson(rpcToJson(result->value))) : nullptr;
 } catch (...) {
     return nullptr;
