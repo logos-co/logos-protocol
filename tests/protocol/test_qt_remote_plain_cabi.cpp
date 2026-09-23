@@ -583,7 +583,13 @@ TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
     EXPECT_EQ(nlohmann::json::parse(interface).at(0).at("name"), "echo");
     lp_string_free(interface);
 
-    EXPECT_EQ(lp_inform_module_token(client, "anchor", "peer", "peer-token"), LP_OK);
+    // Pushing a token at this provider is the grant-gated provider half;
+    // lp_inform_module_token only ever reaches capability_module.
+    ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
+    EXPECT_EQ(lp_inform_module_token_to(client, "anchor", "plain_fixture", "peer", "peer-token",
+                                        1000),
+              LP_OK);
+    ASSERT_EQ(lp_grant_host_services("[]"), LP_OK);
     EXPECT_EQ(fixture.informedModule, "peer");
     EXPECT_EQ(fixture.informedToken, "peer-token");
 
@@ -835,6 +841,43 @@ TEST(QtRemotePlainCabiTest, ConcurrentFirstCallsShareOneTokenRequest)
 
     EXPECT_EQ(succeeded.load(), kCallers);
     EXPECT_EQ(capability.requests.load(), 1);
+}
+
+// Detector: a client aimed at another module delivered this consumer-half
+// token to that module, which is lp_inform_module_token_to's job, behind the
+// token_delivery grant.
+TEST(QtRemotePlainCabiTest, InformModuleTokenAlwaysReachesCapabilityModule)
+{
+    setInstanceId("qtro_cabi_inform_");
+    Fixture capabilityFixture;
+    Fixture otherFixture;
+    lp_provider* capability = lp_provider_create("capability_module", nullptr);
+    lp_provider* other = lp_provider_create("inform_other", nullptr);
+    ASSERT_NE(capability, nullptr);
+    ASSERT_NE(other, nullptr);
+    for (lp_provider* provider : {capability, other})
+        ASSERT_EQ(lp_provider_save_token(provider, "core", "core-secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(capability, dispatch, methods, token, &capabilityFixture), LP_OK);
+    ASSERT_EQ(lp_provider_register(other, dispatch, methods, token, &otherFixture), LP_OK);
+
+    lp_client* client = lp_client_create("inform_other", "core", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    EXPECT_EQ(lp_inform_module_token(client, "core-secret", "loaded_module", "loaded-token"),
+              LP_OK);
+    lp_client_destroy(client);
+    EXPECT_EQ(capabilityFixture.informedModule, "loaded_module");
+    EXPECT_EQ(capabilityFixture.informedToken, "loaded-token");
+    EXPECT_TRUE(otherFixture.informedModule.empty()) << "the token went to the client's target";
+
+    // The way liblogos calls it: a client aimed at capability_module itself.
+    client = lp_client_create("capability_module", "core", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    EXPECT_EQ(lp_inform_module_token(client, "core-secret", "second_module", "second-token"),
+              LP_OK);
+    lp_client_destroy(client);
+    EXPECT_EQ(capabilityFixture.informedModule, "second_module");
+    lp_provider_destroy(other);
+    lp_provider_destroy(capability);
 }
 
 struct EventLog {
