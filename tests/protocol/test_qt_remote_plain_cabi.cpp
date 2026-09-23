@@ -656,6 +656,72 @@ TEST(QtRemotePlainCabiTest, ACallReachesAProviderThatStartsWithinItsTimeout)
     lp_provider_destroy(provider);
 }
 
+struct CapabilityFixture {
+    lp_provider* target = nullptr;
+    std::atomic<int> requests{0};
+};
+
+// capability_module's requestModule: each token issued to a caller replaces
+// the previous one at the target.
+char* capabilityDispatch(const char* method, const char* argsJson, void* userData)
+{
+    auto& capability = *static_cast<CapabilityFixture*>(userData);
+    if (std::strcmp(method, "requestModule") != 0) return copyString("null");
+    const auto args = nlohmann::json::parse(argsJson);
+    const std::string issued = "issued-" + std::to_string(++capability.requests);
+    lp_provider_save_token(capability.target, args.at(0).get<std::string>().c_str(),
+                           issued.c_str());
+    return copyString(nlohmann::json(issued).dump());
+}
+
+// Detector: every concurrent first call requested its own token, and each
+// token revoked the one before it, so most of those calls were refused.
+TEST(QtRemotePlainCabiTest, ConcurrentFirstCallsShareOneTokenRequest)
+{
+    setInstanceId("qtro_cabi_token_flight_");
+    Fixture fixture;
+    CapabilityFixture capability;
+    lp_provider* target = lp_provider_create("flight_target", nullptr);
+    ASSERT_NE(target, nullptr);
+    ASSERT_EQ(lp_provider_register(target, dispatch, methods, token, &fixture), LP_OK);
+    capability.target = target;
+    lp_provider* issuer = lp_provider_create("capability_module", nullptr);
+    ASSERT_NE(issuer, nullptr);
+    ASSERT_EQ(lp_provider_save_token(issuer, "flight_caller", "cap-secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(issuer, capabilityDispatch, methods, token, &capability),
+              LP_OK);
+    ASSERT_EQ(lp_token_save("capability_module", "cap-secret"), LP_OK);
+
+    constexpr int kCallers = 8;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> succeeded{0};
+    std::vector<std::thread> callers;
+    for (int i = 0; i < kCallers; ++i) {
+        callers.emplace_back([&] {
+            lp_client* client = lp_client_create("flight_target", "flight_caller",
+                                                 nullptr, nullptr);
+            ++ready;
+            while (!go) std::this_thread::yield();
+            char* result = nullptr;
+            char* error = nullptr;
+            if (lp_invoke(client, "echo", R"(["x"])", 5000, &result, &error) == LP_OK)
+                ++succeeded;
+            lp_string_free(result);
+            lp_string_free(error);
+            lp_client_destroy(client);
+        });
+    }
+    while (ready.load() < kCallers) std::this_thread::yield();
+    go = true;
+    for (auto& caller : callers) caller.join();
+    lp_provider_destroy(issuer);
+    lp_provider_destroy(target);
+
+    EXPECT_EQ(succeeded.load(), kCallers);
+    EXPECT_EQ(capability.requests.load(), 1);
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");
