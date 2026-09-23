@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <QCoreApplication>
 #include <QEventLoop>
 #include <QJsonValue>
 #include <QMetaObject>
@@ -20,6 +21,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <limits>
 #include <string>
@@ -463,6 +465,103 @@ TEST(QtRemotePlainSocketCompatTest, WaitingQtClientSeesBusinessObjectPublishedAf
     ASSERT_TRUE(pending.isFinished());
     EXPECT_EQ(pending.returnValue().toString(), QStringLiteral("ready"));
 
+    server.stop();
+}
+
+bool waitFor(const std::function<bool()>& ready, int timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+    while (!ready()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+QString callWhoAmI(QRemoteObjectDynamicReplica* replica)
+{
+    QRemoteObjectPendingCall pending;
+    if (!QMetaObject::invokeMethod(
+            replica, "callRemoteMethod", Qt::DirectConnection,
+            Q_RETURN_ARG(QRemoteObjectPendingCall, pending),
+            Q_ARG(QString, QStringLiteral("token")),
+            Q_ARG(QString, QStringLiteral("whoami")),
+            Q_ARG(QVariantList, QVariantList{})))
+        return QStringLiteral("<invoke failed>");
+    pending.waitForFinished(3000);
+    return pending.isFinished() ? pending.returnValue().toString()
+                                : QStringLiteral("<timeout>");
+}
+
+Server::Object answeringFixture(std::string answer)
+{
+    return {"fixture", moduleProxyDefinition(),
+        [answer = std::move(answer)](std::int32_t index, const std::vector<Variant>&) {
+            return index == 0 ? Variant::fromRpc(RpcValue{answer}) : Variant{};
+        }};
+}
+
+// Detector: a re-attaching Qt replica asks with AddObject(isDynamic=false) and
+// stays Suspect until it gets Init. The server used to send nothing.
+TEST(QtRemotePlainSocketCompatTest, QtReplicaRecoversAfterPlainServerRestarts)
+{
+    const std::string path = uniqueSocketPath("restart");
+    std::string error;
+    auto first = std::make_unique<Server>();
+    ASSERT_TRUE(first->publish(answeringFixture("first"), &error)) << error;
+    ASSERT_TRUE(first->start(path, &error)) << error;
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(
+        QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("fixture")));
+    ASSERT_TRUE(replica->waitForSource(3000));
+    EXPECT_EQ(callWhoAmI(replica.data()), QStringLiteral("first"));
+
+    first->stop();
+    first.reset();
+    ASSERT_TRUE(waitFor([&] {
+        return replica->state() == QRemoteObjectReplica::Suspect;
+    }, 3000));
+
+    Server second;
+    ASSERT_TRUE(second.publish(answeringFixture("second"), &error)) << error;
+    ASSERT_TRUE(second.start(path, &error)) << error;
+    EXPECT_TRUE(waitFor([&] {
+        return replica->state() == QRemoteObjectReplica::Valid;
+    }, 5000)) << "replica state " << replica->state();
+    EXPECT_EQ(callWhoAmI(replica.data()), QStringLiteral("second"));
+    second.stop();
+}
+
+TEST(QtRemotePlainSocketCompatTest, QtReplicaRecoversAfterPlainServerRepublishes)
+{
+    const std::string path = uniqueSocketPath("republish");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.publish(answeringFixture("first"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(
+        QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("fixture")));
+    ASSERT_TRUE(replica->waitForSource(3000));
+    EXPECT_EQ(callWhoAmI(replica.data()), QStringLiteral("first"));
+
+    server.unpublish("fixture");
+    ASSERT_TRUE(waitFor([&] {
+        return replica->state() == QRemoteObjectReplica::Suspect;
+    }, 3000));
+    ASSERT_TRUE(server.publish(answeringFixture("second"), &error)) << error;
+    EXPECT_TRUE(waitFor([&] {
+        return replica->state() == QRemoteObjectReplica::Valid;
+    }, 5000)) << "replica state " << replica->state();
+    EXPECT_EQ(callWhoAmI(replica.data()), QStringLiteral("second"));
     server.stop();
 }
 

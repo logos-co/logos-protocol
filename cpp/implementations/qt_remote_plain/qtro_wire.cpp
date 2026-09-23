@@ -808,6 +808,17 @@ std::vector<std::uint8_t> removeObjectPacket(std::string_view name)
     return finishPacket(packetPrefix(PacketType::RemoveObject, name));
 }
 
+std::vector<std::uint8_t> initPacket(
+    std::string_view name,
+    const std::vector<Variant>& properties)
+{
+    auto writer = packetPrefix(PacketType::Init, name);
+    writer.u32(static_cast<std::uint32_t>(properties.size()));
+    for (const auto& property : properties)
+        writer.variant(property);
+    return finishPacket(std::move(writer));
+}
+
 std::vector<std::uint8_t> initDynamicPacket(
     std::string_view name,
     const ClassDefinition& definition,
