@@ -66,9 +66,33 @@ pkgs.runCommand "logos-abi-closure-check-tests"
 /nix/store/b-logos-qt-host-0.1.0" "/nix/store/c-logos-protocol-lib-0.8.0"
   expect_fail "qt-host paired with another protocol-lib" "built against a DIFFERENT"
 
-  echo "=== and the coherent case still passes ==="
+  mkstub "/nix/store/a-logos-protocol-plain-lib-0.12.0
+/nix/store/b-logos-protocol-plain-lib-0.12.0" ""
+  expect_fail "two protocol-plain-lib" "distinct logos-protocol-plain-lib"
+
+  # Runtimes that record the source they were built from.
+  store=$PWD/store
+  for runtime in q-logos-protocol-lib p-logos-protocol-plain-lib o-logos-protocol-plain-lib; do
+    mkdir -p $store/$runtime-0.12.0/share/logos-protocol
+  done
+  echo src-one > $store/q-logos-protocol-lib-0.12.0/share/logos-protocol/source
+  echo src-one > $store/p-logos-protocol-plain-lib-0.12.0/share/logos-protocol/source
+  echo src-two > $store/o-logos-protocol-plain-lib-0.12.0/share/logos-protocol/source
+
+  mkstub "$store/q-logos-protocol-lib-0.12.0
+$store/o-logos-protocol-plain-lib-0.12.0" ""
+  expect_fail "Qt and plain runtimes from different sources" "different sources"
+
+  echo "=== and the coherent cases still pass ==="
   mkstub "/nix/store/a-logos-protocol-lib-0.9.0
 /nix/store/b-logos-qt-host-0.1.0" "/nix/store/a-logos-protocol-lib-0.9.0"
+  PATH="$PWD/stub:$PATH" "$check" "$subject" | sed 's/^/    /'
+
+  mkstub "$store/p-logos-protocol-plain-lib-0.12.0" ""
+  PATH="$PWD/stub:$PATH" "$check" "$subject" | sed 's/^/    /'
+
+  mkstub "$store/q-logos-protocol-lib-0.12.0
+$store/p-logos-protocol-plain-lib-0.12.0" ""
   PATH="$PWD/stub:$PATH" "$check" "$subject" | sed 's/^/    /'
 
   mkdir -p $out

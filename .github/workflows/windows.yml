@@ -19,4 +19,5 @@ jobs:
       smoke: |
         run tests/bin/qt_remote_plain_wire_tests.exe
         run tests/bin/qt_remote_plain_cabi_tests.exe
+        run tests/bin/qt_remote_plain_cabi_shared_tests.exe
         run tests-qt/bin/transport_resolution_tests.exe

@@ -21,7 +21,8 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp protocol/qt_remote_plain_wire_tests.exe protocol/qt_remote_plain_cabi_tests.exe $out/bin/
+    cp protocol/qt_remote_plain_wire_tests.exe protocol/qt_remote_plain_cabi_tests.exe \
+       protocol/qt_remote_plain_cabi_shared_tests.exe bin/liblogos_protocol_plain.dll $out/bin/
     runHook postInstall
   '';
 

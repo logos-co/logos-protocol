@@ -76,9 +76,32 @@
           tests = import ./nix/tests.nix { inherit pkgs common src; };
           module-impl-abi = import ./nix/module-impl-abi.nix { inherit pkgs common src; };
           abi-closure-check = import ./nix/abi-closure-check.nix { inherit pkgs common src; };
+          lib = import ./nix/lib.nix { inherit pkgs common src; };
+          plain-lib = import ./nix/plain-lib.nix { inherit pkgs common src; };
         in
         {
           inherit tests;
+
+          # The configuration Qt-free consumers build, built with no Qt.
+          inherit plain-lib;
+
+          # One shared plain runtime, shipped by the Qt-free output: two builds
+          # under one name let a process load both.
+          plain-runtime-once = pkgs.runCommand "logos-protocol-plain-runtime-once" { } ''
+            for f in ${lib}/lib/liblogos_protocol_plain.so ${lib}/lib/liblogos_protocol_plain.dylib \
+                     ${lib}/bin/liblogos_protocol_plain.dll; do
+              if [ -e "$f" ]; then echo "the Qt output ships $f" >&2; exit 1; fi
+            done
+            shared=0
+            for f in ${plain-lib}/lib/liblogos_protocol_plain.so ${plain-lib}/lib/liblogos_protocol_plain.dylib \
+                     ${plain-lib}/bin/liblogos_protocol_plain.dll; do
+              [ -e "$f" ] && shared=1
+            done
+            [ "$shared" -eq 1 ] || { echo "the Qt-free output ships no shared plain runtime" >&2; exit 1; }
+            [ "$(cat ${lib}/share/logos-protocol/source)" = "$(cat ${plain-lib}/share/logos-protocol/source)" ]
+            touch $out
+          '';
+
           # Proves the ABI manifest every backend checks itself against can
           # still fail. See nix/tests-module-impl-abi.nix.
           module-impl-abi-tests = import ./nix/tests-module-impl-abi.nix {
