@@ -53,9 +53,9 @@ std::string makeErrorJson(const char* code, const std::string& message,
     return e.dump();
 }
 
-// Parse a single-transport JSON object (the lp_* shape) by reusing the
-// transport-set parser (which expects an array). NULL / empty / "null"
-// fall back to the process default.
+// Parse a single-transport JSON object (the lp_* shape) with the strict
+// transport-set parser: an unknown protocol or a mistyped field is refused,
+// not read as local. NULL / empty / "null" fall back to the process default.
 bool parseTransportJson(const char* transport_json, LogosTransportConfig& out)
 {
     if (!transport_json || !*transport_json
@@ -63,9 +63,10 @@ bool parseTransportJson(const char* transport_json, LogosTransportConfig& out)
         out = LogosTransportConfigGlobal::getDefault();
         return true;
     }
-    const LogosTransportSet set = logos::transportSetFromJsonString(
-        std::string("[") + transport_json + "]");
-    if (set.empty()) return false;  // parse error (parser yields empty set)
+    LogosTransportSet set;
+    if (!logos::parseTransportSet(std::string("[") + transport_json + "]", &set)
+        || set.size() != 1)
+        return false;
     out = set.front();
     return true;
 }

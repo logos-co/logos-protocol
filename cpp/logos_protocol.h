@@ -380,7 +380,9 @@ LP_API char* lp_string_copy(const char* s);
 
 /** Set the process-wide communication mode: "remote" (IPC, default),
  *  "local" (in-process registry) or "mock" (in-memory, for tests).
- *  Returns LP_OK or LP_ERR_INVALID_ARG. */
+ *  Returns LP_OK, or LP_ERR_INVALID_ARG for NULL or an unknown mode. The
+ *  Qt-free runtime has only "remote" and returns LP_ERR_UNSUPPORTED for the
+ *  other two. */
 LP_API int lp_set_mode(const char* mode);
 
 /** Current mode as "remote" | "local" | "mock". Static string — do not free. */
@@ -391,7 +393,9 @@ LP_API const char* lp_get_mode(void);
  *    {"protocol":"tcp","host":"127.0.0.1","port":6001,"codec":"json"}
  *    {"protocol":"tcp_ssl","host":"...","port":6443,"codec":"cbor",
  *     "ca_file":"...","cert_file":"...","key_file":"...","verify_peer":true}
- *  Returns LP_OK or LP_ERR_INVALID_ARG on parse failure. */
+ *  "protocol" is one of "local", "qt_remote_plain", "tcp" or "tcp_ssl". Returns
+ *  LP_OK, or LP_ERR_INVALID_ARG for malformed JSON, an unknown protocol or
+ *  codec, or a mistyped field. lp_client_create refuses the same inputs. */
 LP_API int lp_set_default_transport(const char* transport_json);
 
 /* ---------------------------------------------------------------------------

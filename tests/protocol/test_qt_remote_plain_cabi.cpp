@@ -514,6 +514,30 @@ TEST(QtRemotePlainCabiTest, AProviderIsNotCreatedFromAnUnusableTransportSet)
     }
 }
 
+// {"protocol":"local"} is the header's own first example.
+TEST(QtRemotePlainCabiTest, TheHeadersTransportExamplesAreAccepted)
+{
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"local"})"), LP_OK);
+    lp_client* client = lp_client_create("transport_probe", "test", R"({"protocol":"local"})", nullptr);
+    EXPECT_NE(client, nullptr);
+    lp_client_destroy(client);
+    for (const char* refused : {R"({"protocol":"tpc"})", R"({"protocol":"tcp","port":"6001"})",
+                                "[]", "not json"}) {
+        EXPECT_EQ(lp_set_default_transport(refused), LP_ERR_INVALID_ARG) << refused;
+        EXPECT_EQ(lp_client_create("transport_probe", "test", refused, nullptr), nullptr) << refused;
+    }
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"qt_remote_plain"})"), LP_OK);
+}
+
+TEST(QtRemotePlainCabiTest, ModesThisRuntimeLacksAreUnsupported)
+{
+    EXPECT_EQ(lp_set_mode("remote"), LP_OK);
+    EXPECT_EQ(lp_set_mode("local"), LP_ERR_UNSUPPORTED);
+    EXPECT_EQ(lp_set_mode("mock"), LP_ERR_UNSUPPORTED);
+    EXPECT_EQ(lp_set_mode("bogus"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_set_mode(nullptr), LP_ERR_INVALID_ARG);
+}
+
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
 {
     setInstanceId("qtro_cabi_");
