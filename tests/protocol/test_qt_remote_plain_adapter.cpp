@@ -384,6 +384,94 @@ TEST(QtRemotePlainAdapterTest, AsyncResultsReturnToQtThreadAndRespectRelease)
 // (std::bad_variant_access on a detached thread), and a QJsonDocument inside
 // event data desynced the consumer's stream. The consumer here is a plain
 // QRemoteObjectNode, as in every unchanged Qt module.
+// Calls `peer` for "outer", answers "inner" itself.
+class ReentrantProvider final : public LogosProviderObject {
+public:
+    explicit ReentrantProvider(QString name) : m_name(std::move(name)) {}
+    QVariant callMethod(const QString& methodName, const QVariantList&) override
+    {
+        if (methodName == QStringLiteral("inner")) return QStringLiteral("inner-ok");
+        if (methodName == QStringLiteral("outer") && peer)
+            return peer->callMethod(QStringLiteral("secret"), peerMethod, {}, 2000);
+        return {};
+    }
+    QJsonArray getMethods() override { return {}; }
+    void setEventListener(EventCallback) override {}
+    void init(void*) override {}
+    QString providerName() const override { return m_name; }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+    bool informModuleToken(const QString&, const QString&) override { return true; }
+
+    LogosObject* peer = nullptr;
+    QString peerMethod;
+
+private:
+    QString m_name;
+};
+
+// Detector: a module calling out over the plain client waited on a condition
+// variable, so a call back into it (alpha -> beta -> alpha) could not run until
+// its own call timed out. QtRO waits in a nested event loop.
+TEST(QtRemotePlainAdapterTest, AModuleCallingOutCanBeCalledBack)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    TokenManager& tokens = TokenManager::instance();
+    tokens.clearAllTokens();
+    tokens.adoptCredential(QStringLiteral("secret"));
+
+    ReentrantProvider alphaProvider(QStringLiteral("alpha"));
+    ModuleProxy alpha(&alphaProvider, nullptr, &tokens);
+    ASSERT_TRUE(alpha.saveToken(QStringLiteral("caller"), QStringLiteral("secret")));
+    const QString alphaUrl = QString::fromStdString(adapterSocket()) + QStringLiteral("_alpha");
+    logos::qt_remote_plain::QtRemotePlainTransportHost alphaHost(alphaUrl);
+    ASSERT_TRUE(alphaHost.publishObject(QStringLiteral("alpha"), &alpha));
+
+    // Beta runs on its own thread, so only alpha's thread is in question.
+    QThread betaThread;
+    betaThread.start();
+    ReentrantProvider betaProvider(QStringLiteral("beta"));
+    auto* beta = new ModuleProxy(&betaProvider, nullptr, &tokens);
+    ASSERT_TRUE(beta->saveToken(QStringLiteral("caller"), QStringLiteral("secret")));
+    beta->moveToThread(&betaThread);
+    const QString betaUrl = QString::fromStdString(adapterSocket()) + QStringLiteral("_beta");
+    logos::qt_remote_plain::QtRemotePlainTransportHost betaHost(betaUrl);
+    ASSERT_TRUE(betaHost.publishObject(QStringLiteral("beta"), beta));
+
+    logos::qt_remote_plain::QtRemotePlainTransportConnection toBeta(betaUrl);
+    logos::qt_remote_plain::QtRemotePlainTransportConnection toAlpha(alphaUrl);
+    logos::qt_remote_plain::QtRemotePlainTransportConnection caller(alphaUrl);
+    ASSERT_TRUE(toBeta.connectToHost());
+    ASSERT_TRUE(toAlpha.connectToHost());
+    ASSERT_TRUE(caller.connectToHost());
+    alphaProvider.peer = toBeta.requestObject(QStringLiteral("beta"), 1000);
+    alphaProvider.peerMethod = QStringLiteral("outer");
+    betaProvider.peer = toAlpha.requestObject(QStringLiteral("alpha"), 1000);
+    betaProvider.peerMethod = QStringLiteral("inner");
+    LogosObject* entry = caller.requestObject(QStringLiteral("alpha"), 1000);
+    ASSERT_NE(alphaProvider.peer, nullptr);
+    ASSERT_NE(betaProvider.peer, nullptr);
+    ASSERT_NE(entry, nullptr);
+
+    const auto started = std::chrono::steady_clock::now();
+    auto call = std::async(std::launch::async, [entry] {
+        return entry->callMethod(QStringLiteral("secret"), QStringLiteral("outer"), {}, 5000);
+    });
+    ASSERT_TRUE(spinUntil([&] {
+        return call.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+    }, 8000));
+    EXPECT_EQ(call.get().toString(), QStringLiteral("inner-ok"));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::milliseconds(1500));
+
+    entry->release();
+    alphaProvider.peer->release();
+    betaProvider.peer->release();
+    betaHost.unpublishObject(QStringLiteral("beta"));
+    QMetaObject::invokeMethod(beta, [beta] { delete beta; }, Qt::BlockingQueuedConnection);
+    betaThread.quit();
+    betaThread.wait();
+    tokens.clearAllTokens();
+}
+
 TEST(QtRemotePlainAdapterTest, AdapterHostDeliversQtTypesToAnUnchangedQtConsumer)
 {
     qRegisterMetaType<LogosResult>("LogosResult");
