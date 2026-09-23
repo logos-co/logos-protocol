@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #endif
@@ -484,6 +485,14 @@ NativeHandle connectSocket(const std::string& path,
     }
 }
 #else
+// Close-on-exec, as Qt sets it: a child process must not keep a peer's end of
+// a connection open after this one closes it.
+void setCloseOnExec(int fd)
+{
+    const int flags = ::fcntl(fd, F_GETFD, 0);
+    if (flags >= 0) (void)::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 // Nothing listening at the path yet, as opposed to a failure retrying cannot fix.
 bool notListeningYet(int code)
 {
@@ -499,6 +508,7 @@ NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
         setError(error, "socket() failed: " + std::string(std::strerror(errno)));
         return kInvalidHandle;
     }
+    setCloseOnExec(fd);
 #ifdef SO_NOSIGPIPE
     int one = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -1223,6 +1233,11 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::size_t maxQueuedBytes = kDefaultMaxQueuedBytes;
     std::chrono::milliseconds stallTimeout = kDefaultStallTimeout;
     std::string path;
+#ifndef _WIN32
+    // The socket file this server bound, so stop() never removes a successor's.
+    dev_t boundDevice = 0;
+    ino_t boundInode = 0;
+#endif
     std::map<std::string, Object> objects;
     std::vector<std::shared_ptr<Connection>> connections;
 
@@ -1560,6 +1575,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 if (errno == EINTR) continue;
                 break;
             }
+            setCloseOnExec(static_cast<int>(accepted));
 #ifdef SO_NOSIGPIPE
             int one = 1;
             ::setsockopt(accepted, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -1628,6 +1644,7 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
         setError(error, "socket() failed: " + std::string(std::strerror(errno)));
         return false;
     }
+    setCloseOnExec(fd);
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     if (path.size() >= sizeof(address.sun_path)) {
@@ -1650,9 +1667,13 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
         setError(error, permissionError);
         return false;
     }
+    struct stat bound {};
+    (void)::lstat(path.c_str(), &bound);
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         m_impl->path = path;
+        m_impl->boundDevice = bound.st_dev;
+        m_impl->boundInode = bound.st_ino;
         m_impl->listener = fd;
         m_impl->running = true;
         m_impl->acceptExited = false;
@@ -1681,6 +1702,14 @@ void Server::stop()
     }
     m_impl->callsChanged.notify_all();
     closeHandle(m_impl->listener);
+#ifndef _WIN32
+    // Now, not after the handlers finish: by then a successor may have bound
+    // the path. And only the file this server bound.
+    struct stat current {};
+    if (!path.empty() && ::lstat(path.c_str(), &current) == 0
+        && current.st_dev == m_impl->boundDevice && current.st_ino == m_impl->boundInode)
+        ::unlink(path.c_str());
+#endif
     for (const auto& connection : connections) Impl::abandon(*connection);
     std::unique_lock<std::mutex> lock(m_impl->mu);
     const auto caller = std::this_thread::get_id();
@@ -1695,9 +1724,6 @@ void Server::stop()
                 [&](const auto& connection) { return connection->worker == caller; });
     });
     lock.unlock();
-#ifndef _WIN32
-    if (!path.empty()) ::unlink(path.c_str());
-#endif
 }
 
 bool Server::isRunning() const

@@ -10,10 +10,15 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -169,6 +174,90 @@ TEST(QtRemotePlainTransportTest, ACallRacingAnUnpublishFailsInsteadOfThrowing)
     client.close();
     server.stop();
 }
+
+#ifndef _WIN32
+// This process's sockets whose own address, or whose peer's, is `path`.
+std::vector<int> socketsOn(const std::string& path)
+{
+    std::vector<int> found;
+    for (int fd = 0; fd < 1024; ++fd) {
+        struct stat st {};
+        if (::fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+        sockaddr_un local {};
+        socklen_t length = sizeof(local);
+        sockaddr_un peer {};
+        socklen_t peerLength = sizeof(peer);
+        const bool bound = ::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &length) == 0
+            && local.sun_family == AF_UNIX && path == local.sun_path;
+        const bool connected = ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peerLength) == 0
+            && peer.sun_family == AF_UNIX && path == peer.sun_path;
+        if (bound || connected) found.push_back(fd);
+    }
+    return found;
+}
+
+// Detector: sockets were inheritable, so a child process could keep a peer's
+// end open after this process closed it, and the peer never saw end-of-file.
+TEST(QtRemotePlainTransportTest, EverySocketIsCloseOnExec)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+
+    const auto sockets = socketsOn(path);
+    EXPECT_GE(sockets.size(), 2u);
+    for (int fd : sockets)
+        EXPECT_TRUE(::fcntl(fd, F_GETFD, 0) & FD_CLOEXEC) << "fd " << fd;
+    client.close();
+    server.stop();
+}
+
+// Detector: stop() removed the socket file only after its handlers finished,
+// by which time a successor could have bound the path.
+TEST(QtRemotePlainTransportTest, StoppingNeverRemovesASuccessorsSocket)
+{
+    const std::string path = transportSocketPath();
+    std::atomic<bool> inCall{false};
+    Server first;
+    Server::Object slow = echoFixture();
+    slow.invoke = [&inCall](std::int32_t, const std::vector<Variant>&) {
+        inCall = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        return Variant::fromRpc(RpcValue{"slow"});
+    };
+    ASSERT_TRUE(first.publish(std::move(slow)));
+    std::string error;
+    ASSERT_TRUE(first.start(path, &error)) << error;
+    Client caller;
+    ASSERT_TRUE(caller.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(caller.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    std::thread call([&] {
+        std::string callError;
+        (void)caller.call("fixture", "echo(QString)", {Variant::fromRpc(RpcValue{"x"})},
+                          std::chrono::seconds(3), &callError);
+    });
+    while (!inCall) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::thread stopper([&] { first.stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    Server second;
+    ASSERT_TRUE(second.publish(echoFixture()));
+    ASSERT_TRUE(second.start(path, &error)) << error;
+    stopper.join();
+    call.join();
+
+    Client probe;
+    EXPECT_TRUE(probe.connect(path, std::chrono::milliseconds(500), &error)) << error;
+    probe.close();
+    caller.close();
+    second.stop();
+}
+#endif
 
 TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
 {

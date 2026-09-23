@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <thread>
+#include <chrono>
 
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -192,6 +195,47 @@ TEST(SocketPaths, ClosedSocketIsDead)
     ::close(fd);  // file remains on disk, no listener
 
     EXPECT_TRUE(logos::isSocketDead(path));
+    ::unlink(path.c_str());
+}
+
+// Detector (Darwin): a live listener whose backlog is full also refuses with
+// ECONNREFUSED; one probe read it as dead, so a new server replaced it.
+TEST(SocketPaths, ABusyListenerWithAFullBacklogIsNotDead)
+{
+    const std::string path = sockPath("busy");
+    ::unlink(path.c_str());
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(listener, 1), 0);
+
+    // Fill the backlog until the kernel refuses.
+    std::vector<int> pending;
+    for (int i = 0; i < 16; ++i) {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0
+            && errno != EINPROGRESS) {
+            ::close(fd);
+            break;
+        }
+        pending.push_back(fd);
+    }
+    // The owner is alive: it gets round to accepting shortly.
+    std::thread drain([listener, count = pending.size()] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        for (std::size_t i = 0; i < count; ++i) {
+            const int fd = ::accept(listener, nullptr, nullptr);
+            if (fd >= 0) ::close(fd);
+        }
+    });
+    EXPECT_FALSE(logos::isSocketDead(path));
+    drain.join();
+    for (int fd : pending) ::close(fd);
+    ::close(listener);
     ::unlink(path.c_str());
 }
 
