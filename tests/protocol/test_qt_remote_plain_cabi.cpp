@@ -627,6 +627,35 @@ TEST(QtRemotePlainCabiTest, AsyncCallsShareABoundedSetOfThreads)
     EXPECT_LE(threads.callbackThreads.size(), 16u);
 }
 
+// Detector: lp_invoke failed at once when the provider was not listening yet;
+// the Qt C ABI waits for it within the call's timeout.
+TEST(QtRemotePlainCabiTest, ACallReachesAProviderThatStartsWithinItsTimeout)
+{
+    setInstanceId("qtro_cabi_late_provider_");
+    Fixture fixture;
+    ASSERT_EQ(lp_token_save("late_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("late_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    lp_provider* provider = nullptr;
+    std::thread starter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        provider = lp_provider_create("late_fixture", nullptr);
+        lp_provider_save_token(provider, "caller", "secret");
+        lp_provider_register(provider, dispatch, methods, token, &fixture);
+    });
+
+    char* result = nullptr;
+    char* error = nullptr;
+    const int status = lp_invoke(client, "echo", R"(["late"])", 3000, &result, &error);
+    starter.join();
+    EXPECT_EQ(status, LP_OK) << (error ? error : "");
+    if (result) EXPECT_EQ(nlohmann::json::parse(result), "plain:late");
+    lp_string_free(result);
+    lp_string_free(error);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");
