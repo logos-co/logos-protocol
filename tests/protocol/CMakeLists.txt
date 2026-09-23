@@ -553,6 +553,18 @@ target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
 )
 gtest_discover_tests(qt_remote_plain_cabi_tests PROPERTIES TIMEOUT 8)
 
+# The same C ABI checks against the shared plain runtime: the form liblogos,
+# its hosts and logoscore share in one process.
+add_executable(qt_remote_plain_cabi_shared_tests
+    test_protocol_version.cpp
+    test_qt_remote_plain_cabi.cpp
+)
+target_link_libraries(qt_remote_plain_cabi_shared_tests PRIVATE
+    logos_protocol_plain_shared
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_cabi_shared_tests PROPERTIES TIMEOUT 8)
+
 # A real Qt Remote Objects host exercises callback-initiated teardown of the
 # Qt-free client across the legacy/plain interoperability boundary. Qt's local
 # socket path compatibility is required on Unix; Windows modules use plain.

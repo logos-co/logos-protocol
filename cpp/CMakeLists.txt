@@ -190,6 +190,13 @@ endfunction()
 
 logos_protocol_isolate_elf_exports(logos_protocol_plain_shared LOGOS_PROTOCOL_PLAIN)
 
+# Shipped by the Qt-free configuration only. Two builds of one shared library
+# under one name let a process load both, each with its own token registry.
+# The Qt configuration still defines it, for its own tests.
+if(LOGOS_PROTOCOL_BUILD_QT)
+    set_target_properties(logos_protocol_plain_shared PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
 # PE exports no C++ symbols unless they are named explicitly. Generate the
 # plain runtime's export table from its matching static archive so consumers can
 # call both the lp_* C ABI and the transport-config helpers without maintaining
@@ -500,6 +507,7 @@ install(TARGETS logos_socket_paths logos_qt_remote_plain_transport logos_protoco
     INCLUDES DESTINATION include
 )
 
+if(NOT LOGOS_PROTOCOL_BUILD_QT)
 install(TARGETS logos_protocol_plain_shared
     EXPORT logos-protocolTargets
     ARCHIVE DESTINATION lib
@@ -507,6 +515,7 @@ install(TARGETS logos_protocol_plain_shared
     RUNTIME DESTINATION bin
     INCLUDES DESTINATION include
 )
+endif()
 
 install(EXPORT logos-protocolTargets
     FILE logos-protocolTargets.cmake
