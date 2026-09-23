@@ -268,19 +268,18 @@
 // name and mis-call it with no diagnostic. The generation counter is maintained
 // for EVERY client, so gap detection reaches a consumer that changes nothing;
 // only the live callback is opt-in.
-// 0.10: qt_remote_plain, a Qt-free implementation of the Qt Remote Objects
-// 2.0 dynamic-object wire format, plus lp_current_caller_json() for native
-// module hosts. The existing qt_remote implementation remains unchanged and
-// shares the wire on Unix; Windows plain peers use named pipes on both sides.
-// Every existing C ABI symbol keeps its signature and behaviour.
-// 0.11: a dynamically evaluated provider token validator for long-running
-// hosts whose accepted credentials live outside the protocol token registry.
-// Also makes the already-supported empty event name public at the C ABI as the
-// wildcard subscription used by logoscore's `watch <module>` command.
-// 0.12: staged provider publication. A native host can expose the token-only
-// handshake during initialization and publish the business object only after
-// the module context is ready. lp_string_copy() lets a host transfer module
-// results into protocol-owned storage before crossing an allocator boundary.
+// 0.12: the qt_remote_plain wave, all additive:
+//   * qt_remote_plain, a Qt-free implementation of the Qt Remote Objects 2.0
+//     dynamic-object wire. qt_remote is unchanged and shares the wire on
+//     Unix; Windows plain peers use named pipes on both sides.
+//   * lp_current_caller_json() for native module hosts.
+//   * lp_provider_set_token_validator(), for hosts whose accepted credentials
+//     live outside the protocol token registry.
+//   * the empty event name, public as the wildcard subscription.
+//   * staged publication (lp_provider_prepare) and lp_string_copy().
+// MINORs 10 and 11 only ever named revisions of this wave on its branches, and
+// the unmerged feat/optional-dependencies uses 10 for lp_target_presence. A
+// MINOR guard cannot tell those apart; guard on the feature macros below.
 #define LOGOS_PROTOCOL_VERSION_MINOR 12
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.12.0"
@@ -308,6 +307,16 @@
 // FEATURE MACRO: lp_provider_set_max_concurrent_calls() exists, so a host can
 // run a module's calls in arrival order on one thread.
 #define LOGOS_PROTOCOL_HAS_PROVIDER_CONCURRENCY 1
+
+// FEATURE MACROS for the rest of the 0.12 wave (see the version above). Each is
+// defined in both runtimes where its symbol or behaviour exists, and never
+// undefined after.
+#define LOGOS_PROTOCOL_HAS_QT_REMOTE_PLAIN 1          /* LogosProtocol::QtRemotePlain */
+#define LOGOS_PROTOCOL_HAS_CURRENT_CALLER_JSON 1      /* lp_current_caller_json */
+#define LOGOS_PROTOCOL_HAS_PROVIDER_TOKEN_VALIDATOR 1 /* lp_provider_set_token_validator */
+#define LOGOS_PROTOCOL_HAS_WILDCARD_SUBSCRIBE 1       /* lp_subscribe with "" */
+#define LOGOS_PROTOCOL_HAS_STAGED_PUBLICATION 1       /* lp_provider_prepare */
+#define LOGOS_PROTOCOL_HAS_STRING_COPY 1              /* lp_string_copy */
 
 /* ---------------------------------------------------------------------------
  * Export marking.
