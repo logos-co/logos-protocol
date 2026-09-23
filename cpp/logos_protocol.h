@@ -305,6 +305,10 @@
 // whether it still can. Absent before the reservation, never undefined after.
 #define LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES 1
 
+// FEATURE MACRO: lp_provider_set_max_concurrent_calls() exists, so a host can
+// run a module's calls in arrival order on one thread.
+#define LOGOS_PROTOCOL_HAS_PROVIDER_CONCURRENCY 1
+
 /* ---------------------------------------------------------------------------
  * Export marking.
  *
@@ -981,6 +985,13 @@ LP_API int lp_provider_save_token(lp_provider* provider,
 LP_API int lp_provider_set_token_validator(lp_provider* provider,
                            lp_validate_token_cb validate,
                            void* user_data);
+/** Calls start in the order they arrive and at most `max_calls` run at once,
+ *  each on one of that many long-lived threads; 1 runs every call on the same
+ *  thread. 0 restores the default, 64. Call before lp_provider_prepare or
+ *  lp_provider_register. The Qt implementation dispatches on its own event
+ *  loop and returns LP_ERR_UNSUPPORTED. */
+LP_API int lp_provider_set_max_concurrent_calls(lp_provider* provider,
+                           unsigned max_calls);
 
 #ifdef __cplusplus
 }

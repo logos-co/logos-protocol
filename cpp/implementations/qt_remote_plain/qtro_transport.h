@@ -98,6 +98,11 @@ public:
                     const std::vector<Variant>& arguments,
                     std::string* error = nullptr);
 
+    // Calls start in the order they arrive, at most `maxCalls` at once, each on
+    // a long-lived worker thread; 1 runs every call on one thread. 0 restores
+    // the default, 64.
+    void setMaxConcurrentCalls(std::size_t maxCalls);
+
     // For connections accepted afterwards: a peer whose unsent frames exceed
     // `maxQueuedBytes`, or that reads nothing for `stallTimeout` while frames
     // wait, is disconnected. Defaults: 64 MiB, 30 s.

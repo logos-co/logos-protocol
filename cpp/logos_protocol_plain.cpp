@@ -1726,4 +1726,11 @@ int lp_provider_set_token_validator(lp_provider* provider,
     return LP_OK;
 }
 
+int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned maxCalls)
+{
+    if (!provider) return LP_ERR_INVALID_ARG;
+    provider->server.setMaxConcurrentCalls(maxCalls);
+    return LP_OK;
+}
+
 } // extern "C"
