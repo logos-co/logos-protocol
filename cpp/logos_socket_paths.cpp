@@ -187,19 +187,29 @@ bool isSocketDead(const std::string& absPath)
     if (absPath.size() >= sizeof(addr.sun_path)) return false;  // can't probe -> assume alive
     std::memcpy(addr.sun_path, absPath.c_str(), absPath.size());
 
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const auto probe = [&addr]() {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        const int err = rc == 0 ? 0 : errno;
+        ::close(fd);
+        return err;
+    };
 
-    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    const int err = errno;
-    ::close(fd);
-
-    if (rc == 0) return false;                              // a listener answered -> alive
     // ECONNREFUSED: bound but nobody listening. ENOENT: vanished mid-probe.
     // Everything else (EAGAIN/EINPROGRESS backlog full, EACCES, ETIMEDOUT, ...)
     // is treated as alive so we never unlink a socket that might be in use.
+    int err = probe();
+#ifdef __APPLE__
+    // Darwin also refuses a live listener whose backlog is full; a real one
+    // drains it, a dead one keeps refusing.
+    for (int attempt = 0; attempt < 4 && err == ECONNREFUSED; ++attempt) {
+        ::usleep(25 * 1000);
+        err = probe();
+    }
+#endif
     return err == ECONNREFUSED || err == ENOENT;
 }
 
