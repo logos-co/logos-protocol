@@ -173,6 +173,64 @@ TEST(QtRemotePlainRealQroTeardown, StatusWithoutQueuedWork)
     runCase(CallbackKind::SubscriptionStatus, QueuedWork::None);
 }
 
+TEST(QtRemotePlainRealQroBackpressure, LargeWriteHonorsInvocationDeadline)
+{
+    const std::string instance = "qro_backpressure_" + std::to_string(::getpid());
+    ASSERT_EQ(::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1), 0);
+    QtProvider provider;
+    QRemoteObjectHost host;
+    ASSERT_TRUE(host.setHostUrl(QUrl(QString::fromStdString(
+        "local:logos_fixture_" + instance))));
+    ASSERT_TRUE(host.enableRemoting(&provider, QStringLiteral("fixture")));
+    ASSERT_EQ(lp_token_save("fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    std::atomic<bool> warmDone{false};
+    std::atomic<int> warmStatus{-1};
+    std::thread warm([&] {
+        char* result = nullptr;
+        char* error = nullptr;
+        warmStatus = lp_invoke(client, "warmup", "[]", 1000, &result, &error);
+        lp_string_free(result);
+        lp_string_free(error);
+        warmDone = true;
+    });
+    if (!spinUntil([&] { return warmDone.load(); }, 3s))
+        std::_Exit(2); // Avoid joining a call stalled by a broken transport.
+    warm.join();
+    ASSERT_EQ(warmStatus.load(), LP_OK);
+
+    const std::string args = "[\"" + std::string(65536, 'x') + "\"]";
+    std::atomic<bool> done{false};
+    std::atomic<int> status{-1};
+    std::atomic<long long> elapsedMs{-1};
+    std::thread caller([&] {
+        char* result = nullptr;
+        char* error = nullptr;
+        const auto started = std::chrono::steady_clock::now();
+        status = lp_invoke(client, "large", args.c_str(), 250, &result, &error);
+        elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        lp_string_free(result);
+        lp_string_free(error);
+        done = true;
+    });
+    // Do not pump Qt: the real QRO host stops reading and its receive buffer
+    // fills. Once the deadline passes, the plain client must unblock itself.
+    const auto pauseUntil = std::chrono::steady_clock::now() + 800ms;
+    while (std::chrono::steady_clock::now() < pauseUntil)
+        std::this_thread::sleep_for(2ms);
+    const bool finishedWhileHostPaused = done.load();
+    if (!spinUntil([&] { return done.load(); }, 3s))
+        std::_Exit(2);
+    caller.join();
+    EXPECT_TRUE(finishedWhileHostPaused);
+    EXPECT_EQ(status.load(), LP_ERR_UNAVAILABLE);
+    EXPECT_LT(elapsedMs.load(), 800);
+    lp_client_destroy(client);
+}
+
 } // namespace
 
 int main(int argc, char** argv)

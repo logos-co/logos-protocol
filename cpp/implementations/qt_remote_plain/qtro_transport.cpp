@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <utility>
@@ -23,6 +24,8 @@
 #include <windows.h>
 #else
 #include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -32,6 +35,7 @@ namespace logos::qt_remote_plain {
 namespace {
 
 constexpr std::size_t kMaximumFrame = 64u << 20;
+using Deadline = std::chrono::steady_clock::time_point;
 using NativeHandle = std::intptr_t;
 constexpr NativeHandle kInvalidHandle = -1;
 
@@ -60,7 +64,8 @@ std::string windowsError(const char* operation, DWORD code)
 }
 
 bool overlappedWrite(HANDLE handle, const std::uint8_t* data, DWORD size,
-                     DWORD& written, std::string* error)
+                     DWORD& written, std::string* error,
+                     const std::optional<Deadline>& deadline)
 {
     OVERLAPPED operation{};
     operation.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -72,10 +77,29 @@ bool overlappedWrite(HANDLE handle, const std::uint8_t* data, DWORD size,
     if (!success) {
         const DWORD code = ::GetLastError();
         if (code == ERROR_IO_PENDING) {
-            success = ::WaitForSingleObject(operation.hEvent, INFINITE) == WAIT_OBJECT_0
-                && ::GetOverlappedResult(handle, &operation, &written, FALSE) != FALSE;
-            if (!success)
-                setError(error, windowsError("WriteFile", ::GetLastError()));
+            DWORD wait = INFINITE;
+            if (deadline) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    *deadline - std::chrono::steady_clock::now()).count();
+                wait = static_cast<DWORD>(std::max<std::int64_t>(0,
+                    std::min<std::int64_t>(remaining, MAXDWORD - 1)));
+            }
+            const DWORD result = ::WaitForSingleObject(operation.hEvent, wait);
+            if (result != WAIT_OBJECT_0) {
+                const DWORD waitError = result == WAIT_FAILED ? ::GetLastError() : 0;
+                // The OVERLAPPED and its buffer must remain alive until the
+                // cancelled operation completes, even when the deadline ends.
+                (void)::CancelIoEx(handle, &operation);
+                (void)::WaitForSingleObject(operation.hEvent, INFINITE);
+                setError(error, result == WAIT_TIMEOUT
+                    ? "local socket write timed out"
+                    : windowsError("WaitForSingleObject", waitError));
+                success = false;
+            } else {
+                success = ::GetOverlappedResult(handle, &operation, &written, FALSE) != FALSE;
+                if (!success)
+                    setError(error, windowsError("WriteFile", ::GetLastError()));
+            }
         } else {
             setError(error, windowsError("WriteFile", code));
         }
@@ -102,15 +126,19 @@ bool overlappedRead(HANDLE handle, std::uint8_t* data, DWORD size, DWORD& receiv
 }
 
 bool writeAll(NativeHandle handle, const std::vector<std::uint8_t>& data,
-              std::string* error)
+              std::string* error, const std::optional<Deadline>& deadline = {})
 {
     std::size_t offset = 0;
     while (offset < data.size()) {
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+            setError(error, "local socket write timed out");
+            return false;
+        }
         DWORD written = 0;
         const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(
             data.size() - offset, std::numeric_limits<DWORD>::max()));
         if (!overlappedWrite(winHandle(handle), data.data() + offset, remaining,
-                             written, error) || written == 0) {
+                             written, error, deadline) || written == 0) {
             return false;
         }
         offset += written;
@@ -118,8 +146,10 @@ bool writeAll(NativeHandle handle, const std::vector<std::uint8_t>& data,
     return true;
 }
 
-bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size)
+bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size,
+               const std::atomic<bool>* running)
 {
+    (void)running;
     std::size_t offset = 0;
     while (offset < size) {
         DWORD received = 0;
@@ -135,19 +165,73 @@ bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size)
 
 #else
 
-bool writeAll(NativeHandle fd, const std::vector<std::uint8_t>& data, std::string* error)
+int pollTimeout(const Deadline& deadline)
+{
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) return 0;
+    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    if (milliseconds < remaining) ++milliseconds;
+    return static_cast<int>(std::min<std::int64_t>(milliseconds.count(),
+        std::numeric_limits<int>::max()));
+}
+
+bool waitForSocket(int fd, short events, const Deadline& deadline,
+                   std::string* error, const char* operation)
+{
+    pollfd descriptor{fd, events, 0};
+    for (;;) {
+        const int timeout = pollTimeout(deadline);
+        if (timeout == 0) {
+            setError(error, std::string(operation) + " timed out");
+            return false;
+        }
+        const int result = ::poll(&descriptor, 1, timeout);
+        if (result > 0) return true;
+        if (result == 0) {
+            setError(error, std::string(operation) + " timed out");
+            return false;
+        }
+        if (errno != EINTR) {
+            setError(error, std::string(operation) + " failed: " + std::strerror(errno));
+            return false;
+        }
+    }
+}
+
+bool writeAll(NativeHandle fd, const std::vector<std::uint8_t>& data,
+              std::string* error, const std::optional<Deadline>& deadline = {})
 {
     std::size_t offset = 0;
     while (offset < data.size()) {
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+            setError(error, "local socket write timed out");
+            return false;
+        }
 #ifdef MSG_NOSIGNAL
-        constexpr int flags = MSG_NOSIGNAL;
+        constexpr int signalFlag = MSG_NOSIGNAL;
 #else
-        constexpr int flags = 0;
+        constexpr int signalFlag = 0;
 #endif
+        const int flags = signalFlag | (deadline ? MSG_DONTWAIT : 0);
         const auto count = ::send(fd, data.data() + offset, data.size() - offset, flags);
         if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (deadline) {
+                if (!waitForSocket(static_cast<int>(fd), POLLOUT, *deadline, error,
+                                   "local socket write")) return false;
+            } else {
+                pollfd descriptor{static_cast<int>(fd), POLLOUT, 0};
+                if (::poll(&descriptor, 1, -1) < 0 && errno != EINTR) {
+                    setError(error, "local socket write failed: "
+                        + std::string(std::strerror(errno)));
+                    return false;
+                }
+            }
+            continue;
+        }
         if (count <= 0) {
-            setError(error, "local socket write failed: " + std::string(std::strerror(errno)));
+            setError(error, count == 0 ? "local socket closed while writing"
+                : "local socket write failed: " + std::string(std::strerror(errno)));
             return false;
         }
         offset += static_cast<std::size_t>(count);
@@ -155,12 +239,19 @@ bool writeAll(NativeHandle fd, const std::vector<std::uint8_t>& data, std::strin
     return true;
 }
 
-bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size)
+bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size,
+               const std::atomic<bool>* running)
 {
     std::size_t offset = 0;
     while (offset < size) {
+        if (running && !running->load()) return false;
         const auto count = ::recv(fd, output + offset, size - offset, 0);
         if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd descriptor{static_cast<int>(fd), POLLIN, 0};
+            if (::poll(&descriptor, 1, 50) < 0 && errno != EINTR) return false;
+            continue;
+        }
         if (count <= 0) return false;
         offset += static_cast<std::size_t>(count);
     }
@@ -169,10 +260,11 @@ bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size)
 
 #endif
 
-bool readPacket(NativeHandle handle, std::vector<std::uint8_t>& output, std::string* error)
+bool readPacket(NativeHandle handle, std::vector<std::uint8_t>& output,
+                std::string* error, const std::atomic<bool>* running)
 {
     output.resize(4);
-    if (!readExact(handle, output.data(), 4)) {
+    if (!readExact(handle, output.data(), 4, running)) {
         setError(error, "local socket closed");
         return false;
     }
@@ -185,7 +277,7 @@ bool readPacket(NativeHandle handle, std::vector<std::uint8_t>& output, std::str
         return false;
     }
     output.resize(4 + payload);
-    if (!readExact(handle, output.data() + 4, payload)) {
+    if (!readExact(handle, output.data() + 4, payload, running)) {
         setError(error, "local socket closed in the middle of a frame");
         return false;
     }
@@ -241,7 +333,7 @@ NativeHandle connectSocket(const std::string& path,
 }
 #else
 NativeHandle connectSocket(const std::string& path,
-                           std::chrono::milliseconds,
+                           std::chrono::milliseconds timeout,
                            std::string* error)
 {
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -261,11 +353,34 @@ NativeHandle connectSocket(const std::string& path,
         return kInvalidHandle;
     }
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-        setError(error, "connect(" + path + ") failed: " + std::string(std::strerror(errno)));
+    const int originalFlags = ::fcntl(fd, F_GETFL, 0);
+    if (originalFlags < 0 || ::fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
+        setError(error, "fcntl() failed: " + std::string(std::strerror(errno)));
         ::close(fd);
         return kInvalidHandle;
     }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const int connectError = errno;
+        if (connectError != EINPROGRESS || !waitForSocket(fd, POLLOUT, deadline, error,
+                                                           "local socket connection")) {
+            if (connectError != EINPROGRESS)
+                setError(error, "connect(" + path + ") failed: " + std::string(std::strerror(connectError)));
+            ::close(fd);
+            return kInvalidHandle;
+        }
+        int result = 0;
+        socklen_t length = sizeof(result);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &result, &length) < 0 || result != 0) {
+            setError(error, "connect(" + path + ") failed: "
+                + std::string(std::strerror(result == 0 ? errno : result)));
+            ::close(fd);
+            return kInvalidHandle;
+        }
+    }
+    // Keep client sockets nonblocking: Darwin does not reliably honor
+    // MSG_DONTWAIT on local stream sends when the peer stops reading.
+    // readExact handles EAGAIN by waiting for readable data.
     return fd;
 }
 
@@ -407,7 +522,7 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     };
 
     mutable std::mutex mu;
-    std::mutex sendMu;
+    std::timed_mutex sendMu;
     std::condition_variable changed;
     std::atomic<NativeHandle> fd{kInvalidHandle};
     std::atomic<bool> running{false};
@@ -428,15 +543,24 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     bool disconnectReported = false;
     std::thread::id readerThread;
 
-    bool send(const std::vector<std::uint8_t>& frame, std::string* error = nullptr)
+    bool send(const std::vector<std::uint8_t>& frame, std::string* error = nullptr,
+              const std::optional<Deadline>& deadline = {})
     {
-        std::lock_guard<std::mutex> lock(sendMu);
+        std::unique_lock<std::timed_mutex> lock(sendMu, std::defer_lock);
+        if (deadline) {
+            if (!lock.try_lock_until(*deadline)) {
+                setError(error, "local socket write timed out");
+                return false;
+            }
+        } else {
+            lock.lock();
+        }
         const NativeHandle current = fd.load();
         if (current == kInvalidHandle) {
             setError(error, "local socket is closed");
             return false;
         }
-        return writeAll(current, frame, error);
+        return writeAll(current, frame, error, deadline);
     }
 
     void fail(std::string reason)
@@ -578,7 +702,7 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
         }
         std::string error;
         std::vector<std::uint8_t> bytes;
-        while (running && readPacket(fd.load(), bytes, &error)) {
+        while (running && readPacket(fd.load(), bytes, &error, &running)) {
             try {
                 handle(decodeFrame(bytes));
             } catch (const std::exception& exception) {
@@ -617,6 +741,7 @@ bool Client::connect(const std::string& localUrlOrPath,
                      std::chrono::milliseconds timeout,
                      std::string* error)
 {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     closeConnection(false);
     const std::string path = localSocketPath(localUrlOrPath);
     const NativeHandle socket = connectSocket(path, timeout, error);
@@ -640,7 +765,7 @@ bool Client::connect(const std::string& localUrlOrPath,
     std::thread([state] { state->readLoop(); }).detach();
 
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    const bool ready = m_impl->changed.wait_for(lock, timeout, [&] {
+    const bool ready = m_impl->changed.wait_until(lock, deadline, [&] {
         return (m_impl->handshake && m_impl->objectListSeen) || !m_impl->failure.empty();
     });
     if (!ready || !m_impl->handshake || !m_impl->objectListSeen) {
@@ -722,8 +847,9 @@ bool Client::acquire(const std::string& object,
         if (m_impl->requested.insert(object).second) {
             lock.unlock();
             std::string writeError;
-            if (!m_impl->send(addObjectPacket(object), &writeError)) {
+            if (!m_impl->send(addObjectPacket(object), &writeError, deadline)) {
                 setError(error, writeError);
+                closeConnection(false);
                 return false;
             }
             lock.lock();
@@ -757,7 +883,12 @@ std::optional<Variant> Client::call(
     std::chrono::milliseconds timeout,
     std::string* error)
 {
-    if (!acquire(object, timeout, error)) return std::nullopt;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (!acquire(object,
+                 std::max(std::chrono::milliseconds::zero(),
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())),
+                 error)) return std::nullopt;
 
     std::int32_t methodIndex = -1;
     std::int32_t serial = -1;
@@ -779,15 +910,19 @@ std::optional<Variant> Client::call(
     }
 
     std::string writeError;
-    if (!m_impl->send(invokePacket(object, 0, methodIndex, arguments, serial), &writeError)) {
-        std::lock_guard<std::mutex> lock(m_impl->mu);
-        m_impl->pending.erase(serial);
+    if (!m_impl->send(invokePacket(object, 0, methodIndex, arguments, serial),
+                      &writeError, deadline)) {
+        {
+            std::lock_guard<std::mutex> lock(m_impl->mu);
+            m_impl->pending.erase(serial);
+        }
+        closeConnection(false);
         setError(error, writeError);
         return std::nullopt;
     }
 
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    if (!pending->cv.wait_for(lock, timeout, [&] { return pending->done; })) {
+    if (!pending->cv.wait_until(lock, deadline, [&] { return pending->done; })) {
         m_impl->pending.erase(serial);
         setError(error, "QtRO invocation timed out: " + object + "." + methodSignature);
         return std::nullopt;
@@ -862,7 +997,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         }
         std::vector<std::uint8_t> bytes;
         std::string error;
-        while (running && readPacket(connection->fd.load(), bytes, &error)) {
+        while (running && readPacket(connection->fd.load(), bytes, &error, &running)) {
             try {
                 const Frame frame = decodeFrame(bytes);
                 if (frame.type == PacketType::Ping) {

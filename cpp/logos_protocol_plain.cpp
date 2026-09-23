@@ -649,16 +649,23 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
                                   std::vector<Variant> arguments,
                                   int timeout, std::string& error)
 {
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
+    const auto remaining = [&] {
+        return std::max(0, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count()));
+    };
     if (object != state->target) {
         Client temporary;
-        if (!temporary.connect(endpoint(object), std::chrono::milliseconds(timeout), &error))
+        if (!temporary.connect(endpoint(object), std::chrono::milliseconds(remaining()), &error))
             return std::nullopt;
         return temporary.call(object, signature, std::move(arguments),
-                              std::chrono::milliseconds(timeout), &error);
+                              std::chrono::milliseconds(remaining()), &error);
     }
-    if (!ensureConnected(state, timeout, error)) return std::nullopt;
+    if (!ensureConnected(state, remaining(), error)) return std::nullopt;
     return state->wire->call(object, signature, std::move(arguments),
-                             std::chrono::milliseconds(timeout), &error);
+                             std::chrono::milliseconds(remaining()), &error);
 }
 
 std::string mintToken(const std::shared_ptr<ClientState>& state,
@@ -706,7 +713,9 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{credential}),
          Variant::fromRpc(RpcValue{"requestModule"}), std::move(requestArgs)},
-        std::chrono::milliseconds(timeout), &error);
+        std::max(std::chrono::milliseconds::zero(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     deadline - std::chrono::steady_clock::now())), &error);
     if (!result || !result->value.isString()) return {};
     const std::string token = result->value.asString();
     if (!token.empty()) tokenSave(state->tokens, state->target, token);
