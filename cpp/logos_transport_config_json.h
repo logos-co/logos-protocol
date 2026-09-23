@@ -39,6 +39,13 @@ std::string transportSetToJsonString(const LogosTransportSet& set);
 // command-line parser's existing error machinery).
 LogosTransportSet transportSetFromJsonString(const std::string& json);
 
+// The same, refusing what transportSetFromJsonString drops or guesses at:
+// text that is not a JSON array, an entry that is not an object, a field of
+// the wrong type, a port out of range, an unknown protocol or codec. Empty
+// text is the empty set. On failure `error` says what was wrong.
+bool parseTransportSet(const std::string& json, LogosTransportSet* out,
+                       std::string* error = nullptr);
+
 } // namespace logos
 
 #endif // LOGOS_TRANSPORT_CONFIG_JSON_H

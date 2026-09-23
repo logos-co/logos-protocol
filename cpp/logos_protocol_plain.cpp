@@ -1758,6 +1758,8 @@ try {
 lp_provider* lp_provider_create(const char* moduleName, const char* transportSetJson)
 try {
     if (!moduleName || !*moduleName) return nullptr;
+    // Refused, not served as local only: that hid a module's TCP listeners.
+    if (transportSetJson && !logos::parseTransportSet(transportSetJson, nullptr)) return nullptr;
     auto* provider = new lp_provider();
     provider->moduleName = moduleName;
     provider->transportSetJson = transportSetJson ? transportSetJson : "[]";
