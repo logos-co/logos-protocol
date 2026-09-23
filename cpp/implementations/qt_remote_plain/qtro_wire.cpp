@@ -160,6 +160,8 @@ std::vector<std::uint8_t> jsonBytes(const plain::RpcValue& value)
     return {text.begin(), text.end()};
 }
 
+constexpr std::size_t kMaxNesting = 64;
+
 // Qt writes a null QJsonDocument as a null QByteArray and reads an empty
 // buffer as a null document; `empty` is what that decodes to for the type.
 plain::RpcValue parseJsonBytes(const std::optional<std::vector<std::uint8_t>>& bytes,
@@ -168,10 +170,34 @@ plain::RpcValue parseJsonBytes(const std::optional<std::vector<std::uint8_t>>& b
     if (!bytes || bytes->empty())
         return empty;
     const std::string text(bytes->begin(), bytes->end());
-    const auto parsed = nlohmann::json::parse(text, nullptr, false);
+    // Converting the parsed document recurses, so its depth is bounded too.
+    bool tooDeep = false;
+    const auto parsed = nlohmann::json::parse(text,
+        [&](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+            if (depth > static_cast<int>(kMaxNesting)) tooDeep = true;
+            return !tooDeep;
+        }, false);
+    if (tooDeep)
+        throw CodecError("QJson payload nests too deeply");
     if (parsed.is_discarded())
         throw CodecError("invalid QJson payload");
     return jsonToRpc(parsed);
+}
+
+bool isContainer(MetaType type)
+{
+    return type == MetaType::VariantList || type == MetaType::VariantMap
+        || type == MetaType::VariantHash;
+}
+
+// A container child's value moves into its parent, and the child re-encodes
+// from its own children: copying it instead made a frame decode into its
+// size times its depth.
+plain::RpcValue takeValue(Variant& child)
+{
+    if (!isContainer(child.type)) return child.value;
+    child.detached = true;
+    return std::move(child.value);
 }
 
 std::string utf8Of(std::uint32_t cp)
@@ -321,8 +347,6 @@ const std::vector<std::uint8_t>& bytesOf(const plain::RpcValue& value)
     return value.asBytes().data;
 }
 
-constexpr std::size_t kMaxNesting = 64;
-
 Writer packetPrefix(PacketType type, std::string_view name)
 {
     Writer writer;
@@ -387,8 +411,10 @@ Variant Variant::logosResult(bool success, Variant resultValue, Variant resultEr
 
 bool Variant::operator==(const Variant& other) const
 {
+    // A detached container's value lives in its parent; its children say it all.
     return type == other.type && isNull == other.isNull
-        && value == other.value && customType == other.customType
+        && (value == other.value || detached || other.detached)
+        && customType == other.customType
         && jsonUndefined == other.jsonUndefined
         && nestedKeys == other.nestedKeys
         && nestedValues == other.nestedValues
@@ -553,6 +579,13 @@ void Writer::variant(const Variant& input)
         return;
     }
     case MetaType::VariantList: {
+        if (input.detached) {
+            if (input.nestedValues.size() > std::numeric_limits<std::uint32_t>::max())
+                throw CodecError("QVariantList is too large");
+            u32(static_cast<std::uint32_t>(input.nestedValues.size()));
+            for (const auto& child : input.nestedValues) variant(child);
+            return;
+        }
         const auto& list = listOf(input.value).items;
         if (list.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantList is too large");
@@ -564,6 +597,18 @@ void Writer::variant(const Variant& input)
     }
     case MetaType::VariantMap:
     case MetaType::VariantHash: {
+        if (input.detached) {
+            // In the order it arrived, which is how it re-encodes byte for byte.
+            if (input.nestedKeys.size() != input.nestedValues.size()
+                || input.nestedKeys.size() > std::numeric_limits<std::uint32_t>::max())
+                throw CodecError("malformed detached QVariantMap");
+            u32(static_cast<std::uint32_t>(input.nestedKeys.size()));
+            for (std::size_t i = 0; i < input.nestedKeys.size(); ++i) {
+                string(input.nestedKeys[i]);
+                variant(input.nestedValues[i]);
+            }
+            return;
+        }
         const auto entries = sortedMapEntries(mapOf(input.value));
         if (entries.size() > std::numeric_limits<std::uint32_t>::max())
             throw CodecError("QVariantMap is too large");
@@ -997,7 +1042,7 @@ Variant Reader::variant()
         result.nestedValues.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             Variant child = variant();
-            list.items.push_back(child.value);
+            list.items.push_back(takeValue(child));
             result.nestedValues.push_back(std::move(child));
         }
         result.value = plain::RpcValue{std::move(list)};
@@ -1017,7 +1062,7 @@ Variant Reader::variant()
             // QString key.
             auto key = string().value_or(std::string{});
             Variant child = variant();
-            map.emplace(key, child.value);
+            map.emplace(key, takeValue(child));
             result.nestedKeys.push_back(std::move(key));
             result.nestedValues.push_back(std::move(child));
         }
@@ -1059,8 +1104,8 @@ Variant Reader::variant()
         map.emplace("success", plain::RpcValue{boolean()});
         Variant value = variant();
         Variant error = variant();
-        map.emplace("value", value.value);
-        map.emplace("error", error.value);
+        map.emplace("value", takeValue(value));
+        map.emplace("error", takeValue(error));
         result.nestedValues.push_back(std::move(value));
         result.nestedValues.push_back(std::move(error));
         result.value = plain::RpcValue{std::move(map)};

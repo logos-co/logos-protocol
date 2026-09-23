@@ -157,6 +157,79 @@ TEST(QtRemotePlainWireTest, NestingIsBoundedInsteadOfExhaustingTheStack)
     EXPECT_TRUE(trailing.variantUntil(deep.data().size()).opaque);
 }
 
+TEST(QtRemotePlainWireTest, ADeeplyNestedJsonPayloadIsRefusedNotRecursedInto)
+{
+    constexpr int kDepth = 100000;
+    std::string text(kDepth, '[');
+    text.append(kDepth, ']');
+    Writer document;
+    document.u32(static_cast<std::uint32_t>(MetaType::JsonDocument));
+    document.u8(0);
+    document.bytes({text.begin(), text.end()});
+    Reader reader(document.data());
+    EXPECT_THROW((void)reader.variant(), CodecError);
+}
+
+// Each level used to copy its children's values, so a deep frame decoded
+// into its size times its depth; nested containers now hand theirs up.
+TEST(QtRemotePlainWireTest, DeepNestingDecodesOnceAndReencodesExactly)
+{
+    constexpr int kDepth = 60;
+    constexpr int kWidth = 2000;
+    Writer deep;
+    for (int level = 0; level < kDepth; ++level) {
+        deep.u32(static_cast<std::uint32_t>(MetaType::VariantList));
+        deep.u8(0);
+        deep.u32(kWidth + 1);
+        for (int i = 0; i < kWidth; ++i) {
+            deep.u32(static_cast<std::uint32_t>(MetaType::Bool));
+            deep.u8(0);
+            deep.u8(1);
+        }
+    }
+    deep.u32(static_cast<std::uint32_t>(MetaType::Invalid));
+    deep.u8(1);
+
+    Reader reader(deep.data());
+    const Variant decoded = reader.variant();
+    EXPECT_EQ(reader.remaining(), 0u);
+    const RpcValue* level = &decoded.value;
+    for (int i = 0; i < kDepth; ++i) {
+        ASSERT_TRUE(level->isList()) << "level " << i;
+        ASSERT_EQ(level->asList().items.size(), static_cast<std::size_t>(kWidth + 1));
+        level = &level->asList().items.back();
+    }
+    EXPECT_TRUE(level->isNull());
+    EXPECT_TRUE(decoded.nestedValues.back().detached);
+
+    Writer again;
+    again.variant(decoded);
+    EXPECT_EQ(again.data(), deep.data());
+}
+
+TEST(QtRemotePlainWireTest, ADetachedMapReencodesInItsWireOrder)
+{
+    // An unsorted hash inside a list, as Qt may send a QVariantHash.
+    Writer outer;
+    outer.u32(static_cast<std::uint32_t>(MetaType::VariantList));
+    outer.u8(0);
+    outer.u32(1);
+    outer.u32(static_cast<std::uint32_t>(MetaType::VariantHash));
+    outer.u8(0);
+    outer.u32(2);
+    outer.string("zeta");
+    outer.variant(Variant::fromRpc(RpcValue{std::int64_t{1}}));
+    outer.string("alpha");
+    outer.variant(Variant::fromRpc(RpcValue{std::int64_t{2}}));
+    Reader reader(outer.data());
+    const Variant decoded = reader.variant();
+    ASSERT_TRUE(decoded.value.isList());
+    EXPECT_EQ(decoded.value.asList().items[0].asMap().at("alpha"), RpcValue{std::int64_t{2}});
+    Writer again;
+    again.variant(decoded);
+    EXPECT_EQ(again.data(), outer.data());
+}
+
 TEST(QtRemotePlainWireTest, MismatchedValuesFailWithACodecError)
 {
     Variant notAList;

@@ -100,6 +100,9 @@ struct Variant {
     std::vector<std::uint8_t> raw;
     // The codec could not interpret the value; only `raw` carries it.
     bool opaque = false;
+    // A decoded container nested in another: its value was moved into the
+    // parent's, and it re-encodes from nestedKeys/nestedValues.
+    bool detached = false;
 
     static Variant fromRpc(plain::RpcValue value);
     static Variant logosResult(bool success, Variant value, Variant error);

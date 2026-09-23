@@ -852,6 +852,76 @@ TEST(QtRemotePlainCabiTest, ARestartedProviderIsReArmedPromptly)
     lp_provider_destroy(provider);
 }
 
+// Detector: invalid UTF-8 in a name, or a non-string restart option, threw
+// across the C ABI and terminated the process.
+TEST(QtRemotePlainCabiTest, MalformedNamesAndOptionsFailWithoutAborting)
+{
+    setInstanceId("qtro_cabi_malformed_");
+    Fixture fixture;
+    lp_provider* provider = startEventProvider("malformed_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("malformed_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("malformed_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    char* result = nullptr;
+    char* error = nullptr;
+    (void)lp_invoke(client, "\xff\xfe", "[]", 2000, &result, &error);
+    lp_string_free(result);
+    lp_string_free(error);
+    EXPECT_EQ(lp_provider_emit_event(provider, "\xff", "[]"), LP_OK);
+    lp_subscription* subscription = lp_subscribe(client, "\xff", onSlowEvent, nullptr);
+    EXPECT_NE(subscription, nullptr);
+    // As the Qt C ABI: only unparseable JSON is refused.
+    EXPECT_EQ(lp_client_set_subscription_options(client, R"({"restart":1})"), 1);
+    EXPECT_EQ(lp_client_set_subscription_options(client, "[]"), 1);
+    EXPECT_EQ(lp_client_set_subscription_options(client, "{"), 0);
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+struct ReplayDestroy {
+    lp_client* client = nullptr;
+    lp_subscription* subscription = nullptr;
+    std::atomic<int> destroyed{0};
+};
+
+void destroyOnReplay(int status, unsigned long long, const char*, void* userData)
+{
+    auto& replay = *static_cast<ReplayDestroy*>(userData);
+    if (status != LP_SUB_ARMED || !replay.client) return;
+    lp_client* client = replay.client;
+    replay.client = nullptr;
+    lp_unsubscribe(replay.subscription);
+    lp_client_destroy(client);
+    ++replay.destroyed;
+    // The callback's own code keeps running after the destroy.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
+
+// Detector (under a guard allocator): the replay that installing a status
+// callback runs used the client after the callback destroyed it.
+TEST(QtRemotePlainCabiTest, AStatusReplayCanDestroyTheClient)
+{
+    setInstanceId("qtro_cabi_replay_destroy_");
+    Fixture fixture;
+    lp_provider* provider = startEventProvider("replay_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("replay_fixture", "secret"), LP_OK);
+    for (int round = 0; round < 5; ++round) {
+        ReplayDestroy replay;
+        replay.client = lp_client_create("replay_fixture", "caller", nullptr, nullptr);
+        replay.subscription = lp_subscribe(replay.client, "tick", onSlowEvent, nullptr);
+        ASSERT_TRUE(waitUntil([&] {
+            return lp_client_subscription_generation(replay.client) == 1;
+        }));
+        ASSERT_EQ(lp_client_set_subscription_status_cb(replay.client, destroyOnReplay, &replay), 1);
+        EXPECT_EQ(replay.destroyed.load(), 1);
+    }
+    lp_provider_destroy(provider);
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");

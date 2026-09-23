@@ -64,10 +64,30 @@ char* duplicate(const std::string& value)
 
 int timeoutMs(int value) { return value > 0 ? value : kDefaultTimeoutMs; }
 
+// Text crossing the C ABI: invalid UTF-8 in a name or message is replaced
+// rather than thrown.
+std::string dumpJson(const json& value)
+{
+    return value.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+// Members of JSON another party wrote, read without trusting their types.
+std::string stringField(const json& object, const char* key, const std::string& fallback = {})
+{
+    const auto it = object.find(key);
+    return it != object.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+bool boolField(const json& object, const char* key, bool fallback)
+{
+    const auto it = object.find(key);
+    return it != object.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+
 std::string errorJson(const char* code, const std::string& message,
                       const std::string& origin)
 {
-    return json{{"code", code}, {"message", message}, {"origin", origin}}.dump();
+    return dumpJson(json{{"code", code}, {"message", message}, {"origin", origin}});
 }
 
 RpcValue jsonToRpc(const json& value)
@@ -354,7 +374,11 @@ void asyncWorkerLoop(const std::shared_ptr<ClientState>& state)
         std::function<void()> call = std::move(state->asyncCalls.front());
         state->asyncCalls.pop_front();
         lock.unlock();
-        call();
+        try {
+            call();
+        } catch (...) {
+            // Nothing thrown here may end the process.
+        }
         call = nullptr;
         lock.lock();
     }
@@ -407,7 +431,7 @@ void deliverNetworkEvent(const std::shared_ptr<ClientState>& state,
     }
     json data = json::array();
     for (const auto& value : message.data) data.push_back(rpcToJson(value));
-    const std::string text = data.dump();
+    const std::string text = dumpJson(data);
     for (const auto& sub : subscriptions) {
         std::lock_guard<std::recursive_mutex> subLock(sub->callbackMutex);
         if (sub->active && (sub->event.empty() || sub->event == message.eventName)
@@ -982,7 +1006,7 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
             return R"({"kind":"host"})";
         for (const auto& entry : provider->inbound)
             if (entry.second == token)
-                return json{{"kind", "module"}, {"name", entry.first}}.dump();
+                return dumpJson(json{{"kind", "module"}, {"name", entry.first}});
         validate = provider->validateToken;
         validatorData = provider->validatorUserData;
     }
@@ -1002,7 +1026,7 @@ json providerMetadata(lp_provider* provider, const std::string& requested)
     json filtered = json::array();
     for (const auto& entry : metadata) {
         if (!entry.is_object()) continue;
-        const bool event = entry.value("type", std::string{}) == "event";
+        const bool event = stringField(entry, "type") == "event";
         if ((requested == "events") == event) filtered.push_back(entry);
     }
     return filtered;
@@ -1013,10 +1037,10 @@ void cacheReturnTypes(lp_provider* provider)
     const json metadata = providerMetadata(provider, "methods");
     std::map<std::string, std::string> returnTypes;
     for (const auto& entry : metadata) {
-        if (!entry.is_object() || entry.value("type", std::string{"method"}) != "method")
+        if (!entry.is_object() || stringField(entry, "type", "method") != "method")
             continue;
-        const std::string name = entry.value("name", std::string{});
-        const std::string returnType = entry.value("returnType", std::string{});
+        const std::string name = stringField(entry, "name");
+        const std::string returnType = stringField(entry, "returnType");
         if (!name.empty()) returnTypes[name] = returnType;
     }
     std::lock_guard<std::mutex> lock(provider->mutex);
@@ -1075,7 +1099,7 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
     if (caller.empty())
         return Variant::fromRpc(jsonToRpc(json{{kStatusKey, "unauthorized"}}));
     if (!provider->dispatch) return {};
-    const std::string argsText = args.dump();
+    const std::string argsText = dumpJson(args);
     const std::string previousCaller = std::move(gCurrentCaller);
     gCurrentCaller = caller;
     char* text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
@@ -1145,7 +1169,7 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     }
     json args = json::array();
     for (const auto& value : request.args) args.push_back(rpcToJson(value));
-    const std::string argsText = args.dump();
+    const std::string argsText = dumpJson(args);
     const std::string previousCaller = std::move(gCurrentCaller);
     gCurrentCaller = caller;
     char* text = provider->dispatch(request.method.c_str(), argsText.c_str(),
@@ -1181,10 +1205,10 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
     for (const auto& entry : metadata) {
         if (!entry.is_object()) continue;
         logos::plain::MethodMetadata method;
-        method.name = entry.value("name", std::string{});
-        method.signature = entry.value("signature", std::string{});
-        method.returnType = entry.value("returnType", std::string{});
-        method.isInvokable = entry.value("isInvokable", true);
+        method.name = stringField(entry, "name");
+        method.signature = stringField(entry, "signature");
+        method.returnType = stringField(entry, "returnType");
+        method.isInvokable = boolField(entry, "isInvokable", true);
         if (entry.contains("parameters") && entry["parameters"].is_array())
             for (const auto& parameter : entry["parameters"])
                 method.parameters.items.push_back(jsonToRpc(parameter));
@@ -1211,17 +1235,19 @@ int lp_set_mode(const char* mode)
 const char* lp_get_mode(void) { return "remote"; }
 
 int lp_set_default_transport(const char* transportJson)
-{
+try {
     if (!transportJson || !acceptsPlainConfig(transportJson)) return LP_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(gDefaultMutex);
     gDefaultTransport = transportJson;
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 lp_client* lp_client_create(const char* targetModule, const char* originModule,
                             const char* targetTransportJson,
                             const char* capabilityTransportJson)
-{
+try {
     if (!targetModule || !*targetModule || !originModule
         || !acceptsPlainConfig(targetTransportJson)
         || !acceptsPlainConfig(capabilityTransportJson)) return nullptr;
@@ -1275,7 +1301,7 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
                     else it = state->subscriptions.erase(it);
                 }
             }
-            const std::string text = (data.is_array() ? data : json::array()).dump();
+            const std::string text = dumpJson(data.is_array() ? data : json::array());
             for (const auto& sub : subscriptions) {
                 std::lock_guard<std::recursive_mutex> subLock(sub->callbackMutex);
                 if (sub->active && (sub->event.empty() || sub->event == event) && sub->callback) {
@@ -1293,6 +1319,8 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
         || state->targetConfig.protocol == LogosProtocol::TcpSsl)
         state->eventWorker = std::thread([state] { networkEventLoop(state); });
     return new lp_client{std::move(state)};
+} catch (...) {
+    return nullptr;
 }
 
 void lp_client_destroy(lp_client* client)
@@ -1346,7 +1374,7 @@ void lp_client_destroy(lp_client* client)
 
 int lp_invoke(lp_client* client, const char* method, const char* argsJson,
               int timeout, char** outResultJson, char** outErrorJson)
-{
+try {
     if (outResultJson) *outResultJson = nullptr;
     if (outErrorJson) *outErrorJson = nullptr;
     if (!client || !method || !*method) return LP_ERR_INVALID_ARG;
@@ -1364,13 +1392,15 @@ int lp_invoke(lp_client* client, const char* method, const char* argsJson,
             error, client->state->target));
         return LP_ERR_UNAVAILABLE;
     }
-    if (outResultJson) *outResultJson = duplicate(rpcToJson(result->value).dump());
+    if (outResultJson) *outResultJson = duplicate(dumpJson(rpcToJson(result->value)));
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
                     int timeout, lp_result_cb callback, void* userData)
-{
+try {
     if (!client || !method || !*method || !callback) return LP_ERR_INVALID_ARG;
     const json args = json::parse(argsJson && *argsJson ? argsJson : "[]", nullptr, false);
     if (args.is_discarded() || !args.is_array()) return LP_ERR_INVALID_ARG;
@@ -1382,7 +1412,7 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
         std::lock_guard<std::recursive_mutex> lock(state->callbackMutex);
         if (!state->alive) return;
         const std::string text = result
-            ? rpcToJson(result->value).dump()
+            ? dumpJson(rpcToJson(result->value))
             : errorJson(error == "token not recognized" ? "unauthorized" : "transport",
                         error, state->target);
         CallbackScope scope(state.get());
@@ -1407,11 +1437,13 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
     }
     state->asyncChanged.notify_one();
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 lp_subscription* lp_subscribe(lp_client* client, const char* eventName,
                               lp_event_cb callback, void* userData)
-{
+try {
     if (!client || !eventName || !callback
         || std::strcmp(eventName, kCompletionEvent) == 0) return nullptr;
     auto state = std::make_shared<SubscriptionState>();
@@ -1424,6 +1456,8 @@ lp_subscription* lp_subscribe(lp_client* client, const char* eventName,
     }
     client->state->subscriptionChanged.notify_all();
     return new lp_subscription{client->state, std::move(state)};
+} catch (...) {
+    return nullptr;
 }
 
 int lp_client_set_subscription_status_cb(lp_client* client,
@@ -1431,22 +1465,24 @@ int lp_client_set_subscription_status_cb(lp_client* client,
                                          void* userData)
 {
     if (!client) return 0;
+    // The replay may destroy the client; its state must outlive the callback.
+    const std::shared_ptr<ClientState> state = client->state;
     int replay = 0;
     unsigned long long generation = 0;
     {
-        std::lock_guard<std::mutex> lock(client->state->mutex);
-        client->state->statusCallback = callback;
-        client->state->statusUserData = userData;
-        generation = client->state->generation.load();
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->statusCallback = callback;
+        state->statusUserData = userData;
+        generation = state->generation.load();
         if (callback) {
-            if (hasSubscriptionPhase(client->state, SubscriptionState::Phase::Armed))
+            if (hasSubscriptionPhase(state, SubscriptionState::Phase::Armed))
                 replay = LP_SUB_ARMED;
-            else if (hasSubscriptionPhase(client->state, SubscriptionState::Phase::Held))
+            else if (hasSubscriptionPhase(state, SubscriptionState::Phase::Held))
                 replay = LP_SUB_HELD;
         }
     }
     if (replay)
-        reportSubscriptionStatus(client->state, replay, generation,
+        reportSubscriptionStatus(state, replay, generation,
                                  replay == LP_SUB_HELD ? "provider_unavailable" : nullptr);
     return 1;
 }
@@ -1457,20 +1493,23 @@ unsigned long long lp_client_subscription_generation(lp_client* client)
 }
 
 int lp_client_set_subscription_options(lp_client* client, const char* optionsJson)
-{
+try {
     if (!client) return 0;
-    json options = json::object();
+    // As the Qt C ABI: anything but a "manual" restart means automatic, and
+    // only unparseable JSON is refused.
+    bool manual = false;
     if (optionsJson && *optionsJson) {
-        options = json::parse(optionsJson, nullptr, false);
-        if (options.is_discarded() || !options.is_object()) return 0;
+        const json options = json::parse(optionsJson, nullptr, false);
+        if (options.is_discarded()) return 0;
+        manual = options.is_object() && stringField(options, "restart") == "manual";
     }
-    const std::string restart = options.value("restart", "automatic");
-    if (restart != "automatic" && restart != "manual") return 0;
     {
         std::lock_guard<std::mutex> lock(client->state->mutex);
-        client->state->manualRestart = restart == "manual";
+        client->state->manualRestart = manual;
     }
     return 1;
+} catch (...) {
+    return 0;
 }
 
 int lp_client_rearm_subscriptions(lp_client* client)
@@ -1509,7 +1548,7 @@ void lp_unsubscribe(lp_subscription* subscription)
 }
 
 char* lp_pending_subscriptions(lp_client* client)
-{
+try {
     if (!client) return nullptr;
     json pending = json::array();
     std::lock_guard<std::mutex> lock(client->state->mutex);
@@ -1524,23 +1563,27 @@ char* lp_pending_subscriptions(lp_client* client)
             it = client->state->subscriptions.erase(it);
         }
     }
-    return duplicate(pending.dump());
+    return duplicate(dumpJson(pending));
+} catch (...) {
+    return nullptr;
 }
 
 char* lp_get_methods(lp_client* client)
-{
+try {
     if (!client) return nullptr;
     std::string error;
     if (client->state->targetConfig.protocol == LogosProtocol::Tcp
         || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         auto result = networkCall(client->state, client->state->target,
             "getPluginInterface", json::array(), {}, kDefaultTimeoutMs, error);
-        return result ? duplicate(rpcToJson(*result).dump()) : nullptr;
+        return result ? duplicate(dumpJson(rpcToJson(*result))) : nullptr;
     }
     if (!ensureConnected(client->state, kDefaultTimeoutMs, error)) return nullptr;
     auto result = client->state->wire->call(client->state->target, "getPluginInterface()", {},
                                              std::chrono::milliseconds(kDefaultTimeoutMs), &error);
-    return result ? duplicate(rpcToJson(result->value).dump()) : nullptr;
+    return result ? duplicate(dumpJson(rpcToJson(result->value))) : nullptr;
+} catch (...) {
+    return nullptr;
 }
 
 char* lp_token_get(const char* moduleName)
@@ -1631,17 +1674,19 @@ int lp_token_adopt_credential(const char* identity, const char* credential)
 }
 
 char* lp_token_keys(void)
-{
+try {
     if (!(gHostServices.load() & kTokenRegistry)) return nullptr;
     json keys = json::array();
     std::lock_guard<std::mutex> lock(gSharedTokens->mutex);
     for (const auto& entry : gSharedTokens->outbound) keys.push_back(entry.first);
-    return duplicate(keys.dump());
+    return duplicate(dumpJson(keys));
+} catch (...) {
+    return nullptr;
 }
 
 int lp_inform_module_token(lp_client* client, const char* authToken,
                            const char* moduleName, const char* token)
-{
+try {
     if (!client || !authToken || !moduleName || !token) return LP_ERR_INVALID_ARG;
     std::string error;
     if (client->state->targetConfig.protocol == LogosProtocol::Tcp
@@ -1661,12 +1706,14 @@ int lp_inform_module_token(lp_client* client, const char* authToken,
         {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
          Variant::fromRpc(RpcValue{token})}, kDefaultTimeoutMs, error);
     return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_inform_module_token_to(lp_client*, const char* authToken,
                               const char* originModule, const char* moduleName,
                               const char* token, int timeout)
-{
+try {
     if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
     if (!authToken || !originModule || !*originModule || !moduleName || !token)
         return LP_ERR_INVALID_ARG;
@@ -1685,10 +1732,12 @@ int lp_inform_module_token_to(lp_client*, const char* authToken,
              Variant::fromRpc(RpcValue{token})}, std::chrono::milliseconds(wait), &error);
     }
     return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_grant_host_services(const char* servicesJson)
-{
+try {
     unsigned services = 0;
     if (servicesJson && *servicesJson) {
         const json value = json::parse(servicesJson, nullptr, false);
@@ -1702,15 +1751,19 @@ int lp_grant_host_services(const char* servicesJson)
     }
     gHostServices = services;
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 lp_provider* lp_provider_create(const char* moduleName, const char* transportSetJson)
-{
+try {
     if (!moduleName || !*moduleName) return nullptr;
     auto* provider = new lp_provider();
     provider->moduleName = moduleName;
     provider->transportSetJson = transportSetJson ? transportSetJson : "[]";
     return provider;
+} catch (...) {
+    return nullptr;
 }
 
 void lp_provider_destroy(lp_provider* provider)
@@ -1727,7 +1780,7 @@ void lp_provider_destroy(lp_provider* provider)
 int lp_provider_prepare(lp_provider* provider, lp_dispatch_cb dispatch,
                         lp_getmethods_cb getMethods, lp_token_cb onToken,
                         void* userData)
-{
+try {
     if (!provider || !dispatch || provider->prepared || provider->registered)
         return LP_ERR_INVALID_ARG;
     provider->dispatch = dispatch;
@@ -1781,12 +1834,14 @@ int lp_provider_prepare(lp_provider* provider, lp_dispatch_cb dispatch,
     }
     provider->prepared = true;
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
                          lp_getmethods_cb getMethods, lp_token_cb onToken,
                          void* userData)
-{
+try {
     if (!provider || !dispatch || provider->registered) return LP_ERR_INVALID_ARG;
     if (!provider->prepared) {
         const int prepared = lp_provider_prepare(
@@ -1809,11 +1864,13 @@ int lp_provider_register(lp_provider* provider, lp_dispatch_cb dispatch,
     }
     provider->registered = true;
     return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_provider_emit_event(lp_provider* provider, const char* eventName,
                            const char* dataJson)
-{
+try {
     if (!provider || !provider->registered || !eventName || !*eventName)
         return LP_ERR_INVALID_ARG;
     const json data = json::parse(dataJson && *dataJson ? dataJson : "[]", nullptr, false);
@@ -1827,6 +1884,8 @@ int lp_provider_emit_event(lp_provider* provider, const char* eventName,
     return provider->server.emitSignal(provider->moduleName, 0,
         {Variant::fromRpc(RpcValue{std::string(eventName)}),
          Variant::fromRpc(jsonToRpc(data))}, &error) ? LP_OK : LP_ERR_INTERNAL;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 int lp_provider_save_token(lp_provider* provider, const char* moduleName,
