@@ -11,9 +11,16 @@
 #include <gtest/gtest.h>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QEventLoop>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QJsonValue>
+#include <QRemoteObjectDynamicReplica>
 #include <QRemoteObjectHost>
+#include <QRemoteObjectNode>
+#include <QRemoteObjectPendingCall>
+#include <QTimeZone>
 #include <QTimer>
 #include <QThread>
 
@@ -53,6 +60,44 @@ public:
     QString informedModule;
     QString informedToken;
     EventCallback listener;
+};
+
+class TypedProvider final : public LogosProviderObject {
+public:
+    QVariant callMethod(const QString& methodName, const QVariantList&) override
+    {
+        if (methodName == QStringLiteral("strings"))
+            return QStringList{QStringLiteral("a"), QStringLiteral("b")};
+        if (methodName == QStringLiteral("document"))
+            return QVariant::fromValue(QJsonDocument(QJsonObject{{QStringLiteral("k"), 1}}));
+        if (methodName == QStringLiteral("hash"))
+            return QVariantHash{{QStringLiteral("n"), 7}};
+        if (methodName == QStringLiteral("when"))
+            return QDateTime(QDate(2026, 9, 23), QTime(10, 0), QTimeZone::UTC);
+        if (methodName == QStringLiteral("single"))
+            return QVariant::fromValue(1.5f);
+        if (methodName == QStringLiteral("ints"))
+            return QVariant::fromValue(QList<int>{1, 2, 3});
+        return {};
+    }
+    QJsonArray getMethods() override { return {}; }
+    void setEventListener(EventCallback callback) override { listener = std::move(callback); }
+    void init(void*) override {}
+    QString providerName() const override { return QStringLiteral("typed"); }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+    bool informModuleToken(const QString&, const QString&) override { return true; }
+
+    void fire(const QString& name, const QVariantList& data) { if (listener) listener(name, data); }
+    EventCallback listener;
+};
+
+class EventRecorder : public QObject {
+    Q_OBJECT
+public:
+    QList<std::pair<QString, QVariantList>> events;
+
+public slots:
+    void record(const QString& name, const QVariantList& data) { events.append({name, data}); }
 };
 
 class RealQroProvider final : public QObject {
@@ -334,6 +379,75 @@ TEST(QtRemotePlainAdapterTest, AsyncResultsReturnToQtThreadAndRespectRelease)
     settle.exec();
     EXPECT_FALSE(delivered.load());
 }
+
+// Detector: a QStringList result or event terminated the adapter host
+// (std::bad_variant_access on a detached thread), and a QJsonDocument inside
+// event data desynced the consumer's stream. The consumer here is a plain
+// QRemoteObjectNode, as in every unchanged Qt module.
+TEST(QtRemotePlainAdapterTest, AdapterHostDeliversQtTypesToAnUnchangedQtConsumer)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    TypedProvider provider;
+    TokenManager& tokens = TokenManager::instance();
+    tokens.clearAllTokens();
+    tokens.adoptCredential(QStringLiteral("secret"));
+    ModuleProxy proxy(&provider, nullptr, &tokens);
+    ASSERT_TRUE(proxy.saveToken(QStringLiteral("caller"), QStringLiteral("secret")));
+
+    const QString url = realQroSocket();
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
+    ASSERT_TRUE(host.publishObject(QStringLiteral("typed"), &proxy));
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(QUrl(url)));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("typed")));
+    ASSERT_TRUE(replica->waitForSource(3000));
+    EventRecorder recorder;
+    ASSERT_TRUE(QObject::connect(replica.data(), SIGNAL(eventResponse(QString,QVariantList)),
+                                 &recorder, SLOT(record(QString,QVariantList))));
+
+    const auto call = [&](const char* method) {
+        QRemoteObjectPendingCall pending;
+        QMetaObject::invokeMethod(replica.data(), "callRemoteMethod", Qt::DirectConnection,
+            Q_RETURN_ARG(QRemoteObjectPendingCall, pending),
+            Q_ARG(QString, QStringLiteral("secret")),
+            Q_ARG(QString, QString::fromLatin1(method)),
+            Q_ARG(QVariantList, QVariantList{}));
+        pending.waitForFinished(3000);
+        return pending.isFinished() ? pending.returnValue() : QVariant();
+    };
+
+    const QVariant strings = call("strings");
+    EXPECT_EQ(strings.metaType(), QMetaType::fromType<QStringList>());
+    EXPECT_EQ(strings.toStringList(), (QStringList{QStringLiteral("a"), QStringLiteral("b")}));
+    const QVariant document = call("document");
+    EXPECT_EQ(document.metaType(), QMetaType::fromType<QJsonDocument>());
+    EXPECT_EQ(document.toJsonDocument().object().value(QStringLiteral("k")).toInt(), 1);
+    const QVariant hash = call("hash");
+    EXPECT_EQ(hash.metaType(), QMetaType::fromType<QVariantHash>());
+    EXPECT_EQ(hash.toHash().value(QStringLiteral("n")).toInt(), 7);
+    const QVariant when = call("when");
+    EXPECT_EQ(when.metaType(), QMetaType::fromType<QDateTime>());
+    EXPECT_EQ(when.toDateTime(), QDateTime(QDate(2026, 9, 23), QTime(10, 0), QTimeZone::UTC));
+    EXPECT_EQ(call("single").metaType(), QMetaType::fromType<float>());
+    EXPECT_EQ(call("ints").value<QList<int>>(), (QList<int>{1, 2, 3}));
+
+    provider.fire(QStringLiteral("tick"),
+        {QStringList{QStringLiteral("x")},
+         QVariant::fromValue(QJsonDocument(QJsonObject{{QStringLiteral("k"), 2}}))});
+    provider.fire(QStringLiteral("tock"), {1});
+    ASSERT_TRUE(spinUntil([&] { return recorder.events.size() == 2; }));
+    EXPECT_EQ(recorder.events[0].first, QStringLiteral("tick"));
+    ASSERT_EQ(recorder.events[0].second.size(), 2);
+    EXPECT_EQ(recorder.events[0].second[0].toStringList(), QStringList{QStringLiteral("x")});
+    EXPECT_EQ(recorder.events[0].second[1].toJsonDocument().object()
+                  .value(QStringLiteral("k")).toInt(), 2);
+    EXPECT_EQ(recorder.events[1].first, QStringLiteral("tock"));
+    EXPECT_EQ(replica->state(), QRemoteObjectReplica::Valid);
+    tokens.clearAllTokens();
+}
+
 #endif
 
 } // namespace

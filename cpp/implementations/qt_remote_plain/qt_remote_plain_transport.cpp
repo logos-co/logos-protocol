@@ -9,6 +9,8 @@
 #include "../../module_proxy.h"
 
 #include <QCoreApplication>
+#include <QDataStream>
+#include <QIODevice>
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -40,161 +42,48 @@ std::chrono::milliseconds timeoutFor(int timeoutMs)
     return std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : kDefaultTimeoutMs);
 }
 
+// Both directions go through a QDataStream round trip with the QtRO stream
+// settings, so the adapter reproduces exactly what a QRemoteObjectHost or
+// replica would put on the wire, including types the plain codec keeps opaque.
 Variant fromQVariant(const QVariant& value)
 {
     if (!value.isValid()) return {};
-
-    const int logosResultId = QMetaType::fromName("LogosResult").id();
-    if (logosResultId != QMetaType::UnknownType && value.userType() == logosResultId) {
-        const LogosResult result = value.value<LogosResult>();
-        return Variant::logosResult(result.success,
-                                    fromQVariant(result.value),
-                                    fromQVariant(result.error));
-    }
-
-    Variant out;
-    out.isNull = value.isNull();
-    out.value = plain::qvariantToRpcValue(value);
-    switch (static_cast<QMetaType::Type>(value.userType())) {
-    case QMetaType::Bool: out.type = MetaType::Bool; break;
-    case QMetaType::Int:
-    case QMetaType::Short:
-    case QMetaType::Char:
-    case QMetaType::SChar: out.type = MetaType::Int; break;
-    case QMetaType::UInt:
-    case QMetaType::UShort:
-    case QMetaType::UChar: out.type = MetaType::UInt; break;
-    case QMetaType::Long:
-    case QMetaType::LongLong: out.type = MetaType::LongLong; break;
-    case QMetaType::ULong:
-    case QMetaType::ULongLong: out.type = MetaType::ULongLong; break;
-    case QMetaType::Float:
-    case QMetaType::Double: out.type = MetaType::Double; break;
-    case QMetaType::QString: out.type = MetaType::String; break;
-    case QMetaType::QStringList: out.type = MetaType::StringList; break;
-    case QMetaType::QByteArray: out.type = MetaType::ByteArray; break;
-    case QMetaType::QVariantList: {
-        out.type = MetaType::VariantList;
-        const QVariantList items = value.toList();
-        out.nestedValues.reserve(static_cast<std::size_t>(items.size()));
-        for (const QVariant& item : items) out.nestedValues.push_back(fromQVariant(item));
-        break;
-    }
-    case QMetaType::QVariantMap: {
-        out.type = MetaType::VariantMap;
-        const QVariantMap entries = value.toMap();
-        out.nestedKeys.reserve(static_cast<std::size_t>(entries.size()));
-        out.nestedValues.reserve(static_cast<std::size_t>(entries.size()));
-        for (auto it = entries.begin(); it != entries.end(); ++it) {
-            out.nestedKeys.push_back(it.key().toStdString());
-            out.nestedValues.push_back(fromQVariant(it.value()));
+    if (value.metaType().hasRegisteredDataStreamOperators()) {
+        QByteArray bytes;
+        QDataStream stream(&bytes, QIODevice::WriteOnly);
+        stream.setVersion(QDataStream::Qt_6_2);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        stream << value;
+        if (stream.status() == QDataStream::Ok) {
+            try {
+                Reader reader(reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+                              static_cast<std::size_t>(bytes.size()));
+                return reader.variantUntil(static_cast<std::size_t>(bytes.size()));
+            } catch (const CodecError&) {
+            }
         }
-        break;
     }
-    case QMetaType::QJsonValue:
-        out.type = MetaType::JsonValue;
-        out.jsonUndefined = value.toJsonValue().isUndefined();
-        break;
-    case QMetaType::QJsonObject: out.type = MetaType::JsonObject; break;
-    case QMetaType::QJsonArray: out.type = MetaType::JsonArray; break;
-    case QMetaType::QJsonDocument: out.type = MetaType::JsonDocument; break;
-    default: return Variant::fromRpc(std::move(out.value));
-    }
-    return out;
-}
-
-QJsonValue rpcToJson(const RpcValue& value)
-{
-    if (value.isNull()) return QJsonValue(QJsonValue::Null);
-    if (value.isBool()) return value.asBool();
-    if (value.isInt()) return static_cast<double>(value.asInt());
-    if (value.isUInt()) return static_cast<double>(value.asUInt());
-    if (value.isDouble()) return value.asDouble();
-    if (value.isString()) return QString::fromStdString(value.asString());
-    if (value.isList()) {
-        QJsonArray out;
-        for (const auto& child : value.asList().items) out.append(rpcToJson(child));
-        return out;
-    }
-    if (value.isMap()) {
-        QJsonObject out;
-        for (const auto& entry : value.asMap().entries)
-            out.insert(QString::fromStdString(entry.first), rpcToJson(entry.second));
-        return out;
-    }
-    return QJsonValue(QJsonValue::Null);
+    return Variant::fromRpc(plain::qvariantToRpcValue(value));
 }
 
 QVariant toQVariant(const Variant& value)
 {
-    switch (value.type) {
-    case MetaType::Invalid: return {};
-    case MetaType::Bool: return value.value.asBool();
-    case MetaType::Int: return static_cast<int>(value.value.asInt());
-    case MetaType::UInt:
-        return static_cast<uint>(value.value.isUInt() ? value.value.asUInt() : value.value.asInt());
-    case MetaType::LongLong: return static_cast<qlonglong>(value.value.asInt());
-    case MetaType::ULongLong:
-        return static_cast<qulonglong>(value.value.isUInt() ? value.value.asUInt() : value.value.asInt());
-    case MetaType::Double: return value.value.asDouble();
-    case MetaType::String: return QString::fromStdString(value.value.asString());
-    case MetaType::ByteArray: {
-        const auto& bytes = value.value.asBytes().data;
-        return QByteArray(reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()));
+    if (value.type == MetaType::Invalid && !value.opaque) return {};
+    try {
+        Writer writer;
+        writer.variant(value);
+        const auto& data = writer.data();
+        const QByteArray bytes(reinterpret_cast<const char*>(data.data()),
+                               static_cast<qsizetype>(data.size()));
+        QDataStream stream(bytes);
+        stream.setVersion(QDataStream::Qt_6_2);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        QVariant result;
+        stream >> result;
+        if (stream.status() == QDataStream::Ok) return result;
+    } catch (const CodecError&) {
     }
-    case MetaType::StringList: {
-        QStringList out;
-        for (const auto& child : value.value.asList().items)
-            out.append(QString::fromStdString(child.asString()));
-        return out;
-    }
-    case MetaType::VariantList: {
-        if (value.nestedValues.size() == value.value.asList().items.size()) {
-            QVariantList out;
-            out.reserve(static_cast<qsizetype>(value.nestedValues.size()));
-            for (const Variant& child : value.nestedValues) out.append(toQVariant(child));
-            return out;
-        }
-        return plain::rpcValueToQVariant(value.value);
-    }
-    case MetaType::VariantMap: {
-        if (value.nestedKeys.size() == value.nestedValues.size()
-            && value.nestedKeys.size() == value.value.asMap().entries.size()) {
-            QVariantMap out;
-            for (std::size_t i = 0; i < value.nestedKeys.size(); ++i)
-                out.insert(QString::fromStdString(value.nestedKeys[i]),
-                           toQVariant(value.nestedValues[i]));
-            return out;
-        }
-        return plain::rpcValueToQVariant(value.value);
-    }
-    case MetaType::JsonValue:
-        return QVariant::fromValue(value.jsonUndefined
-            ? QJsonValue(QJsonValue::Undefined) : rpcToJson(value.value));
-    case MetaType::JsonObject: return QVariant::fromValue(rpcToJson(value.value).toObject());
-    case MetaType::JsonArray: return QVariant::fromValue(rpcToJson(value.value).toArray());
-    case MetaType::JsonDocument: {
-        const QJsonValue json = rpcToJson(value.value);
-        return QVariant::fromValue(json.isArray() ? QJsonDocument(json.toArray())
-                                                  : QJsonDocument(json.toObject()));
-    }
-    case MetaType::User: {
-        if (value.customType == "LogosResult" && value.value.isMap()) {
-            const RpcMap& map = value.value.asMap();
-            const RpcValue* success = map.find("success");
-            const RpcValue* result = map.find("value");
-            const RpcValue* error = map.find("error");
-            if (success && result && error)
-                return QVariant::fromValue(LogosResult{success->asBool(),
-                    value.nestedValues.size() == 2 ? toQVariant(value.nestedValues[0])
-                                                   : plain::rpcValueToQVariant(*result),
-                    value.nestedValues.size() == 2 ? toQVariant(value.nestedValues[1])
-                                                   : plain::rpcValueToQVariant(*error)});
-        }
-        return {};
-    }
-    }
-    return {};
+    return value.opaque ? QVariant() : plain::rpcValueToQVariant(value.value);
 }
 
 QVariantList toQVariantList(const std::vector<Variant>& values)
@@ -337,6 +226,7 @@ struct HandleState {
 
 QtRemotePlainTransportHost::QtRemotePlainTransportHost(const QString& url)
 {
+    qRegisterMetaType<LogosResult>("LogosResult");
     std::string error;
     if (!m_server.start(url.toStdString(), &error))
         qCritical() << "QtRemotePlainTransportHost:" << error.c_str();
@@ -558,6 +448,7 @@ private:
 QtRemotePlainTransportConnection::QtRemotePlainTransportConnection(const QString& url)
     : m_shared(std::make_shared<Shared>()), m_url(url.toStdString())
 {
+    qRegisterMetaType<LogosResult>("LogosResult");
     std::weak_ptr<Shared> weak = m_shared;
     m_shared->client->setInternalEventHandler(
         [weak](const std::string& object, std::int32_t signal,
