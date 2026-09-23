@@ -205,20 +205,12 @@ std::string endpoint(const std::string& module)
 std::mutex gDefaultMutex;
 std::string gDefaultTransport = R"({"protocol":"qt_remote_plain"})";
 
+// "local" is accepted too: here it can only mean qt_remote_plain.
 bool acceptsPlainConfig(const char* text)
 {
     if (!text || !*text || std::strcmp(text, "null") == 0) return true;
-    try {
-        const json value = json::parse(text, nullptr, false);
-        if (value.is_discarded() || !value.is_object()) return false;
-        const std::string protocol = value.value("protocol", "qt_remote_plain");
-        if (protocol != "qt_remote_plain" && protocol != "tcp"
-            && protocol != "tcp_ssl") return false;
-        return !logos::transportSetFromJsonString(
-            std::string("[") + text + "]").empty();
-    } catch (...) {
-        return false;
-    }
+    LogosTransportSet set;
+    return logos::parseTransportSet(std::string("[") + text + "]", &set) && set.size() == 1;
 }
 
 LogosTransportConfig parsePlainConfig(const char* text)
@@ -231,7 +223,10 @@ LogosTransportConfig parsePlainConfig(const char* text)
         source = gDefaultTransport;
     } else source = text;
     const auto set = logos::transportSetFromJsonString(std::string("[") + source + "]");
-    return set.empty() ? config : set.front();
+    if (set.empty()) return config;
+    LogosTransportConfig parsed = set.front();
+    if (parsed.protocol == LogosProtocol::LocalSocket) parsed.protocol = LogosProtocol::QtRemotePlain;
+    return parsed;
 }
 
 struct TokenFlight {
@@ -1280,7 +1275,11 @@ const char* lp_current_caller_json(void) { return gCurrentCaller.c_str(); }
 
 int lp_set_mode(const char* mode)
 {
-    return mode && std::strcmp(mode, "remote") == 0 ? LP_OK : LP_ERR_UNSUPPORTED;
+    if (!mode) return LP_ERR_INVALID_ARG;
+    if (std::strcmp(mode, "remote") == 0) return LP_OK;
+    if (std::strcmp(mode, "local") == 0 || std::strcmp(mode, "mock") == 0)
+        return LP_ERR_UNSUPPORTED;
+    return LP_ERR_INVALID_ARG;
 }
 const char* lp_get_mode(void) { return "remote"; }
 

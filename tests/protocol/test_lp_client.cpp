@@ -239,6 +239,22 @@ TEST_F(LpClientTest, MalformedTransportJsonFailsCreate)
     EXPECT_EQ(lp_client_create("t", "o", nullptr, "not json"), nullptr);
 }
 
+// An unknown protocol used to read as local, silently.
+TEST_F(LpClientTest, UnknownTransportProtocolFailsCreate)
+{
+    EXPECT_EQ(lp_client_create("t", "o", R"({"protocol":"tpc"})", nullptr), nullptr);
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"tpc"})"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"local"})"), LP_OK);
+}
+
+// A mistyped field used to throw out through the C ABI.
+TEST_F(LpClientTest, MistypedTransportFieldFailsCreate)
+{
+    EXPECT_EQ(lp_client_create("t", "o", R"({"protocol":"tcp","port":"6001"})", nullptr), nullptr);
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"tcp","port":"6001"})"),
+              LP_ERR_INVALID_ARG);
+}
+
 TEST_F(LpClientTest, TokenStoreRoundTrip)
 {
     EXPECT_EQ(lp_token_save("some_module", "tok-123"), LP_OK);
