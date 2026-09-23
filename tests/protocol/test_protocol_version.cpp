@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "logos_protocol.h"
+#include "logos_transport_config.h"
 
 #include <cstring>
 
@@ -48,4 +49,14 @@ TEST(ProtocolVersion, StringCopyUsesProtocolOwnedStorage)
     EXPECT_NE(copy, source);
     lp_string_free(copy);
     EXPECT_EQ(lp_string_copy(nullptr), nullptr);
+}
+
+// Plugins built before qt_remote_plain existed carry these numbers in the
+// LogosTransportConfig objects they share with the host in-process.
+TEST(ProtocolVersion, TransportProtocolsKeepTheirNumbers)
+{
+    EXPECT_EQ(static_cast<int>(LogosProtocol::LocalSocket), 0);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::Tcp), 1);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::TcpSsl), 2);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::QtRemotePlain), 3);
 }
