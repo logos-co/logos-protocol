@@ -587,6 +587,60 @@ TEST(PlainNetworkCAbi, ASubscriptionConnectsOverASlowTlsPath)
 
 // Detector: an event whose CBOR text was not valid UTF-8 threw out of the
 // consumer's event thread and aborted the process; the Qt client shows U+FFFD.
+// Detector: over tcp too, introspection of a provider built before
+// logos-cpp-sdk #71 failed instead of asking its two older calls.
+TEST(PlainNetworkCAbi, IntrospectionFallsBackForProvidersBeforeGetPluginInterface)
+{
+    using namespace logos::plain;
+    LogosTransportConfig serverConfig;
+    serverConfig.protocol = LogosProtocol::Tcp;
+    serverConfig.port = freePort();
+    const auto entries = [](const char* name, const char* type) {
+        RpcMap entry;
+        entry.emplace("name", RpcValue{name});
+        if (type) entry.emplace("type", RpcValue{type});
+        return RpcValue{RpcList{{RpcValue{std::move(entry)}}}};
+    };
+    logos::plain::abi::ServerEndpoint endpoint(serverConfig,
+        [&](const CallMessage& request) {
+            ResultMessage result;
+            result.id = request.id;
+            result.ok = request.method != "getPluginInterface";
+            if (!result.ok) {
+                result.err = "no such method";
+                result.errCode = "METHOD_NOT_FOUND";
+            } else if (request.method == "getPluginMethods") {
+                result.value = entries("legacyCall", "method");
+            } else if (request.method == "getPluginEvents") {
+                result.value = entries("legacyEvent", nullptr);
+            }
+            return result;
+        },
+        [](const MethodsMessage& request) {
+            MethodsResultMessage result;
+            result.id = request.id;
+            result.ok = true;
+            return result;
+        },
+        [](const TokenMessage&) {});
+    ASSERT_TRUE(endpoint.start());
+
+    const std::string config = networkConfig("tcp", serverConfig.port);
+    lp_client* client = lp_client_create("legacy_network_provider", "network_test",
+                                         config.c_str(), config.c_str());
+    ASSERT_NE(client, nullptr);
+    char* interface = lp_get_methods(client);
+    lp_client_destroy(client);
+    endpoint.stop();
+    ASSERT_NE(interface, nullptr);
+    const auto described = nlohmann::json::parse(interface);
+    lp_string_free(interface);
+    ASSERT_EQ(described.size(), 2u);
+    EXPECT_EQ(described[0].at("name"), "legacyCall");
+    EXPECT_EQ(described[1].at("name"), "legacyEvent");
+    EXPECT_EQ(described[1].at("type"), "event");
+}
+
 TEST(PlainNetworkCAbi, AnEventWithInvalidUtf8ArrivesReplaced)
 {
     using namespace logos::plain;
