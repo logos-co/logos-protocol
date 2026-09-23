@@ -619,7 +619,11 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         }
 
         std::string error;
-        bool acquired = ensureConnected(state, 250, error);
+        // QtRO's local retry tick; a network dial (DNS, TCP, TLS) gets the
+        // 5 s the Qt-side network client gave it.
+        const bool network = state->targetConfig.protocol == LogosProtocol::Tcp
+            || state->targetConfig.protocol == LogosProtocol::TcpSsl;
+        bool acquired = ensureConnected(state, network ? 5000 : 250, error);
         if (acquired && state->targetConfig.protocol == LogosProtocol::QtRemotePlain) {
             std::lock_guard<std::timed_mutex> connectionLock(state->connectionMutex);
             acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
