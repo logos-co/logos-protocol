@@ -15,7 +15,8 @@
 namespace logos::qt_remote_plain {
 
 // Qt Remote Objects 6.9.2 uses QDataStream::Qt_6_2 in little-endian mode.
-// These are the stable QMetaType ids which can cross the Logos module surface.
+// These are the stable QMetaType ids the codec decodes. Any other id can
+// still cross as an opaque trailing value (Reader::variantUntil).
 enum class MetaType : std::uint32_t {
     Invalid = 0,
     Bool = 1,
@@ -24,15 +25,33 @@ enum class MetaType : std::uint32_t {
     LongLong = 4,
     ULongLong = 5,
     Double = 6,
+    Character = 7, // QChar
     VariantMap = 8,
     VariantList = 9,
     String = 10,
     StringList = 11,
     ByteArray = 12,
+    Date = 14,
+    Time = 15,
+    DateTime = 16,
+    Url = 17,
+    VariantHash = 28,
+    Uuid = 30,
+    Long = 32,
+    Short = 33,
+    Char = 34,
+    ULong = 35,
+    UShort = 36,
+    UChar = 37,
+    Float = 38,
+    SChar = 40,
     JsonValue = 45,
     JsonObject = 46,
     JsonArray = 47,
     JsonDocument = 48,
+    ByteArrayList = 49,
+    Char16 = 56,
+    Char32 = 57,
     User = 65536,
 };
 
@@ -75,6 +94,12 @@ struct Variant {
     // its value and error children in nestedValues.
     std::vector<std::string> nestedKeys;
     std::vector<Variant> nestedValues;
+    // Serialized data after the QVariant header, written back verbatim. Set
+    // for types whose RpcValue is lossy (QChar, QDate, QTime, QDateTime,
+    // QUrl, QUuid) and for opaque values.
+    std::vector<std::uint8_t> raw;
+    // The codec could not interpret the value; only `raw` carries it.
+    bool opaque = false;
 
     static Variant fromRpc(plain::RpcValue value);
     static Variant logosResult(bool success, Variant value, Variant error);
@@ -197,18 +222,27 @@ public:
     std::vector<std::string> stringList();
     std::vector<std::string> byteStringList();
     Variant variant();
+    // Decodes a variant that ends exactly at `end`. A value the codec cannot
+    // interpret is kept opaque instead of failing the frame; frames only let
+    // the last value of a packet be located this way.
+    Variant variantUntil(std::size_t end);
     ClassDefinition classDefinition();
     std::vector<std::uint8_t> remainingBytes();
 
     std::size_t remaining() const { return m_size - m_pos; }
     std::size_t position() const { return m_pos; }
+    std::size_t size() const { return m_size; }
 
 private:
     void require(std::size_t count) const;
+    Variant variantHeader();
+    // `lossy` reports a lone surrogate replaced by U+FFFD.
+    std::optional<std::string> string(bool* lossy);
 
     const std::uint8_t* m_data;
     std::size_t m_size;
     std::size_t m_pos = 0;
+    std::size_t m_depth = 0;
 };
 
 std::vector<std::uint8_t> handshakePacket();

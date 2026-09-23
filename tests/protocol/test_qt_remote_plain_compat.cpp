@@ -6,10 +6,17 @@
 
 #include <QBuffer>
 #include <QDataStream>
+#include <QDate>
+#include <QDateTime>
+#include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QMetaMethod>
+#include <QTime>
+#include <QTimeZone>
+#include <QUrl>
+#include <QUuid>
 #include <QVariant>
 
 #include <functional>
@@ -275,6 +282,126 @@ TEST(QtRemotePlainCompatTest, DynamicDefinitionBytesMatchQt692QDataStream)
     stream << quint32(0);
 
     EXPECT_EQ(plain.data(), stdBytes(qt));
+}
+
+std::vector<std::uint8_t> qtVariantBytes(const QVariant& value)
+{
+    QByteArray result;
+    QDataStream stream(&result, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_2);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    stream << value;
+    return stdBytes(result);
+}
+
+QVariant qtVariantFrom(const std::vector<std::uint8_t>& bytes)
+{
+    QByteArray data(reinterpret_cast<const char*>(bytes.data()), qsizetype(bytes.size()));
+    QDataStream stream(data);
+    stream.setVersion(QDataStream::Qt_6_2);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    QVariant value;
+    stream >> value;
+    return stream.status() == QDataStream::Ok ? value : QVariant();
+}
+
+RpcList byteItems(std::initializer_list<std::vector<std::uint8_t>> items)
+{
+    RpcList list;
+    for (const auto& item : items) list.items.emplace_back(RpcBytes{item});
+    return list;
+}
+
+// Detector: each of these types dropped the whole connection on the previous
+// head ("unsupported QVariant metatype id").
+TEST(QtRemotePlainCompatTest, QtBuiltinValuesDecodeAndReencodeByteForByte)
+{
+    const QDate date(2026, 9, 23);
+    const QTime time(10, 37, 50, 123);
+    const QTimeZone berlin("Europe/Berlin");
+    struct Case {
+        QVariant qt;
+        RpcValue expected;
+    };
+    std::vector<Case> cases{
+        {QVariant::fromValue<float>(1.5f), RpcValue{1.5}},
+        {QVariant::fromValue<short>(-3), RpcValue{std::int64_t{-3}}},
+        {QVariant::fromValue<ushort>(65535), RpcValue{std::int64_t{65535}}},
+        {QVariant::fromValue<char>('A'), RpcValue{std::int64_t{65}}},
+        {QVariant::fromValue<signed char>(-5), RpcValue{std::int64_t{-5}}},
+        {QVariant::fromValue<uchar>(200), RpcValue{std::int64_t{200}}},
+        {QVariant::fromValue<long>(-7), RpcValue{std::int64_t{-7}}},
+        {QVariant::fromValue<ulong>(7), RpcValue{std::int64_t{7}}},
+        {QVariant(QChar(0x00e9)), RpcValue{"\xc3\xa9"}},
+        {QVariant(QUrl(QStringLiteral("https://example.org/a b?q=1"))),
+         RpcValue{"https://example.org/a%20b?q=1"}},
+        {QVariant(QUuid(QStringLiteral("{12345678-9abc-def0-1234-56789abcdef0}"))),
+         RpcValue{"{12345678-9abc-def0-1234-56789abcdef0}"}},
+        {QVariant(date), RpcValue{"2026-09-23"}},
+        {QVariant(time), RpcValue{"10:37:50.123"}},
+        {QVariant(QDateTime(date, time, QTimeZone::UTC)),
+         RpcValue{"2026-09-23T10:37:50.123Z"}},
+        {QVariant(QDateTime(date, time, QTimeZone::fromSecondsAheadOfUtc(-3 * 3600))),
+         RpcValue{"2026-09-23T10:37:50.123-03:00"}},
+        {QVariant::fromValue(QByteArrayList{QByteArray("a"), QByteArray()}),
+         RpcValue{byteItems({{'a'}, {}})}},
+        {QVariant(QString()), RpcValue{""}},
+        {QVariant(QByteArray()), RpcValue{RpcBytes{}}},
+        {QVariant(QStringList{QStringLiteral("a"), QString()}),
+         RpcValue{RpcList{{RpcValue{"a"}, RpcValue{""}}}}},
+        {QVariant(QString(QChar(0xd83d))), RpcValue{"\xef\xbf\xbd"}},
+        {QVariant::fromValue(QJsonDocument()), RpcValue{}},
+    };
+    if (berlin.isValid())
+        cases.push_back({QVariant(QDateTime(date, time, berlin)),
+                         RpcValue{"2026-09-23T10:37:50.123[Europe/Berlin]"}});
+
+    for (const auto& value : cases) {
+        SCOPED_TRACE(value.qt.typeName());
+        const auto bytes = qtVariantBytes(value.qt);
+        Reader reader(bytes);
+        Variant decoded;
+        ASSERT_NO_THROW(decoded = reader.variant());
+        EXPECT_EQ(reader.remaining(), 0u);
+        EXPECT_EQ(decoded.value, value.expected);
+        Writer writer;
+        ASSERT_NO_THROW(writer.variant(decoded));
+        EXPECT_EQ(writer.data(), bytes);
+    }
+}
+
+TEST(QtRemotePlainCompatTest, QVariantHashDecodesAndQtReadsItBack)
+{
+    QVariantHash hash;
+    hash.insert(QStringLiteral("n"), 7);
+    hash.insert(QStringLiteral("s"), QStringLiteral("x"));
+    const auto bytes = qtVariantBytes(hash);
+    Reader reader(bytes);
+    const Variant decoded = reader.variant();
+    ASSERT_TRUE(decoded.value.isMap());
+    EXPECT_EQ(*decoded.value.asMap().find("n"), RpcValue{std::int64_t{7}});
+    EXPECT_EQ(*decoded.value.asMap().find("s"), RpcValue{"x"});
+
+    Writer writer;
+    writer.variant(decoded);
+    EXPECT_EQ(qtVariantFrom(writer.data()), QVariant(hash));
+}
+
+TEST(QtRemotePlainCompatTest, AQtCustomTypeCrossesOpaqueAndQtReadsItBack)
+{
+    const QVariant ints = QVariant::fromValue(QList<int>{1, 2, 3});
+    const auto bytes = qtVariantBytes(ints);
+    Reader strict(bytes);
+    EXPECT_THROW((void)strict.variant(), CodecError);
+
+    Reader reader(bytes);
+    const Variant opaque = reader.variantUntil(bytes.size());
+    EXPECT_TRUE(opaque.opaque);
+    EXPECT_EQ(opaque.customType, "QList<int>");
+    Writer writer;
+    writer.variant(opaque);
+    EXPECT_EQ(writer.data(), bytes);
+    EXPECT_EQ(qtVariantFrom(writer.data()), ints);
 }
 
 } // namespace

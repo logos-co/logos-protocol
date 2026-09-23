@@ -91,4 +91,80 @@ TEST(QtRemotePlainWireTest, RejectsTruncationAndUnboundedLengths)
     EXPECT_THROW((void)completeFrameSize(frame), CodecError);
 }
 
+TEST(QtRemotePlainWireTest, InvalidTextIsReplacedRatherThanRejected)
+{
+    Writer invalidUtf8;
+    ASSERT_NO_THROW(invalidUtf8.variant(Variant::fromRpc(RpcValue{std::string("a\xff" "b")})));
+    Reader replaced(invalidUtf8.data());
+    EXPECT_EQ(replaced.variant().value.asString(), "a\xef\xbf\xbd" "b");
+
+    // A QString holding one high surrogate, as a Qt peer may send it.
+    Writer lone;
+    lone.u32(10);
+    lone.u8(0);
+    lone.u32(2);
+    lone.u16(0xd83d);
+    Reader reader(lone.data());
+    const Variant decoded = reader.variant();
+    EXPECT_EQ(decoded.value.asString(), "\xef\xbf\xbd");
+    Writer again;
+    again.variant(decoded);
+    EXPECT_EQ(again.data(), lone.data());
+}
+
+TEST(QtRemotePlainWireTest, NullJsonPayloadsDecode)
+{
+    for (const auto type : {MetaType::JsonObject, MetaType::JsonArray, MetaType::JsonDocument}) {
+        Writer nullDocument;
+        nullDocument.u32(static_cast<std::uint32_t>(type));
+        nullDocument.u8(0);
+        nullDocument.u32(0xffffffffu);
+        Reader reader(nullDocument.data());
+        EXPECT_NO_THROW((void)reader.variant()) << static_cast<std::uint32_t>(type);
+    }
+}
+
+TEST(QtRemotePlainWireTest, AnUninterpretableTrailingValueCrossesOpaque)
+{
+    // QBitArray is outside the codec: 3 bits in one byte.
+    Writer bits;
+    bits.u32(13);
+    bits.u8(0);
+    bits.u32(3);
+    bits.u8(0x05);
+    Reader reader(bits.data());
+    const Variant value = reader.variantUntil(bits.data().size());
+    EXPECT_TRUE(value.opaque);
+    EXPECT_EQ(reader.remaining(), 0u);
+    Writer again;
+    again.variant(value);
+    EXPECT_EQ(again.data(), bits.data());
+}
+
+TEST(QtRemotePlainWireTest, NestingIsBoundedInsteadOfExhaustingTheStack)
+{
+    Writer deep;
+    for (int i = 0; i < 1000; ++i) {
+        deep.u32(9); // QVariantList of one element
+        deep.u8(0);
+        deep.u32(1);
+    }
+    deep.u32(0);
+    deep.u8(1);
+    Reader reader(deep.data());
+    EXPECT_THROW((void)reader.variant(), CodecError);
+    Reader trailing(deep.data());
+    EXPECT_TRUE(trailing.variantUntil(deep.data().size()).opaque);
+}
+
+TEST(QtRemotePlainWireTest, MismatchedValuesFailWithACodecError)
+{
+    Variant notAList;
+    notAList.type = MetaType::StringList;
+    notAList.isNull = false;
+    notAList.value = RpcValue{"not a list"};
+    Writer writer;
+    EXPECT_THROW(writer.variant(notAList), CodecError);
+}
+
 } // namespace
