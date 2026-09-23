@@ -306,7 +306,8 @@ struct ClientState {
     std::condition_variable subscriptionChanged;
     std::condition_variable eventsChanged;
     std::mutex eventsMutex;
-    std::deque<EventMessage> events;
+    // Network events in arrival order; an empty entry is the connection's loss.
+    std::deque<std::optional<EventMessage>> events;
     std::shared_ptr<Client> wire = std::make_shared<Client>();
     std::shared_ptr<RpcConnectionBase> networkWire;
     LogosTransportConfig targetConfig;
@@ -319,6 +320,9 @@ struct ClientState {
     std::deque<StatusNotification> statusNotifications;
     std::atomic<bool> alive{true};
     std::atomic<unsigned long long> generation{0};
+    // An armed subscription was lost since the last arm; only then is the next
+    // arm a new establishment.
+    bool lostSinceArmed = false;
     lp_subscription_status_cb statusCallback = nullptr;
     void* statusUserData = nullptr;
     bool manualRestart = false;
@@ -426,10 +430,21 @@ void queueNetworkEvent(const std::shared_ptr<ClientState>& state,
     state->eventsChanged.notify_one();
 }
 
+// Reported behind the events already received, as over QtRO.
+void queueNetworkLoss(const std::shared_ptr<ClientState>& state)
+{
+    {
+        std::lock_guard<std::mutex> lock(state->eventsMutex);
+        if (!state->alive) return;
+        state->events.push_back(std::nullopt);
+    }
+    state->eventsChanged.notify_one();
+}
+
 void networkEventLoop(const std::shared_ptr<ClientState>& state)
 {
     for (;;) {
-        EventMessage message;
+        std::optional<EventMessage> message;
         {
             std::unique_lock<std::mutex> lock(state->eventsMutex);
             state->eventsChanged.wait(lock, [&] {
@@ -439,7 +454,10 @@ void networkEventLoop(const std::shared_ptr<ClientState>& state)
             message = std::move(state->events.front());
             state->events.pop_front();
         }
-        deliverNetworkEvent(state, message);
+        if (message)
+            deliverNetworkEvent(state, *message);
+        else
+            connectionLost(state);
     }
 }
 
@@ -515,7 +533,7 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         }
         std::weak_ptr<ClientState> weak = state;
         wire->setErrorHandler([weak](const std::string&) {
-            if (auto locked = weak.lock()) connectionLost(locked);
+            if (auto locked = weak.lock()) queueNetworkLoss(locked);
         });
         wire->sendSubscribe({state->target, kCompletionEvent},
             [weak](EventMessage event) {
@@ -536,7 +554,9 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
 
 void subscriptionLoop(const std::shared_ptr<ClientState>& state)
 {
-    auto retry = std::chrono::milliseconds(250);
+    // Each attempt itself waits up to 250 ms for the provider to listen, so a
+    // returning provider is reached within about half a second, as over QtRO.
+    const auto retry = std::chrono::milliseconds(250);
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(state->mutex);
@@ -573,7 +593,6 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
                 })) {
                 if (state->workerStop) return;
             }
-            retry = std::min(retry * 2, std::chrono::milliseconds(5000));
             continue;
         }
 
@@ -596,10 +615,12 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
                     it = state->subscriptions.erase(it);
                 }
             }
-            established = armedAny && !alreadyArmed;
+            // Arming a subscription taken while none was armed is not a gap.
+            established = armedAny && !alreadyArmed
+                && (state->generation == 0 || state->lostSinceArmed);
+            if (established) state->lostSinceArmed = false;
             generation = established ? ++state->generation : state->generation.load();
         }
-        retry = std::chrono::milliseconds(250);
         if (established)
             reportSubscriptionStatus(state, LP_SUB_ARMED, generation, nullptr);
     }
@@ -678,9 +699,11 @@ void connectionLost(const std::shared_ptr<ClientState>& state)
             }
         }
         generation = state->generation.load();
-        if (lost)
+        if (lost) {
+            state->lostSinceArmed = true;
             state->statusNotifications.push_back({held ? LP_SUB_HELD : LP_SUB_LOST,
                                                   generation, "provider_unavailable"});
+        }
     }
     if (!lost) return;
     state->subscriptionChanged.notify_all();

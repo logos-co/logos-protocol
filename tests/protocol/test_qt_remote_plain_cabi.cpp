@@ -722,6 +722,136 @@ TEST(QtRemotePlainCabiTest, ConcurrentFirstCallsShareOneTokenRequest)
     EXPECT_EQ(capability.requests.load(), 1);
 }
 
+struct EventLog {
+    std::mutex mutex;
+    std::vector<std::string> data;
+    std::vector<std::pair<int, std::size_t>> statuses;   // status, events seen by then
+};
+
+void onSlowEvent(const char*, const char* data, void* userData)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto& log = *static_cast<EventLog*>(userData);
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.data.emplace_back(data);
+}
+
+void onLoggedStatus(int status, unsigned long long, const char*, void* userData)
+{
+    auto& log = *static_cast<EventLog*>(userData);
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.statuses.emplace_back(status, log.data.size());
+}
+
+bool logged(EventLog& log, int status)
+{
+    std::lock_guard<std::mutex> lock(log.mutex);
+    return std::any_of(log.statuses.begin(), log.statuses.end(),
+                       [&](const auto& entry) { return entry.first == status; });
+}
+
+lp_provider* startEventProvider(const char* name, Fixture& fixture)
+{
+    lp_provider* provider = lp_provider_create(name, nullptr);
+    if (!provider) return nullptr;
+    lp_provider_save_token(provider, "caller", "secret");
+    lp_provider_register(provider, dispatch, methods, token, &fixture);
+    return provider;
+}
+
+// Detector: a lost connection marked the subscription unarmed before the
+// events it had already received were delivered, so those were dropped.
+TEST(QtRemotePlainCabiTest, EventsReceivedBeforeALossAreDeliveredBeforeIt)
+{
+    setInstanceId("qtro_cabi_loss_order_");
+    Fixture fixture;
+    lp_provider* provider = startEventProvider("loss_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("loss_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("loss_fixture", "caller", nullptr, nullptr);
+    EventLog log;
+    ASSERT_EQ(lp_client_set_subscription_status_cb(client, onLoggedStatus, &log), 1);
+    lp_subscription* subscription = lp_subscribe(client, "tick", onSlowEvent, &log);
+    ASSERT_NE(subscription, nullptr);
+    ASSERT_TRUE(waitUntil([&] { return logged(log, LP_SUB_ARMED); }));
+
+    constexpr int kEvents = 40;
+    for (int i = 0; i < kEvents; ++i)
+        ASSERT_EQ(lp_provider_emit_event(provider, "tick", ("[" + std::to_string(i) + "]").c_str()),
+                  LP_OK);
+    // All of them reach the client well before its 10 ms callbacks finish.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    lp_provider_destroy(provider);
+    ASSERT_TRUE(waitUntil([&] { return logged(log, LP_SUB_LOST); }));
+
+    {
+        std::lock_guard<std::mutex> lock(log.mutex);
+        ASSERT_EQ(log.data.size(), static_cast<std::size_t>(kEvents));
+        for (int i = 0; i < kEvents; ++i)
+            EXPECT_EQ(log.data[i], "[" + std::to_string(i) + "]");
+        for (const auto& [status, seen] : log.statuses)
+            if (status == LP_SUB_LOST) EXPECT_EQ(seen, static_cast<std::size_t>(kEvents));
+    }
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+}
+
+// Detector: arming a subscription taken after the last one was dropped
+// advanced the generation, reporting a gap that never happened.
+TEST(QtRemotePlainCabiTest, ResubscribingWithoutALossKeepsTheGeneration)
+{
+    setInstanceId("qtro_cabi_resubscribe_");
+    Fixture fixture;
+    lp_provider* provider = startEventProvider("resubscribe_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("resubscribe_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("resubscribe_fixture", "caller", nullptr, nullptr);
+    EventLog first;
+    lp_subscription* subscription = lp_subscribe(client, "tick", onSlowEvent, &first);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+    lp_unsubscribe(subscription);
+
+    EventLog second;
+    subscription = lp_subscribe(client, "tick", onSlowEvent, &second);
+    ASSERT_TRUE(waitUntil([&] {
+        (void)lp_provider_emit_event(provider, "tick", "[1]");
+        std::lock_guard<std::mutex> lock(second.mutex);
+        return !second.data.empty();
+    }));
+    EXPECT_EQ(lp_client_subscription_generation(client), 1u);
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
+// Detector: re-arming backed off to 5 s, so a provider back after a few
+// seconds went unnoticed for seconds more.
+TEST(QtRemotePlainCabiTest, ARestartedProviderIsReArmedPromptly)
+{
+    setInstanceId("qtro_cabi_rearm_");
+    Fixture fixture;
+    lp_provider* provider = startEventProvider("rearm_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("rearm_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("rearm_fixture", "caller", nullptr, nullptr);
+    EventLog log;
+    lp_subscription* subscription = lp_subscribe(client, "tick", onSlowEvent, &log);
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 1; }));
+
+    lp_provider_destroy(provider);
+    // Long enough for the old backoff to be waiting several seconds.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5500));
+    provider = startEventProvider("rearm_fixture", fixture);
+    ASSERT_NE(provider, nullptr);
+    const auto restarted = std::chrono::steady_clock::now();
+    ASSERT_TRUE(waitUntil([&] { return lp_client_subscription_generation(client) == 2; },
+                          std::chrono::seconds(10)));
+    EXPECT_LT(std::chrono::steady_clock::now() - restarted, std::chrono::milliseconds(1500));
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");

@@ -718,8 +718,9 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     EventHandler eventHandler;
     InternalEventHandler internalEventHandler;
     DisconnectHandler disconnectHandler;
+    // Outlives reconnects, so events a lost connection already delivered
+    // still reach the handler, in order, before the loss does.
     std::shared_ptr<CallbackExecutor> eventExecutor;
-    std::vector<std::shared_ptr<CallbackExecutor>> retiredExecutors;
     bool disconnectReported = false;
     std::thread::id readerThread;
 
@@ -934,8 +935,16 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
         // User/status handling may wait behind a running event callback, and
         // that callback is allowed to reconnect. Release close()/connect()
         // before invoking the handler, otherwise it and the callback can wait
-        // on each other forever.
-        if (disconnected) disconnected(error);
+        // on each other forever. Queued behind the events already received.
+        if (disconnected) {
+            std::shared_ptr<CallbackExecutor> executor;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                executor = eventExecutor;
+            }
+            if (!executor || !executor->post([disconnected, error] { disconnected(error); }))
+                disconnected(error);
+        }
     }
 };
 
@@ -951,9 +960,9 @@ bool Client::connect(const std::string& localUrlOrPath,
     const std::string path = localSocketPath(localUrlOrPath);
     const NativeHandle socket = connectSocket(path, timeout, error);
     if (socket == kInvalidHandle) return false;
-    auto executor = CallbackExecutor::start();
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
+        if (!m_impl->eventExecutor) m_impl->eventExecutor = CallbackExecutor::start();
         m_impl->fd = socket;
         m_impl->running = true;
         m_impl->readerExited = false;
@@ -965,7 +974,6 @@ bool Client::connect(const std::string& localUrlOrPath,
         m_impl->definitionFailures.clear();
         m_impl->requested.clear();
         m_impl->disconnectReported = false;
-        m_impl->eventExecutor = std::move(executor);
     }
     auto state = m_impl;
     std::thread([state] { state->readLoop(); }).detach();
@@ -997,33 +1005,21 @@ void Client::closeWithoutWaitingForCallbacks()
 void Client::closeConnection(bool waitForCallbacks)
 {
     std::shared_ptr<CallbackExecutor> executor;
-    std::vector<std::shared_ptr<CallbackExecutor>> retired;
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         if (m_impl->readerExited && m_impl->fd.load() == kInvalidHandle
-            && !m_impl->eventExecutor
-            && (!waitForCallbacks || m_impl->retiredExecutors.empty())) return;
+            && (!waitForCallbacks || !m_impl->eventExecutor)) return;
         m_impl->running = false;
-        executor = std::move(m_impl->eventExecutor);
-        if (waitForCallbacks)
-            retired.swap(m_impl->retiredExecutors);
-        else if (executor)
-            m_impl->retiredExecutors.push_back(executor);
+        // A reconnect keeps the executor: what it holds was received and is
+        // still delivered. Only the final close stops it.
+        if (waitForCallbacks) executor = std::move(m_impl->eventExecutor);
     }
     closeHandle(m_impl->fd);
     std::unique_lock<std::mutex> lock(m_impl->mu);
     if (m_impl->readerThread != std::this_thread::get_id())
         m_impl->changed.wait(lock, [&] { return m_impl->readerExited; });
     lock.unlock();
-    if (executor) {
-        executor->requestStop();
-        // Reconnect must not wait for an event callback which may itself be the
-        // caller waiting to acquire the reconnect serialization lock.
-        if (waitForCallbacks) executor->waitStopped();
-    }
-    if (waitForCallbacks) {
-        for (const auto& old : retired) old->stop();
-    }
+    if (executor) executor->stop();
 }
 
 bool Client::isConnected() const
