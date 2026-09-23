@@ -33,6 +33,7 @@
 
 #ifndef _WIN32
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 #endif
@@ -637,6 +638,119 @@ TEST(QtRemotePlainSocketCompatTest, HandshakeIsAlwaysTheFirstFrame)
     churn.join();
     server.stop();
     EXPECT_EQ(wrongFirst, 0);
+}
+
+// A consumer that acquired an object and then stopped reading.
+UniqueFd stalledConsumer(const std::string& path)
+{
+    auto peer = connectUnix(path);
+    (void)readFrame(peer.get());   // handshake
+    (void)readFrame(peer.get());   // object list
+    writeAll(peer.get(), addObjectPacket("fixture"));
+    if (decodeFrame(readFrame(peer.get())).type != PacketType::InitDynamic)
+        throw std::runtime_error("no definition");
+    return peer;
+}
+
+// Reads what the server sent until it closes; false if it is still open.
+bool drainsToEndOfStream(int fd, int timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+    timeval tick{0, 200 * 1000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tick, sizeof(tick));
+    std::vector<std::uint8_t> buffer(64 << 10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto count = ::recv(fd, buffer.data(), buffer.size(), 0);
+        if (count == 0) return true;
+        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return true;
+    }
+    return false;
+}
+
+std::vector<Variant> bulkyEvent()
+{
+    return {Variant::fromRpc(RpcValue{"tick"}),
+            Variant::fromRpc(RpcValue{std::string(4096, 'x')})};
+}
+
+// Detector: server writes blocked the emitting thread on a consumer that
+// stopped reading, starving every other listener and publish().
+TEST(QtRemotePlainSocketCompatTest, AStalledConsumerBlocksNeitherTheEmitterNorOtherListeners)
+{
+    const std::string path = uniqueSocketPath("stalled");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.publish(answeringFixture("x"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    std::atomic<int> received{0};
+    Client healthy;
+    healthy.setEventHandler([&](const std::string&, std::int32_t, std::vector<Variant>) {
+        ++received;
+    });
+    ASSERT_TRUE(healthy.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(healthy.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+
+    // Declared before the stalled peer so a blocked emitter is released
+    // (the peer closes) before this future waits for it.
+    std::future<void> emitted;
+    auto stalled = stalledConsumer(path);
+    constexpr int kEvents = 2000;
+    const auto arguments = bulkyEvent();
+    emitted = std::async(std::launch::async, [&] {
+        for (int i = 0; i < kEvents; ++i) (void)server.emitSignal("fixture", 0, arguments);
+    });
+    ASSERT_EQ(emitted.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+        << "emitSignal blocked on a consumer that stopped reading";
+    EXPECT_TRUE(waitFor([&] { return received.load() == kEvents; }, 10000))
+        << "healthy listener received " << received.load() << " of " << kEvents;
+
+    auto published = std::async(std::launch::async, [&] {
+        Server::Object late = answeringFixture("late");
+        late.name = "late";
+        return server.publish(std::move(late));
+    });
+    EXPECT_EQ(published.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+        << "publish() blocked on a consumer that stopped reading";
+    server.stop();
+}
+
+TEST(QtRemotePlainSocketCompatTest, AConsumerThatStopsReadingIsDroppedAtTheQueueLimit)
+{
+    const std::string path = uniqueSocketPath("queue_limit");
+    std::string error;
+    Server server;
+    server.setWriteLimits(256u << 10, std::chrono::seconds(30));
+    ASSERT_TRUE(server.publish(answeringFixture("x"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    auto stalled = stalledConsumer(path);
+    const auto arguments = bulkyEvent();
+    for (int i = 0; i < 2000; ++i) (void)server.emitSignal("fixture", 0, arguments);
+    EXPECT_TRUE(drainsToEndOfStream(stalled.get(), 5000))
+        << "8 MiB queued for a consumer limited to 256 KiB and it was not dropped";
+    server.stop();
+}
+
+TEST(QtRemotePlainSocketCompatTest, AConsumerThatStopsReadingIsDroppedAfterTheStallTimeout)
+{
+    const std::string path = uniqueSocketPath("stall_timeout");
+    std::string error;
+    Server server;
+    server.setWriteLimits(64u << 20, std::chrono::milliseconds(500));
+    ASSERT_TRUE(server.publish(answeringFixture("x"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    auto stalled = stalledConsumer(path);
+    const auto arguments = bulkyEvent();
+    // More than any local socket buffers, so the writer has to wait.
+    for (int i = 0; i < 2000; ++i) (void)server.emitSignal("fixture", 0, arguments);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    EXPECT_TRUE(drainsToEndOfStream(stalled.get(), 5000))
+        << "a consumer that read nothing past the stall timeout was not dropped";
+    server.stop();
 }
 
 // Detector: one reply the codec cannot decode used to drop the whole

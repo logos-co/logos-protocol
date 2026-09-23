@@ -35,6 +35,10 @@ namespace logos::qt_remote_plain {
 namespace {
 
 constexpr std::size_t kMaximumFrame = 64u << 20;
+// What a server connection buffers for a peer before dropping it, and how long
+// a peer may read nothing while frames wait. Qt buffers without bound.
+constexpr std::size_t kDefaultMaxQueuedBytes = 64u << 20;
+constexpr std::chrono::milliseconds kDefaultStallTimeout{30000};
 using Deadline = std::chrono::steady_clock::time_point;
 using NativeHandle = std::intptr_t;
 constexpr NativeHandle kInvalidHandle = -1;
@@ -146,6 +150,33 @@ bool writeAll(NativeHandle handle, const std::vector<std::uint8_t>& data,
     return true;
 }
 
+// Fails once `stall` passes with no write completing.
+bool writeAllOrStall(NativeHandle handle, const std::vector<std::uint8_t>& data,
+                     std::string* error, std::chrono::milliseconds stall)
+{
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        DWORD written = 0;
+        const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(
+            data.size() - offset, std::numeric_limits<DWORD>::max()));
+        if (!overlappedWrite(winHandle(handle), data.data() + offset, remaining, written,
+                             error, std::chrono::steady_clock::now() + stall)
+            || written == 0) {
+            return false;
+        }
+        offset += written;
+    }
+    return true;
+}
+
+// Ends pending and future I/O on the handle without releasing it.
+void shutdownHandle(NativeHandle handle)
+{
+    if (handle == kInvalidHandle) return;
+    ::CancelIoEx(winHandle(handle), nullptr);
+    ::DisconnectNamedPipe(winHandle(handle));
+}
+
 bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size,
                const std::atomic<bool>* running)
 {
@@ -237,6 +268,42 @@ bool writeAll(NativeHandle fd, const std::vector<std::uint8_t>& data,
         offset += static_cast<std::size_t>(count);
     }
     return true;
+}
+
+// Fails once `stall` passes with no byte written. The socket is nonblocking.
+bool writeAllOrStall(NativeHandle fd, const std::vector<std::uint8_t>& data,
+                     std::string* error, std::chrono::milliseconds stall)
+{
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
+#else
+    constexpr int flags = MSG_DONTWAIT;
+#endif
+    std::size_t offset = 0;
+    auto deadline = std::chrono::steady_clock::now() + stall;
+    while (offset < data.size()) {
+        const auto count = ::send(fd, data.data() + offset, data.size() - offset, flags);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!waitForSocket(static_cast<int>(fd), POLLOUT, deadline, error,
+                               "local socket write")) return false;
+            continue;
+        }
+        if (count <= 0) {
+            setError(error, count == 0 ? "local socket closed while writing"
+                : "local socket write failed: " + std::string(std::strerror(errno)));
+            return false;
+        }
+        offset += static_cast<std::size_t>(count);
+        deadline = std::chrono::steady_clock::now() + stall;
+    }
+    return true;
+}
+
+// Ends pending and future I/O on the socket without releasing it.
+void shutdownHandle(NativeHandle fd)
+{
+    if (fd != kInvalidHandle) ::shutdown(static_cast<int>(fd), SHUT_RDWR);
 }
 
 bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size,
@@ -1087,12 +1154,30 @@ void Client::setDisconnectHandler(DisconnectHandler handler)
 }
 
 struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
+    using SharedFrame = std::shared_ptr<const std::vector<std::uint8_t>>;
+
+    // Frames leave through the connection's writer thread, so a peer that
+    // stops reading never blocks the thread that sent to it.
     struct Connection {
-        explicit Connection(NativeHandle value) : fd(value) {}
+        Connection(NativeHandle value, std::size_t maxQueued, std::chrono::milliseconds stall)
+            : fd(value), maxQueuedBytes(maxQueued), stallTimeout(stall) {}
         std::atomic<NativeHandle> fd;
+        // Held from a registration to the frames that must precede anything
+        // else (the greeting; an object's definition), keeping them in order.
         std::mutex sendMu;
         std::set<std::string> acquired;
         std::thread::id worker;
+
+        const std::size_t maxQueuedBytes;
+        const std::chrono::milliseconds stallTimeout;
+        std::mutex outMu;
+        std::condition_variable outChanged;
+        std::deque<SharedFrame> outbox;
+        std::size_t queuedBytes = 0;
+        bool closing = false;
+        bool writerDone = false;
+        // Only the reader closes the handle, once the writer is done with it.
+        std::mutex fdMu;
     };
 
     mutable std::mutex mu;
@@ -1101,25 +1186,109 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::atomic<bool> running{false};
     bool acceptExited = true;
     std::size_t activeInvocations = 0;
+    std::size_t activeWriters = 0;
+    std::size_t maxQueuedBytes = kDefaultMaxQueuedBytes;
+    std::chrono::milliseconds stallTimeout = kDefaultStallTimeout;
     std::string path;
     std::map<std::string, Object> objects;
     std::vector<std::shared_ptr<Connection>> connections;
 
-    // The caller holds connection.sendMu.
-    static bool writeLocked(Connection& connection,
-                            const std::vector<std::uint8_t>& frame,
-                            std::string* error = nullptr)
+    // Drops what is queued and ends the connection's I/O; its reader then
+    // closes it.
+    static void abandon(Connection& connection)
     {
-        const NativeHandle current = connection.fd.load();
-        return current != kInvalidHandle && writeAll(current, frame, error);
+        {
+            std::lock_guard<std::mutex> lock(connection.outMu);
+            connection.closing = true;
+            connection.outbox.clear();
+            connection.queuedBytes = 0;
+        }
+        connection.outChanged.notify_all();
+        std::lock_guard<std::mutex> lock(connection.fdMu);
+        shutdownHandle(connection.fd.load());
     }
 
-    bool send(const std::shared_ptr<Connection>& connection,
-              const std::vector<std::uint8_t>& frame,
+    // The caller holds connection.sendMu.
+    static bool enqueueLocked(Connection& connection, SharedFrame frame,
+                              std::string* error = nullptr)
+    {
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lock(connection.outMu);
+            if (connection.closing) {
+                setError(error, "local socket closed");
+                return false;
+            }
+            // One frame is always accepted, however large.
+            overflow = connection.queuedBytes > 0
+                && connection.queuedBytes + frame->size() > connection.maxQueuedBytes;
+            if (!overflow) {
+                connection.queuedBytes += frame->size();
+                connection.outbox.push_back(std::move(frame));
+            }
+        }
+        if (overflow) {
+            // A peer this far behind is not reading; buffering more is unbounded.
+            abandon(connection);
+            setError(error, "local socket peer stopped reading");
+            return false;
+        }
+        connection.outChanged.notify_one();
+        return true;
+    }
+
+    static bool enqueueLocked(Connection& connection, std::vector<std::uint8_t> frame,
+                              std::string* error = nullptr)
+    {
+        return enqueueLocked(connection,
+            std::make_shared<const std::vector<std::uint8_t>>(std::move(frame)), error);
+    }
+
+    bool send(const std::shared_ptr<Connection>& connection, SharedFrame frame,
               std::string* error = nullptr)
     {
         std::lock_guard<std::mutex> lock(connection->sendMu);
-        return writeLocked(*connection, frame, error);
+        return enqueueLocked(*connection, std::move(frame), error);
+    }
+
+    bool send(const std::shared_ptr<Connection>& connection,
+              std::vector<std::uint8_t> frame, std::string* error = nullptr)
+    {
+        std::lock_guard<std::mutex> lock(connection->sendMu);
+        return enqueueLocked(*connection, std::move(frame), error);
+    }
+
+    void writerLoop(const std::shared_ptr<Connection>& connection)
+    {
+        for (;;) {
+            SharedFrame frame;
+            {
+                std::unique_lock<std::mutex> lock(connection->outMu);
+                connection->outChanged.wait(lock, [&] {
+                    return connection->closing || !connection->outbox.empty();
+                });
+                if (connection->closing) break;
+                frame = std::move(connection->outbox.front());
+                connection->outbox.pop_front();
+                connection->queuedBytes -= frame->size();
+            }
+            std::string error;
+            if (!writeAllOrStall(connection->fd.load(), *frame, &error,
+                                 connection->stallTimeout)) {
+                abandon(*connection);
+                break;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(connection->outMu);
+            connection->writerDone = true;
+        }
+        connection->outChanged.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            --activeWriters;
+        }
+        changed.notify_all();
     }
 
     std::vector<ObjectInfo> objectList() const
@@ -1177,7 +1346,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                         }
                     }
                     if (found)
-                        (void)writeLocked(*connection, dynamic
+                        (void)enqueueLocked(*connection, dynamic
                             ? initDynamicPacket(frame.name, object.definition)
                             : initPacket(frame.name));
                     continue;
@@ -1257,7 +1426,15 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 break;
             }
         }
-        closeHandle(connection->fd);
+        abandon(*connection);
+        {
+            std::unique_lock<std::mutex> lock(connection->outMu);
+            connection->outChanged.wait(lock, [&] { return connection->writerDone; });
+        }
+        {
+            std::lock_guard<std::mutex> lock(connection->fdMu);
+            closeHandle(connection->fd);
+        }
         {
             std::lock_guard<std::mutex> lock(mu);
             connections.erase(std::remove(connections.begin(), connections.end(), connection),
@@ -1315,9 +1492,17 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
             int one = 1;
             ::setsockopt(accepted, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+            // The writer's stall deadline needs nonblocking sends; Darwin does
+            // not reliably honour MSG_DONTWAIT on local sockets.
+            const int flags = ::fcntl(static_cast<int>(accepted), F_GETFL, 0);
+            if (flags >= 0) (void)::fcntl(static_cast<int>(accepted), F_SETFL, flags | O_NONBLOCK);
 #endif
-            auto connection = std::make_shared<Connection>(accepted);
+            std::shared_ptr<Connection> connection;
             std::vector<ObjectInfo> currentObjects;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                connection = std::make_shared<Connection>(accepted, maxQueuedBytes, stallTimeout);
+            }
             // publish() sees the connection as soon as it is registered; hold
             // its send lock so nothing can precede the handshake.
             std::unique_lock<std::mutex> greeting(connection->sendMu);
@@ -1328,13 +1513,14 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                     break;
                 }
                 connections.push_back(connection);
+                ++activeWriters;
                 currentObjects = objectList();
             }
-            const bool greeted = writeLocked(*connection, handshakePacket())
-                && writeLocked(*connection, objectListPacket(currentObjects));
+            (void)enqueueLocked(*connection, handshakePacket());
+            (void)enqueueLocked(*connection, objectListPacket(currentObjects));
             greeting.unlock();
-            if (!greeted) closeHandle(connection->fd);
             auto state = shared_from_this();
+            std::thread([state, connection] { state->writerLoop(connection); }).detach();
             std::thread([state, connection] { state->connectionLoop(connection); }).detach();
         }
         {
@@ -1412,18 +1598,22 @@ void Server::stop()
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         if (!m_impl->running && m_impl->listener.load() == kInvalidHandle
-            && m_impl->connections.empty() && m_impl->activeInvocations == 0) return;
+            && m_impl->connections.empty() && m_impl->activeInvocations == 0
+            && m_impl->activeWriters == 0) return;
         m_impl->running = false;
         connections = m_impl->connections;
         path = m_impl->path;
     }
     closeHandle(m_impl->listener);
-    for (const auto& connection : connections) closeHandle(connection->fd);
+    for (const auto& connection : connections) Impl::abandon(*connection);
     std::unique_lock<std::mutex> lock(m_impl->mu);
     const auto caller = std::this_thread::get_id();
     m_impl->changed.wait(lock, [&] {
+        // A caller's own connection closes once the caller returns; its
+        // writer, like every other, has already stopped.
         return m_impl->acceptExited
             && m_impl->activeInvocations == 0
+            && m_impl->activeWriters == 0
             && std::all_of(m_impl->connections.begin(), m_impl->connections.end(),
                 [&](const auto& connection) { return connection->worker == caller; });
     });
@@ -1496,17 +1686,26 @@ bool Server::emitSignal(const std::string& object,
         for (const auto& connection : m_impl->connections)
             if (connection->acquired.count(object)) listeners.push_back(connection);
     }
-    std::vector<std::uint8_t> frame;
+    Impl::SharedFrame frame;
     try {
-        frame = invokePacket(object, 0, signalIndex, arguments);
+        frame = std::make_shared<const std::vector<std::uint8_t>>(
+            invokePacket(object, 0, signalIndex, arguments));
     } catch (const CodecError& exception) {
         setError(error, std::string("cannot encode QtRO signal: ") + exception.what());
         return false;
     }
+    // Queued per listener: a listener that stops reading delays only itself.
     bool ok = true;
     for (const auto& connection : listeners)
         ok = m_impl->send(connection, frame, error) && ok;
     return ok;
+}
+
+void Server::setWriteLimits(std::size_t maxQueuedBytes, std::chrono::milliseconds stallTimeout)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    m_impl->maxQueuedBytes = maxQueuedBytes;
+    m_impl->stallTimeout = stallTimeout;
 }
 
 std::string Server::socketPath() const

@@ -92,10 +92,16 @@ public:
 
     bool publish(Object object, std::string* error = nullptr);
     void unpublish(const std::string& name);
+    // Queues the event for every listener and returns without waiting on any.
     bool emitSignal(const std::string& object,
                     std::int32_t signalIndex,
                     const std::vector<Variant>& arguments,
                     std::string* error = nullptr);
+
+    // For connections accepted afterwards: a peer whose unsent frames exceed
+    // `maxQueuedBytes`, or that reads nothing for `stallTimeout` while frames
+    // wait, is disconnected. Defaults: 64 MiB, 30 s.
+    void setWriteLimits(std::size_t maxQueuedBytes, std::chrono::milliseconds stallTimeout);
 
     std::string socketPath() const;
 
