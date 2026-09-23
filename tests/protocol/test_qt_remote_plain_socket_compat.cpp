@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QEventLoop>
 #include <QJsonValue>
 #include <QMetaObject>
@@ -12,6 +13,7 @@
 #include <QRemoteObjectHost>
 #include <QRemoteObjectNode>
 #include <QRemoteObjectPendingCall>
+#include <QTimeZone>
 #include <QTimer>
 #include <QUrl>
 #include <QVariant>
@@ -24,6 +26,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -149,6 +152,14 @@ public:
 
 signals:
     void tick(const QString& value);
+};
+
+class QtExoticFixture : public QObject {
+    Q_OBJECT
+public:
+    Q_INVOKABLE QVariant ints() { return QVariant::fromValue(QList<int>{1, 2, 3}); }
+    Q_INVOKABLE QVariant single() { return QVariant::fromValue(1.5f); }
+    Q_INVOKABLE QString echo(const QString& value) { return QStringLiteral("qt:") + value; }
 };
 
 class EventSink : public QObject {
@@ -626,6 +637,186 @@ TEST(QtRemotePlainSocketCompatTest, HandshakeIsAlwaysTheFirstFrame)
     churn.join();
     server.stop();
     EXPECT_EQ(wrongFirst, 0);
+}
+
+// Detector: one reply the codec cannot decode used to drop the whole
+// connection, failing every other call on it.
+TEST(QtRemotePlainSocketCompatTest, PlainClientSurvivesQtValuesItCannotDecode)
+{
+    const std::string path = uniqueSocketPath("exotic_qt_host");
+    QRemoteObjectHost host;
+    ASSERT_TRUE(host.setHostUrl(QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QtExoticFixture fixture;
+    ASSERT_TRUE(host.enableRemoting(&fixture, QStringLiteral("fixture")));
+
+    struct Results {
+        std::optional<Variant> ints;
+        std::optional<Variant> single;
+        std::optional<Variant> echo;
+        bool connected = false;
+    };
+    auto future = std::async(std::launch::async, [&] {
+        Results results;
+        std::string error;
+        Client client;
+        if (!client.connect(path, std::chrono::seconds(3), &error)
+            || !client.acquire("fixture", std::chrono::seconds(3), &error))
+            throw std::runtime_error(error);
+        results.ints = client.call("fixture", "ints()", {}, std::chrono::seconds(3), &error);
+        results.single = client.call("fixture", "single()", {}, std::chrono::seconds(3), &error);
+        results.echo = client.call("fixture", "echo(QString)",
+            {Variant::fromRpc(RpcValue{"hi"})}, std::chrono::seconds(3), &error);
+        results.connected = client.isConnected();
+        return results;
+    });
+    ASSERT_TRUE(waitFor([&] {
+        return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }, 10000));
+    const Results results = future.get();
+    ASSERT_TRUE(results.ints.has_value());
+    EXPECT_TRUE(results.ints->opaque);
+    EXPECT_EQ(results.ints->customType, "QList<int>");
+    ASSERT_TRUE(results.single.has_value());
+    EXPECT_EQ(results.single->type, MetaType::Float);
+    EXPECT_EQ(results.single->value, RpcValue{1.5});
+    ASSERT_TRUE(results.echo.has_value());
+    EXPECT_EQ(results.echo->value.asString(), "qt:hi");
+    EXPECT_TRUE(results.connected);
+}
+
+// Detector: arguments the plain server cannot decode used to drop the Qt
+// consumer's connection, leaving its replica Suspect.
+TEST(QtRemotePlainSocketCompatTest, QtConsumerSurvivesArgumentsThePlainServerCannotDecode)
+{
+    const std::string path = uniqueSocketPath("exotic_args");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.publish({"fixture", moduleProxyDefinition(),
+        [](std::int32_t index, const std::vector<Variant>& arguments) -> Variant {
+            if (index != 0 || arguments.size() < 3) return {};
+            if (arguments[2].opaque) return Variant::fromRpc(RpcValue{"opaque"});
+            return Variant::fromRpc(arguments[2].value);
+        }}, &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    QRemoteObjectNode node;
+    ASSERT_TRUE(node.connectToNode(
+        QUrl(QStringLiteral("local:") + QString::fromStdString(path))));
+    QSharedPointer<QRemoteObjectDynamicReplica> replica(
+        node.acquireDynamic(QStringLiteral("fixture")));
+    ASSERT_TRUE(replica->waitForSource(3000));
+    const auto call = [&](const QVariantList& args) {
+        QRemoteObjectPendingCall pending;
+        QMetaObject::invokeMethod(replica.data(), "callRemoteMethod", Qt::DirectConnection,
+            Q_RETURN_ARG(QRemoteObjectPendingCall, pending),
+            Q_ARG(QString, QStringLiteral("token")),
+            Q_ARG(QString, QStringLiteral("echo")),
+            Q_ARG(QVariantList, args));
+        pending.waitForFinished(3000);
+        return pending.isFinished() ? pending.returnValue() : QVariant();
+    };
+
+    EXPECT_EQ(call({QVariant::fromValue(QList<int>{1, 2})}).toString(),
+              QStringLiteral("opaque"));
+
+    QVariantHash hash;
+    hash.insert(QStringLiteral("n"), 7);
+    const QDateTime when(QDate(2026, 9, 23), QTime(10, 0), QTimeZone::UTC);
+    const QVariantList echoed = call({QUrl(QStringLiteral("https://example.org")),
+                                      QVariant::fromValue(1.5f), when, hash}).toList();
+    ASSERT_EQ(echoed.size(), 4);
+    EXPECT_EQ(echoed[0].toString(), QStringLiteral("https://example.org"));
+    EXPECT_EQ(echoed[1].toDouble(), 1.5);
+    EXPECT_EQ(echoed[2].toString(), QStringLiteral("2026-09-23T10:00:00.000Z"));
+    EXPECT_EQ(echoed[3].toMap().value(QStringLiteral("n")).toInt(), 7);
+    EXPECT_EQ(replica->state(), QRemoteObjectReplica::Valid);
+    server.stop();
+}
+
+Variant callArguments(RpcValue args)
+{
+    return Variant::fromRpc(std::move(args));
+}
+
+// Detector: a frame above the 64 MiB read limit used to end the connection.
+TEST(QtRemotePlainSocketCompatTest, AnOversizedCallFailsAloneOnThePlainServer)
+{
+    const std::string path = uniqueSocketPath("oversized_call");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.publish(answeringFixture("small"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    auto peer = connectUnix(path);
+    ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::Handshake);
+    ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::ObjectList);
+    writeAll(peer.get(), addObjectPacket("fixture"));
+    ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::InitDynamic);
+
+    RpcList huge;
+    huge.items.emplace_back(RpcBytes{std::vector<std::uint8_t>(70u << 20, 0x5a)});
+    writeAll(peer.get(), invokePacket("fixture", 0, 0,
+        {Variant::fromRpc(RpcValue{"token"}), Variant::fromRpc(RpcValue{"m"}),
+         callArguments(RpcValue{std::move(huge)})}, 7));
+    const Frame failed = decodeFrame(readFrame(peer.get()));
+    ASSERT_EQ(failed.type, PacketType::InvokeReply);
+    Reader failedReply(failed.payload);
+    EXPECT_EQ(failedReply.i32(), 7);
+    EXPECT_EQ(failedReply.variant().type, MetaType::Invalid);
+
+    writeAll(peer.get(), invokePacket("fixture", 0, 0,
+        {Variant::fromRpc(RpcValue{"token"}), Variant::fromRpc(RpcValue{"m"}),
+         callArguments(RpcValue{RpcList{}})}, 8));
+    const Frame answered = decodeFrame(readFrame(peer.get()));
+    Reader answeredReply(answered.payload);
+    EXPECT_EQ(answeredReply.i32(), 8);
+    EXPECT_EQ(answeredReply.variant().value.asString(), "small");
+    server.stop();
+}
+
+TEST(QtRemotePlainSocketCompatTest, AnOversizedReplyFailsAloneOnThePlainClient)
+{
+    const std::string path = uniqueSocketPath("oversized_reply");
+    UnixListener listener(path);
+    std::thread peerThread([&] {
+        auto peer = listener.acceptOne();
+        writeAll(peer.get(), handshakePacket());
+        writeAll(peer.get(), objectListPacket({{"fixture", std::nullopt, {}}}));
+        (void)readFrame(peer.get()); // AddObject
+        writeAll(peer.get(), initDynamicPacket("fixture", moduleProxyDefinition()));
+        for (int call = 0; call < 2; ++call) {
+            const Frame invoke = decodeFrame(readFrame(peer.get()));
+            Reader body(invoke.payload);
+            (void)body.i32();
+            (void)body.i32();
+            const auto count = body.u32();
+            for (std::uint32_t i = 0; i < count; ++i) (void)body.variant();
+            const auto serial = body.i32();
+            const RpcValue value = call == 0
+                ? RpcValue{RpcBytes{std::vector<std::uint8_t>(70u << 20, 0x5a)}}
+                : RpcValue{"small"};
+            writeAll(peer.get(), invokeReplyPacket("fixture", serial, Variant::fromRpc(value)));
+        }
+    });
+
+    std::string error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(3), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(3), &error)) << error;
+    const std::vector<Variant> args{Variant::fromRpc(RpcValue{"token"}),
+                                    Variant::fromRpc(RpcValue{"m"}),
+                                    callArguments(RpcValue{RpcList{}})};
+    const auto big = client.call("fixture", "callRemoteMethod(QString,QString,QVariantList)",
+                                 args, std::chrono::seconds(10), &error);
+    EXPECT_FALSE(big.has_value());
+    EXPECT_NE(error.find("exceeds the transport limit"), std::string::npos) << error;
+    EXPECT_TRUE(client.isConnected());
+    const auto small = client.call("fixture", "callRemoteMethod(QString,QString,QVariantList)",
+                                   args, std::chrono::seconds(10), &error);
+    ASSERT_TRUE(small.has_value()) << error;
+    EXPECT_EQ(small->value.asString(), "small");
+    peerThread.join();
+    client.close();
 }
 
 #else

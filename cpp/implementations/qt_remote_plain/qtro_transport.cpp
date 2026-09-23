@@ -260,9 +260,30 @@ bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size,
 
 #endif
 
+// A frame above kMaximumFrame is discarded rather than buffered. Its head
+// still names the packet and object (and an InvokeReply's serial); its last
+// eight bytes are an Invoke's serial and property index.
+struct OversizedFrame {
+    bool present = false;
+    std::uint32_t size = 0;
+    std::uint8_t tail[8] = {};
+
+    std::int32_t tailSerial() const
+    {
+        return static_cast<std::int32_t>(static_cast<std::uint32_t>(tail[0])
+            | (static_cast<std::uint32_t>(tail[1]) << 8)
+            | (static_cast<std::uint32_t>(tail[2]) << 16)
+            | (static_cast<std::uint32_t>(tail[3]) << 24));
+    }
+};
+
+constexpr std::size_t kOversizedHead = 64u << 10;
+
 bool readPacket(NativeHandle handle, std::vector<std::uint8_t>& output,
-                std::string* error, const std::atomic<bool>* running)
+                std::string* error, const std::atomic<bool>* running,
+                OversizedFrame* oversized)
 {
+    oversized->present = false;
     output.resize(4);
     if (!readExact(handle, output.data(), 4, running)) {
         setError(error, "local socket closed");
@@ -272,16 +293,78 @@ bool readPacket(NativeHandle handle, std::vector<std::uint8_t>& output,
         | (static_cast<std::uint32_t>(output[1]) << 8)
         | (static_cast<std::uint32_t>(output[2]) << 16)
         | (static_cast<std::uint32_t>(output[3]) << 24);
-    if (payload > kMaximumFrame) {
-        setError(error, "QtRO frame exceeds transport limit");
-        return false;
-    }
-    output.resize(4 + payload);
-    if (!readExact(handle, output.data() + 4, payload, running)) {
+    const std::uint32_t kept = payload > kMaximumFrame
+        ? static_cast<std::uint32_t>(kOversizedHead) : payload;
+    output.resize(4 + static_cast<std::size_t>(kept));
+    if (!readExact(handle, output.data() + 4, kept, running)) {
         setError(error, "local socket closed in the middle of a frame");
         return false;
     }
+    if (payload == kept) return true;
+
+    oversized->present = true;
+    oversized->size = payload;
+    std::memcpy(oversized->tail, output.data() + output.size() - 8, 8);
+    std::vector<std::uint8_t> scratch(kOversizedHead);
+    std::uint64_t left = static_cast<std::uint64_t>(payload) - kept;
+    while (left > 0) {
+        const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(left, scratch.size()));
+        if (!readExact(handle, scratch.data(), chunk, running)) {
+            setError(error, "local socket closed in the middle of a frame");
+            return false;
+        }
+        if (chunk >= 8) {
+            std::memcpy(oversized->tail, scratch.data() + chunk - 8, 8);
+        } else {
+            std::memmove(oversized->tail, oversized->tail + chunk, 8 - chunk);
+            std::memcpy(oversized->tail + 8 - chunk, scratch.data(), chunk);
+        }
+        left -= chunk;
+    }
+    output[0] = static_cast<std::uint8_t>(kept);
+    output[1] = static_cast<std::uint8_t>(kept >> 8);
+    output[2] = static_cast<std::uint8_t>(kept >> 16);
+    output[3] = static_cast<std::uint8_t>(kept >> 24);
     return true;
+}
+
+// An Invoke's serial is its second-to-last field; readable even when an
+// argument before it cannot be decoded.
+std::int32_t trailingSerial(const std::vector<std::uint8_t>& payload)
+{
+    if (payload.size() < 8) return -1;
+    const std::size_t at = payload.size() - 8;
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(payload[at])
+        | (static_cast<std::uint32_t>(payload[at + 1]) << 8)
+        | (static_cast<std::uint32_t>(payload[at + 2]) << 16)
+        | (static_cast<std::uint32_t>(payload[at + 3]) << 24));
+}
+
+struct InvokeFrame {
+    std::int32_t call = -1;
+    std::int32_t index = -1;
+    std::vector<Variant> arguments;
+    std::int32_t serial = -1;
+};
+
+// The last argument ends where the serial begins, so a value the codec cannot
+// interpret there is kept opaque instead of failing the frame.
+InvokeFrame decodeInvoke(const std::vector<std::uint8_t>& payload)
+{
+    if (payload.size() < 20) throw CodecError("truncated QtRO invoke");
+    Reader reader(payload);
+    InvokeFrame frame;
+    frame.call = reader.i32();
+    frame.index = reader.i32();
+    const auto count = reader.u32();
+    if (count > 1024) throw CodecError("QtRO invoke has too many arguments");
+    frame.arguments.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i)
+        frame.arguments.push_back(i + 1 == count ? reader.variantUntil(payload.size() - 8)
+                                                 : reader.variant());
+    frame.serial = reader.i32();
+    (void)reader.i32();
+    return frame;
 }
 
 void closeHandle(std::atomic<NativeHandle>& handle)
@@ -532,6 +615,7 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
     std::string failure;
     std::map<std::string, ObjectInfo> advertised;
     std::map<std::string, ClassDefinition> definitions;
+    std::map<std::string, std::string> definitionFailures;
     std::set<std::string> requested;
     std::map<std::int32_t, std::shared_ptr<Pending>> pending;
     std::int32_t nextSerial = 1;
@@ -586,7 +670,23 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
         changed.notify_all();
     }
 
-    void handle(Frame frame)
+    void completeCall(std::int32_t serial, Variant value, std::string error)
+    {
+        std::shared_ptr<Pending> call;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            const auto it = pending.find(serial);
+            if (it == pending.end()) return;
+            call = it->second;
+            pending.erase(it);
+            call->value = std::move(value);
+            call->error = std::move(error);
+            call->done = true;
+        }
+        call->cv.notify_all();
+    }
+
+    void handle(Frame frame, const OversizedFrame& oversized)
     {
         switch (frame.type) {
         case PacketType::Handshake: {
@@ -620,13 +720,18 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
             break;
         }
         case PacketType::InitDynamic: {
-            Reader reader(frame.payload);
-            auto definition = reader.classDefinition();
-            const auto properties = reader.u32();
-            for (std::uint32_t i = 0; i < properties; ++i) (void)reader.variant();
-            {
+            try {
+                Reader reader(frame.payload);
+                auto definition = reader.classDefinition();
+                const auto properties = reader.u32();
+                for (std::uint32_t i = 0; i < properties; ++i) (void)reader.variant();
                 std::lock_guard<std::mutex> lock(mu);
                 definitions[frame.name] = std::move(definition);
+                definitionFailures.erase(frame.name);
+            } catch (const CodecError& exception) {
+                // One unusable definition fails its acquire, not the connection.
+                std::lock_guard<std::mutex> lock(mu);
+                definitionFailures[frame.name] = exception.what();
             }
             changed.notify_all();
             break;
@@ -640,32 +745,35 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
             break;
         }
         case PacketType::InvokeReply: {
+            if (frame.payload.size() < 4) break;
             Reader reader(frame.payload);
             const auto serial = reader.i32();
-            Variant value = reader.variant();
-            std::shared_ptr<Pending> call;
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                const auto it = pending.find(serial);
-                if (it == pending.end()) break;
-                call = it->second;
-                pending.erase(it);
-                call->value = std::move(value);
-                call->done = true;
+            Variant value;
+            std::string replyError;
+            if (oversized.present) {
+                replyError = "QtRO reply of " + std::to_string(oversized.size)
+                    + " bytes exceeds the transport limit";
+            } else {
+                try {
+                    value = reader.variantUntil(frame.payload.size());
+                } catch (const CodecError& exception) {
+                    replyError = std::string("undecodable QtRO reply: ") + exception.what();
+                }
             }
-            call->cv.notify_all();
+            completeCall(serial, std::move(value), std::move(replyError));
             break;
         }
         case PacketType::Invoke: {
-            Reader reader(frame.payload);
-            const auto callKind = reader.i32();
-            const auto index = reader.i32();
-            const auto count = reader.u32();
-            std::vector<Variant> args;
-            args.reserve(count);
-            for (std::uint32_t i = 0; i < count; ++i) args.push_back(reader.variant());
-            (void)reader.i32();
-            (void)reader.i32();
+            if (oversized.present) break;
+            InvokeFrame invoke;
+            try {
+                invoke = decodeInvoke(frame.payload);
+            } catch (const CodecError&) {
+                break; // one lost event, not a lost connection
+            }
+            const auto callKind = invoke.call;
+            const auto index = invoke.index;
+            std::vector<Variant> args = std::move(invoke.arguments);
             EventHandler callback;
             InternalEventHandler internalCallback;
             std::shared_ptr<CallbackExecutor> executor;
@@ -702,9 +810,10 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
         }
         std::string error;
         std::vector<std::uint8_t> bytes;
-        while (running && readPacket(fd.load(), bytes, &error, &running)) {
+        OversizedFrame oversized;
+        while (running && readPacket(fd.load(), bytes, &error, &running, &oversized)) {
             try {
-                handle(decodeFrame(bytes));
+                handle(decodeFrame(bytes), oversized);
             } catch (const std::exception& exception) {
                 error = exception.what();
                 break;
@@ -757,6 +866,7 @@ bool Client::connect(const std::string& localUrlOrPath,
         m_impl->failure.clear();
         m_impl->advertised.clear();
         m_impl->definitions.clear();
+        m_impl->definitionFailures.clear();
         m_impl->requested.clear();
         m_impl->disconnectReported = false;
         m_impl->eventExecutor = std::move(executor);
@@ -844,6 +954,13 @@ bool Client::acquire(const std::string& object,
             return false;
         }
         if (m_impl->definitions.count(object) != 0) return true;
+        const auto unusable = [&] {
+            const auto it = m_impl->definitionFailures.find(object);
+            if (it == m_impl->definitionFailures.end()) return false;
+            setError(error, "unusable QtRO definition for " + object + ": " + it->second);
+            return true;
+        };
+        if (unusable()) return false;
         if (m_impl->requested.insert(object).second) {
             lock.unlock();
             std::string writeError;
@@ -855,7 +972,9 @@ bool Client::acquire(const std::string& object,
             lock.lock();
         }
         if (!m_impl->changed.wait_until(lock, deadline, [&] {
-                return m_impl->definitions.count(object) != 0 || !m_impl->failure.empty();
+                return m_impl->definitions.count(object) != 0
+                    || m_impl->definitionFailures.count(object) != 0
+                    || !m_impl->failure.empty();
             })) {
             setError(error, "dynamic object definition timed out: " + object);
             return false;
@@ -864,6 +983,7 @@ bool Client::acquire(const std::string& object,
             setError(error, m_impl->failure);
             return false;
         }
+        if (unusable()) return false;
     }
     return true;
 }
@@ -895,7 +1015,13 @@ std::optional<Variant> Client::call(
     auto pending = std::make_shared<Impl::Pending>();
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
-        const auto& methods = m_impl->definitions.at(object).methodDefinitions;
+        // A RemoveObject can land between acquire() and here.
+        const auto definition = m_impl->definitions.find(object);
+        if (definition == m_impl->definitions.end()) {
+            setError(error, "object was removed before the call: " + object);
+            return std::nullopt;
+        }
+        const auto& methods = definition->second.methodDefinitions;
         const auto it = std::find_if(methods.begin(), methods.end(), [&](const auto& method) {
             return method.signature == methodSignature;
         });
@@ -909,9 +1035,17 @@ std::optional<Variant> Client::call(
         m_impl->pending[serial] = pending;
     }
 
+    std::vector<std::uint8_t> request;
+    try {
+        request = invokePacket(object, 0, methodIndex, arguments, serial);
+    } catch (const CodecError& exception) {
+        std::lock_guard<std::mutex> lock(m_impl->mu);
+        m_impl->pending.erase(serial);
+        setError(error, std::string("cannot encode QtRO call: ") + exception.what());
+        return std::nullopt;
+    }
     std::string writeError;
-    if (!m_impl->send(invokePacket(object, 0, methodIndex, arguments, serial),
-                      &writeError, deadline)) {
+    if (!m_impl->send(request, &writeError, deadline)) {
         {
             std::lock_guard<std::mutex> lock(m_impl->mu);
             m_impl->pending.erase(serial);
@@ -1005,9 +1139,17 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         }
         std::vector<std::uint8_t> bytes;
         std::string error;
-        while (running && readPacket(connection->fd.load(), bytes, &error, &running)) {
+        OversizedFrame oversized;
+        while (running && readPacket(connection->fd.load(), bytes, &error, &running, &oversized)) {
             try {
                 const Frame frame = decodeFrame(bytes);
+                if (oversized.present) {
+                    // Answer the call with Qt's failure value; keep the connection.
+                    const auto serial = oversized.tailSerial();
+                    if (frame.type == PacketType::Invoke && serial >= 0)
+                        (void)send(connection, invokeReplyPacket(frame.name, serial, Variant{}));
+                    continue;
+                }
                 if (frame.type == PacketType::Ping) {
                     (void)send(connection, pingPacket(PacketType::Pong, frame.name));
                     continue;
@@ -1018,8 +1160,8 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                     continue;
                 }
                 if (frame.type == PacketType::AddObject) {
-                    Reader payload(frame.payload);
-                    const bool dynamic = payload.boolean();
+                    if (frame.payload.size() != 1 || frame.payload[0] > 1) continue;
+                    const bool dynamic = frame.payload[0] != 0;
                     // Register and answer under one send lock: an event that
                     // reaches a Qt replica before its definition crashes it.
                     std::lock_guard<std::mutex> sendLock(connection->sendMu);
@@ -1041,16 +1183,21 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                     continue;
                 }
                 if (frame.type == PacketType::Invoke) {
-                    Reader payload(frame.payload);
-                    const auto callKind = payload.i32();
-                    const auto methodIndex = payload.i32();
-                    const auto count = payload.u32();
-                    std::vector<Variant> arguments;
-                    arguments.reserve(count);
-                    for (std::uint32_t i = 0; i < count; ++i)
-                        arguments.push_back(payload.variant());
-                    const auto serial = payload.i32();
-                    (void)payload.i32();
+                    InvokeFrame invoke;
+                    try {
+                        invoke = decodeInvoke(frame.payload);
+                    } catch (const CodecError&) {
+                        // Qt answers a call it cannot dispatch with an invalid
+                        // QVariant; do the same rather than drop the connection.
+                        const auto serial = trailingSerial(frame.payload);
+                        if (serial >= 0)
+                            (void)send(connection, invokeReplyPacket(frame.name, serial, Variant{}));
+                        continue;
+                    }
+                    const auto callKind = invoke.call;
+                    const auto methodIndex = invoke.index;
+                    const auto serial = invoke.serial;
+                    std::vector<Variant> arguments = std::move(invoke.arguments);
                     Object object;
                     bool found = false;
                     {
@@ -1078,9 +1225,15 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                                 } catch (...) {
                                     result = Variant::fromRpc(plain::RpcValue{});
                                 }
-                                if (serial >= 0)
-                                    (void)state->send(connection,
-                                        invokeReplyPacket(objectName, serial, result));
+                                if (serial >= 0) {
+                                    std::vector<std::uint8_t> reply;
+                                    try {
+                                        reply = invokeReplyPacket(objectName, serial, result);
+                                    } catch (const std::exception&) {
+                                        reply = invokeReplyPacket(objectName, serial, Variant{});
+                                    }
+                                    (void)state->send(connection, reply);
+                                }
                                 {
                                     std::lock_guard<std::mutex> lock(state->mu);
                                     --state->activeInvocations;
@@ -1343,7 +1496,13 @@ bool Server::emitSignal(const std::string& object,
         for (const auto& connection : m_impl->connections)
             if (connection->acquired.count(object)) listeners.push_back(connection);
     }
-    const auto frame = invokePacket(object, 0, signalIndex, arguments);
+    std::vector<std::uint8_t> frame;
+    try {
+        frame = invokePacket(object, 0, signalIndex, arguments);
+    } catch (const CodecError& exception) {
+        setError(error, std::string("cannot encode QtRO signal: ") + exception.what());
+        return false;
+    }
     bool ok = true;
     for (const auto& connection : listeners)
         ok = m_impl->send(connection, frame, error) && ok;

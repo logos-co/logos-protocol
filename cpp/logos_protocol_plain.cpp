@@ -805,6 +805,12 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         error = "token not recognized";
         return std::nullopt;
     }
+    if (result && result->opaque) {
+        error = "reply carries a Qt type the plain runtime cannot represent (metatype "
+            + std::to_string(static_cast<std::uint32_t>(result->type))
+            + (result->customType.empty() ? "" : " " + result->customType) + ")";
+        return std::nullopt;
+    }
     if (result) {
         std::string completion;
         if (pendingId(*result, completion)) {
@@ -951,6 +957,7 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         || !arguments[0].value.isString() || !arguments[1].value.isString()) return {};
     const std::string auth = arguments[0].value.asString();
     const std::string method = arguments[1].value.asString();
+    if (arguments.size() >= 3 && arguments[2].opaque) return {};
     const json args = arguments.size() >= 3 ? rpcToJson(arguments[2].value) : json::array();
     if ((method == "getPluginMethods" || method == "getPluginEvents"
          || method == "getPluginInterface") && args.empty()) {
@@ -1128,7 +1135,8 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
             if (!state || !state->alive || object != state->target
                 || signal != 0 || arguments.size() != 2
                 || !arguments[0].value.isString()
-                || arguments[0].value.asString() != kCompletionEvent)
+                || arguments[0].value.asString() != kCompletionEvent
+                || arguments[1].opaque)
                 return false;
             const json data = rpcToJson(arguments[1].value);
             if (!data.is_array() || data.size() != 2 || !data[0].is_string())
@@ -1148,7 +1156,7 @@ lp_client* lp_client_create(const char* targetModule, const char* originModule,
             std::lock_guard<std::recursive_mutex> callbackLock(state->callbackMutex);
             if (!state->alive || object != state->target
                 || signal != 0 || arguments.size() != 2
-                || !arguments[0].value.isString()) return;
+                || !arguments[0].value.isString() || arguments[1].opaque) return;
             const std::string event = arguments[0].value.asString();
             const json data = rpcToJson(arguments[1].value);
             std::vector<std::shared_ptr<SubscriptionState>> subscriptions;
