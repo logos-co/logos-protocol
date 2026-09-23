@@ -138,9 +138,11 @@ json rpcToJson(const RpcValue& value)
     return out;
 }
 
+// "result" is the LIDL spelling the C++ generator publishes; Rust publishes
+// "LogosResult". Qt typed wrappers need the user type either way.
 bool isLogosResultType(const std::string& type)
 {
-    return type == "LogosResult"
+    return type == "LogosResult" || type == "result"
         || (type.size() > 13 && type.compare(type.size() - 13, 13, "::LogosResult") == 0);
 }
 

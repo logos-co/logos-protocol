@@ -58,14 +58,15 @@ char* dispatch(const char* method, const char* argsJson, void*)
     if (std::strcmp(method, "echoBytes") == 0)
         return copyString(args.at(0).dump());
     if (std::strcmp(method, "mapCollision") == 0
-        || std::strcmp(method, "resultCollision") == 0)
+        || std::strcmp(method, "resultCollision") == 0
+        || std::strcmp(method, "lidlResult") == 0)
         return copyString(R"({"success":true,"value":42,"error":null})");
     return copyString("null");
 }
 
 char* methods(void*)
 {
-    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]},{"type":"method","name":"echoBytes","signature":"echoBytes(QByteArray)","returnType":"QByteArray","isInvokable":true,"parameters":[]},{"type":"method","name":"mapCollision","signature":"mapCollision()","returnType":"QVariantMap","isInvokable":true,"parameters":[]},{"type":"method","name":"resultCollision","signature":"resultCollision()","returnType":"LogosResult","isInvokable":true,"parameters":[]}])json");
+    return copyString(R"json([{"type":"method","name":"echo","signature":"echo(string)","returnType":"string","isInvokable":true,"parameters":[]},{"type":"method","name":"echoBytes","signature":"echoBytes(QByteArray)","returnType":"QByteArray","isInvokable":true,"parameters":[]},{"type":"method","name":"mapCollision","signature":"mapCollision()","returnType":"QVariantMap","isInvokable":true,"parameters":[]},{"type":"method","name":"resultCollision","signature":"resultCollision()","returnType":"LogosResult","isInvokable":true,"parameters":[]},{"type":"method","name":"lidlResult","signature":"lidlResult()","returnType":"result","isInvokable":true,"parameters":[]}])json");
 }
 
 int token(const char* module, const char* value, void* userData)
@@ -842,6 +843,11 @@ TEST(QtRemotePlainCabiTest, DeclaredReturnTypeDisambiguatesMapAndLogosResult)
     ASSERT_TRUE(result.has_value()) << error;
     EXPECT_EQ(result->type, logos::qt_remote_plain::MetaType::User);
     EXPECT_EQ(result->customType, "LogosResult");
+    // Detector: the C++ generator publishes the LIDL spelling, "result".
+    const auto lidl = call("lidlResult");
+    ASSERT_TRUE(lidl.has_value()) << error;
+    EXPECT_EQ(lidl->type, logos::qt_remote_plain::MetaType::User);
+    EXPECT_EQ(lidl->customType, "LogosResult");
 
     wire.close();
     lp_provider_destroy(provider);
