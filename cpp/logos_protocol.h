@@ -959,6 +959,9 @@ typedef int (*lp_validate_token_cb)(const char* token,
  *  this value through logos_module_set_call_caller(). */
 LP_API const char* lp_current_caller_json(void);
 
+/** NULL for an empty module name, or for a transport set that is not a valid
+ *  transport-set JSON array (unknown protocols and malformed entries included):
+ *  a provider is never created serving less than it was asked to. */
 LP_API lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json);
 LP_API void lp_provider_destroy(lp_provider* provider);

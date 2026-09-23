@@ -423,6 +423,27 @@ void runDestroyWithQueuedCallback(DestroyCallbackKind kind, QueuedWork queued,
     lp_provider_destroy(provider);
 }
 
+// Detector: a transport set that did not parse (the plain host was handed
+// base64) was accepted and served local only, dropping its TCP listeners.
+TEST(QtRemotePlainCabiTest, AProviderIsNotCreatedFromAnUnusableTransportSet)
+{
+    for (const char* unusable : {
+             "W3sicHJvdG9jb2wiOiJ0Y3AiLCJwb3J0Ijo2MDAxfV0=", "{}", "[1]",
+             R"([{"protocol":"tcp","port":"6001"}])", R"([{"protocol":"tcp","port":70000}])",
+             R"([{"protocol":"quic"}])", R"([{"codec":"xml"}])"}) {
+        lp_provider* provider = lp_provider_create("transport_set_probe", unusable);
+        EXPECT_EQ(provider, nullptr) << unusable;
+        lp_provider_destroy(provider);
+    }
+    for (const char* usable : {
+             "", "[]", R"([{"protocol":"local"}])",
+             R"([{"protocol":"tcp","host":"127.0.0.1","port":0,"codec":"cbor"}])"}) {
+        lp_provider* provider = lp_provider_create("transport_set_probe", usable);
+        EXPECT_NE(provider, nullptr) << usable;
+        lp_provider_destroy(provider);
+    }
+}
+
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
 {
     setInstanceId("qtro_cabi_");

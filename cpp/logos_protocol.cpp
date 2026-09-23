@@ -948,6 +948,8 @@ lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json)
 {
     if (!module_name || !*module_name) return nullptr;
+    if (transport_set_json && !logos::parseTransportSet(transport_set_json, nullptr))
+        return nullptr;
     auto* provider = new lp_provider();
     provider->moduleName = module_name;
     provider->transportSetJson =
