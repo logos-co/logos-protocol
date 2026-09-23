@@ -1032,6 +1032,8 @@ struct lp_provider {
     std::mutex mutex;
     std::map<std::string, std::string> inbound;
     std::map<std::string, std::string> returnTypes;
+    // Deferred calls of LogosResult methods: call id -> declared return type.
+    std::map<std::string, std::string> pendingResultTypes;
     std::string credential;
     std::atomic<bool> prepared{false};
     std::atomic<bool> registered{false};
@@ -1099,6 +1101,17 @@ std::string providerReturnType(lp_provider* provider, const std::string& method)
     return found == provider->returnTypes.end() ? std::string{} : found->second;
 }
 
+// A deferred LogosResult method answers with the pending sentinel; the
+// completion that carries its result must carry the user type too.
+void rememberPendingResult(lp_provider* provider, const json& result, const std::string& type)
+{
+    if (!isLogosResultType(type) || !result.is_object() || result.size() != 1) return;
+    const auto found = result.find(kPendingKey);
+    if (found == result.end() || !found->is_string() || found->get<std::string>().empty()) return;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->pendingResultTypes[found->get<std::string>()] = type;
+}
+
 Variant providerInvoke(lp_provider* provider, bool handshake,
                        std::int32_t index, const std::vector<Variant>& arguments)
 {
@@ -1152,8 +1165,10 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
     if (!text) return {};
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
-    return result.is_discarded() ? Variant{}
-                                 : resultVariant(result, providerReturnType(provider, method));
+    if (result.is_discarded()) return {};
+    const std::string type = providerReturnType(provider, method);
+    rememberPendingResult(provider, result, type);
+    return resultVariant(result, type);
 }
 
 bool providerAcceptToken(lp_provider* provider, const std::string& auth,
@@ -1955,15 +1970,26 @@ try {
         return LP_ERR_INVALID_ARG;
     const json data = json::parse(dataJson && *dataJson ? dataJson : "[]", nullptr, false);
     if (data.is_discarded() || !data.is_array()) return LP_ERR_INVALID_ARG;
+    std::string resultType;
+    if (std::strcmp(eventName, kCompletionEvent) == 0 && data.size() == 2 && data[0].is_string()) {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        const auto pending = provider->pendingResultTypes.find(data[0].get<std::string>());
+        if (pending != provider->pendingResultTypes.end()) {
+            resultType = pending->second;
+            provider->pendingResultTypes.erase(pending);
+        }
+    }
     std::vector<RpcValue> arguments;
     for (const auto& item : data) arguments.push_back(jsonToRpc(item));
     for (auto& endpoint : provider->networkEndpoints)
         endpoint->emit(provider->moduleName, eventName, arguments);
     if (!provider->qtroStarted) return LP_OK;
+    Variant payload = Variant::fromRpc(jsonToRpc(data));
+    if (!resultType.empty()) payload.nestedValues[1] = resultVariant(data[1], resultType);
     std::string error;
     return provider->server.emitSignal(provider->moduleName, 0,
-        {Variant::fromRpc(RpcValue{std::string(eventName)}),
-         Variant::fromRpc(jsonToRpc(data))}, &error) ? LP_OK : LP_ERR_INTERNAL;
+        {Variant::fromRpc(RpcValue{std::string(eventName)}), std::move(payload)}, &error)
+        ? LP_OK : LP_ERR_INTERNAL;
 } catch (...) {
     return LP_ERR_INTERNAL;
 }
