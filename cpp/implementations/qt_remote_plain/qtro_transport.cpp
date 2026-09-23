@@ -1023,8 +1023,10 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                             found = true;
                         }
                     }
-                    if (found && dynamic)
-                        (void)send(connection, initDynamicPacket(frame.name, object.definition));
+                    if (found)
+                        (void)send(connection, dynamic
+                            ? initDynamicPacket(frame.name, object.definition)
+                            : initPacket(frame.name));
                     continue;
                 }
                 if (frame.type == PacketType::Invoke) {

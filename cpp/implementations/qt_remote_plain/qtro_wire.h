@@ -215,6 +215,11 @@ std::vector<std::uint8_t> handshakePacket();
 std::vector<std::uint8_t> objectListPacket(const std::vector<ObjectInfo>& objects);
 std::vector<std::uint8_t> addObjectPacket(std::string_view name, bool dynamic = true);
 std::vector<std::uint8_t> removeObjectPacket(std::string_view name);
+// Answer to a non-dynamic AddObject: a replica that already holds the
+// definition (a Qt node re-attaching after a reconnect) needs properties only.
+std::vector<std::uint8_t> initPacket(
+    std::string_view name,
+    const std::vector<Variant>& properties = {});
 std::vector<std::uint8_t> initDynamicPacket(
     std::string_view name,
     const ClassDefinition& definition,
