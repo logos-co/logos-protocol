@@ -1,6 +1,7 @@
 #include "logos_protocol.h"
 #include "logos_codec.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
+#include "logos_protocol_plain_tokens.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -1474,6 +1475,108 @@ TEST(QtRemotePlainCabiTest, DeferredCompletionsKeepTheDeclaredResultType)
 
     wire.close();
     lp_provider_destroy(provider);
+}
+
+char* callerDispatch(const char* method, const char*, void*)
+{
+    if (std::strcmp(method, "whoAmI") != 0) return copyString("null");
+    const char* caller = lp_current_caller_json();
+    return copyString(nlohmann::json(caller ? caller : "").dump());
+}
+
+char* callerMethods(void*)
+{
+    return copyString(R"json([{"type":"method","name":"whoAmI","signature":"whoAmI()","returnType":"QString","isInvokable":true,"parameters":[]}])json");
+}
+
+int refuseToken(const char*, const char*, void*) { return LP_ERR_INVALID_ARG; }
+
+int acceptExternal(const char* value, const char*, void*)
+{
+    return value && std::strcmp(value, "external-secret") == 0 ? LP_OK : LP_ERR_UNAVAILABLE;
+}
+
+struct CallerFixture {
+    lp_provider* provider = nullptr;
+    logos::qt_remote_plain::Client wire;
+
+    explicit CallerFixture(const std::vector<std::pair<std::string, std::string>>& modules)
+    {
+        provider = lp_provider_create("caller_fixture", nullptr);
+        EXPECT_NE(provider, nullptr);
+        lp_provider_save_token(provider, "core", "core-anchor");
+        lp_provider_save_token(provider, "capability_module", "capability-anchor");
+        for (const auto& module : modules)
+            lp_provider_save_token(provider, module.first.c_str(), module.second.c_str());
+        lp_provider_set_token_validator(provider, acceptExternal, nullptr);
+        EXPECT_EQ(lp_provider_register(provider, callerDispatch, callerMethods, refuseToken, nullptr),
+                  LP_OK);
+        std::string error;
+        EXPECT_TRUE(wire.connect("local:logos_caller_fixture_"
+            + std::string(std::getenv("LOGOS_INSTANCE_ID")), std::chrono::seconds(1), &error))
+            << error;
+    }
+    ~CallerFixture()
+    {
+        wire.close();
+        lp_provider_destroy(provider);
+    }
+    // The caller document the module saw, or "refused" when it was not called.
+    std::string whoAmI(const std::string& token)
+    {
+        using logos::qt_remote_plain::Variant;
+        std::string error;
+        const auto reply = wire.call("caller_fixture", "callRemoteMethod(QString,QString,QVariantList)",
+            {Variant::fromRpc(logos::plain::RpcValue{token}),
+             Variant::fromRpc(logos::plain::RpcValue{"whoAmI"}),
+             Variant::fromRpc(logos::plain::RpcValue{logos::plain::RpcList{}})},
+            std::chrono::seconds(1), &error);
+        return reply && reply->value.isString() ? reply->value.asString() : "refused";
+    }
+};
+
+// Detector: the plain provider named an anchor key ("core") as the caller,
+// answered a validator-accepted token with "external", a kind outside the
+// caller document, and kept a token its module had refused.
+TEST(QtRemotePlainCabiTest, CallerIdentityFollowsTheQtProvider)
+{
+    using logos::qt_remote_plain::Variant;
+    setInstanceId("qtro_cabi_caller_");
+    CallerFixture fixture({{"chat_module", "chat-secret"}});
+
+    EXPECT_EQ(fixture.whoAmI("chat-secret"), R"({"kind":"module","name":"chat_module"})");
+    EXPECT_EQ(fixture.whoAmI("capability-anchor"), R"({"kind":"host"})");
+    EXPECT_EQ(fixture.whoAmI("core-anchor"), R"({"kind":"unknown"})") << "an anchor key named the caller";
+    EXPECT_EQ(fixture.whoAmI("external-secret"), R"({"kind":"unknown"})");
+    EXPECT_EQ(fixture.whoAmI("nobody"), "refused");
+
+    std::string error;
+    const auto pushed = fixture.wire.call("caller_fixture", "informModuleToken(QString,QString,QString)",
+        {Variant::fromRpc(logos::plain::RpcValue{"capability-anchor"}),
+         Variant::fromRpc(logos::plain::RpcValue{"pusher"}),
+         Variant::fromRpc(logos::plain::RpcValue{"pushed-secret"})},
+        std::chrono::seconds(1), &error);
+    ASSERT_TRUE(pushed.has_value()) << error;
+    EXPECT_FALSE(pushed->value.isBool() && pushed->value.asBool());
+    EXPECT_EQ(fixture.whoAmI("pushed-secret"), "refused") << "a refused push authorized its token";
+}
+
+// Every stored token is compared whichever one matches, as on the Qt path.
+TEST(QtRemotePlainCabiTest, EveryStoredTokenIsComparedWhicheverMatches)
+{
+    setInstanceId("qtro_cabi_caller_cost_");
+    CallerFixture fixture({{"a_module", "a-secret"}, {"m_module", "m-secret"},
+                           {"z_module", "z-secret"}});
+    const auto cost = [&](const char* token) {
+        const unsigned long long before = logos::plain::abi::tokenComparisonCount();
+        fixture.whoAmI(token);
+        return logos::plain::abi::tokenComparisonCount() - before;
+    };
+    const unsigned long long first = cost("a-secret");
+    EXPECT_GT(first, 3u);
+    EXPECT_EQ(cost("z-secret"), first);
+    EXPECT_EQ(cost("core-anchor"), first);
+    EXPECT_EQ(cost("nobody"), first);
 }
 
 TEST(QtRemotePlainCabiTest, DeferredSubscriptionReconnectsAndManualPolicyHolds)
