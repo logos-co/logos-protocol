@@ -2,6 +2,7 @@
 
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_network.h"
+#include "logos_protocol_plain_tokens.h"
 #include "logos_codec.h"
 #include "logos_call_error.h"
 #include "logos_transport_config_json.h"
@@ -1041,6 +1042,32 @@ struct lp_provider {
 
 namespace {
 
+std::atomic<unsigned long long> gTokenComparisons{0};
+
+// The Qt provider's comparison (module_proxy.cpp): a different length is a
+// mismatch, but the scan still covers the longer value.
+bool constantTimeEquals(const std::string& a, const std::string& b)
+{
+    gTokenComparisons.fetch_add(1, std::memory_order_relaxed);
+    const std::size_t n = std::max(a.size(), b.size());
+    std::size_t diff = a.size() ^ b.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= static_cast<std::size_t>(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+bool isAnchorKey(const std::string& key)
+{
+    return key == "core" || key == "capability_module";
+}
+
+// The caller document for `token`, empty when unauthorized. As on the Qt path
+// (module_proxy.cpp), every entry is compared, an anchor key authorizes but
+// never names, and a value two callers share names neither; a token the host's
+// validator accepts is authorized too, and named by no one.
 std::string providerCaller(lp_provider* provider, const std::string& token,
                            const char* protocol = "local")
 {
@@ -1049,16 +1076,28 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
     void* validatorData = nullptr;
     {
         std::lock_guard<std::mutex> lock(provider->mutex);
-        if (!provider->credential.empty() && provider->credential == token)
-            return R"({"kind":"host"})";
-        for (const auto& entry : provider->inbound)
-            if (entry.second == token)
-                return dumpJson(json{{"kind", "module"}, {"name", entry.first}});
+        const bool host = !provider->credential.empty()
+            && constantTimeEquals(provider->credential, token);
+        bool anchor = false;
+        int named = 0;
+        std::string name;
+        for (const auto& entry : provider->inbound) {
+            const bool match = constantTimeEquals(entry.second, token);
+            if (isAnchorKey(entry.first)) {
+                anchor = anchor || match;
+            } else if (match) {
+                ++named;
+                name = entry.first;
+            }
+        }
+        if (host) return R"({"kind":"host"})";
+        if (named == 1 && !anchor) return dumpJson(json{{"kind", "module"}, {"name", name}});
+        if (named > 0 || anchor) return R"({"kind":"unknown"})";
         validate = provider->validateToken;
         validatorData = provider->validatorUserData;
     }
     if (validate && validate(token.c_str(), protocol, validatorData) == LP_OK)
-        return R"({"kind":"external"})";
+        return R"({"kind":"unknown"})";
     return {};
 }
 
@@ -1101,6 +1140,26 @@ std::string providerReturnType(lp_provider* provider, const std::string& method)
     return found == provider->returnTypes.end() ? std::string{} : found->second;
 }
 
+// Recorded only once the module took it: a refused push must not later
+// authorize, or name, whoever presents that token.
+bool providerAcceptToken(lp_provider* provider, const std::string& auth,
+                         const std::string& module, const std::string& token)
+{
+    bool trusted = false;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        trusted = !provider->credential.empty() && constantTimeEquals(provider->credential, auth);
+    }
+    if (!trusted) return false;
+    const bool accepted = !provider->onToken
+        || provider->onToken(module.c_str(), token.c_str(), provider->userData) == LP_OK;
+    if (accepted && !module.empty() && !token.empty()) {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        provider->inbound[module] = token;
+    }
+    return accepted;
+}
+
 // A deferred LogosResult method answers with the pending sentinel; the
 // completion that carries its result must carry the user type too.
 void rememberPendingResult(lp_provider* provider, const json& result, const std::string& type)
@@ -1119,19 +1178,9 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         if (arguments.size() != 3 || !arguments[0].value.isString()
             || !arguments[1].value.isString() || !arguments[2].value.isString())
             return Variant::fromRpc(RpcValue{false});
-        const std::string auth = arguments[0].value.asString();
-        const std::string module = arguments[1].value.asString();
-        const std::string token = arguments[2].value.asString();
-        bool trusted = false;
-        {
-            std::lock_guard<std::mutex> lock(provider->mutex);
-            trusted = !provider->credential.empty() && provider->credential == auth;
-            if (trusted && !module.empty() && !token.empty()) provider->inbound[module] = token;
-        }
-        if (!trusted) return Variant::fromRpc(RpcValue{false});
-        const bool accepted = !provider->onToken
-            || provider->onToken(module.c_str(), token.c_str(), provider->userData) == LP_OK;
-        return Variant::fromRpc(RpcValue{accepted});
+        return Variant::fromRpc(RpcValue{providerAcceptToken(provider,
+            arguments[0].value.asString(), arguments[1].value.asString(),
+            arguments[2].value.asString())});
     }
     if (index >= 4 && index <= 6) {
         const json metadata = providerMetadata(
@@ -1171,19 +1220,6 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
     return resultVariant(result, type);
 }
 
-bool providerAcceptToken(lp_provider* provider, const std::string& auth,
-                         const std::string& module, const std::string& token)
-{
-    bool trusted = false;
-    {
-        std::lock_guard<std::mutex> lock(provider->mutex);
-        trusted = !provider->credential.empty() && provider->credential == auth;
-        if (trusted && !module.empty() && !token.empty())
-            provider->inbound[module] = token;
-    }
-    return trusted && (!provider->onToken
-        || provider->onToken(module.c_str(), token.c_str(), provider->userData) == LP_OK);
-}
 
 ResultMessage providerNetworkCall(lp_provider* provider,
                                   const CallMessage& request,
@@ -1279,6 +1315,13 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
 }
 
 } // namespace
+
+namespace logos::plain::abi {
+unsigned long long tokenComparisonCount()
+{
+    return gTokenComparisons.load(std::memory_order_relaxed);
+}
+} // namespace logos::plain::abi
 
 extern "C" {
 
