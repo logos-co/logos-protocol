@@ -658,6 +658,11 @@ void Client::close()
     closeConnection(true);
 }
 
+void Client::closeWithoutWaitingForCallbacks()
+{
+    closeConnection(false);
+}
+
 void Client::closeConnection(bool waitForCallbacks)
 {
     std::shared_ptr<CallbackExecutor> executor;

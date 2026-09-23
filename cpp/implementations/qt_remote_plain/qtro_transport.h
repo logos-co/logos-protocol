@@ -39,6 +39,9 @@ public:
                  std::chrono::milliseconds timeout,
                  std::string* error = nullptr);
     void close();
+    // Stop I/O without waiting for public event callbacks. Use when the caller
+    // itself holds a callback lock; the executor is drained on final teardown.
+    void closeWithoutWaitingForCallbacks();
     bool isConnected() const;
 
     bool acquire(const std::string& object,

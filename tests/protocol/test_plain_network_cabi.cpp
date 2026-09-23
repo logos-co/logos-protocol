@@ -71,6 +71,44 @@ struct DeferredState {
     std::string value;
 };
 
+struct AsyncDestroyState {
+    lp_client* client = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool proceed = false;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> success{-1};
+    std::atomic<int> events{0};
+};
+
+void onAsyncDestroyStatus(int status, unsigned long long, const char*, void* user)
+{
+    if (status == LP_SUB_ARMED)
+        static_cast<AsyncDestroyState*>(user)->armed = true;
+}
+
+void onAsyncDestroyEvent(const char*, const char*, void* user)
+{
+    ++static_cast<AsyncDestroyState*>(user)->events;
+}
+
+void onAsyncDestroyResult(int success, const char*, void* user)
+{
+    auto& state = *static_cast<AsyncDestroyState*>(user);
+    state.success = success;
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.entered = true;
+        state.changed.notify_all();
+        state.changed.wait(lock, [&] { return state.proceed; });
+    }
+    lp_client_destroy(state.client);
+    state.client = nullptr;
+    state.done = true;
+}
+
 bool writeSelfSignedCert(const std::filesystem::path& certPath,
                          const std::filesystem::path& keyPath)
 {
@@ -253,6 +291,88 @@ TEST(PlainNetworkCAbi, TcpDeferredCompletionBypassesPublicEventCallback)
 TEST(PlainNetworkCAbi, TlsDeferredCompletionBypassesPublicEventCallback)
 {
     runDeferredCompletionFromCallback(true);
+}
+
+void runAsyncResultDestroyWithQueuedNetworkEvent(bool tls)
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor reservation(io,
+        {boost::asio::ip::address_v4::loopback(), 0});
+    const auto port = reservation.local_endpoint().port();
+    reservation.close();
+    const auto directory = std::filesystem::temp_directory_path()
+        / ("logos-plain-async-destroy-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (tls) {
+        std::filesystem::create_directories(directory);
+        ASSERT_TRUE(writeSelfSignedCert(directory / "cert.pem", directory / "key.pem"));
+    }
+    nlohmann::json clientConfig = {
+        {"protocol", tls ? "tcp_ssl" : "tcp"},
+        {"host", "127.0.0.1"}, {"port", port}, {"verify_peer", false}};
+    nlohmann::json serverConfig = clientConfig;
+    if (tls) {
+        serverConfig["cert_file"] = (directory / "cert.pem").string();
+        serverConfig["key_file"] = (directory / "key.pem").string();
+    }
+    const std::string clientJson = clientConfig.dump();
+    const std::string serverSet = nlohmann::json::array({serverConfig}).dump();
+
+    lp_provider* provider = lp_provider_create("plain_async_destroy", serverSet.c_str());
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "network_test", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, nullptr), LP_OK);
+    ASSERT_EQ(lp_token_save("plain_async_destroy", "secret"), LP_OK);
+    AsyncDestroyState state;
+    state.client = lp_client_create("plain_async_destroy", "network_test",
+                                     clientJson.c_str(), clientJson.c_str());
+    ASSERT_NE(state.client, nullptr);
+    ASSERT_EQ(lp_client_set_subscription_status_cb(
+        state.client, onAsyncDestroyStatus, &state), 1);
+    lp_subscription* subscription = lp_subscribe(
+        state.client, "tick", onAsyncDestroyEvent, &state);
+    ASSERT_NE(subscription, nullptr);
+    for (int attempt = 0; attempt < 200 && !state.armed; ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_TRUE(state.armed);
+    ASSERT_EQ(lp_invoke_async(state.client, "answer", "[]", 1000,
+                              onAsyncDestroyResult, &state), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        ASSERT_TRUE(state.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return state.entered;
+        }));
+    }
+    ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.proceed = true;
+    }
+    state.changed.notify_all();
+    if (!state.done) {
+        for (int attempt = 0; attempt < 200 && !state.done; ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!state.done) {
+        ADD_FAILURE() << "Async-result destruction blocked behind network event";
+        std::_Exit(2); // Each GTest case runs in a separate CTest process.
+    }
+    EXPECT_EQ(state.success.load(), 1);
+    EXPECT_EQ(state.events.load(), 0);
+    lp_unsubscribe(subscription);
+    lp_provider_destroy(provider);
+    if (tls) std::filesystem::remove_all(directory);
+}
+
+TEST(PlainNetworkCAbi, TcpAsyncResultCanDestroyClientWithQueuedEvent)
+{
+    runAsyncResultDestroyWithQueuedNetworkEvent(false);
+}
+
+TEST(PlainNetworkCAbi, TlsAsyncResultCanDestroyClientWithQueuedEvent)
+{
+    runAsyncResultDestroyWithQueuedNetworkEvent(true);
 }
 
 TEST(PlainNetworkCAbi, SilentTlsPeerCannotOutliveInvocationDeadline)

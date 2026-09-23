@@ -1195,7 +1195,10 @@ void lp_client_destroy(lp_client* client)
         networkWire = std::move(client->state->networkWire);
     }
     if (networkWire) networkWire->stop("client destroyed");
-    client->state->wire->close();
+    if (fromCallback)
+        client->state->wire->closeWithoutWaitingForCallbacks();
+    else
+        client->state->wire->close();
     if (client->state->subscriptionWorker.joinable()) {
         if (fromCallback
             || client->state->subscriptionWorker.get_id() == std::this_thread::get_id())
@@ -1254,6 +1257,7 @@ int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
             ? rpcToJson(result->value).dump()
             : errorJson(error == "token not recognized" ? "unauthorized" : "transport",
                         error, state->target);
+        CallbackScope scope(state.get());
         callback(result ? 1 : 0, text.c_str(), userData);
     }).detach();
     return LP_OK;
