@@ -30,6 +30,15 @@ public:
         const std::vector<Variant>& arguments)>;
     using DisconnectHandler = std::function<void(const std::string& reason)>;
 
+    // Why connect, acquire or call produced nothing, in the terms of the
+    // protocol's call errors (logos_call_error.h).
+    enum class Failure {
+        Unavailable, // nothing listening, or the object is not published
+        Timeout,     // the deadline passed with the call sent
+        Transport,   // the connection failed or closed
+        Failed,      // the call could not be made, or its reply not read
+    };
+
     Client();
     ~Client();
     Client(const Client&) = delete;
@@ -37,7 +46,8 @@ public:
 
     bool connect(const std::string& localUrlOrPath,
                  std::chrono::milliseconds timeout,
-                 std::string* error = nullptr);
+                 std::string* error = nullptr,
+                 Failure* failure = nullptr);
     void close();
     // Stop I/O without waiting for public event callbacks. Use when the caller
     // itself holds a callback lock; the executor is drained on final teardown.
@@ -46,7 +56,8 @@ public:
 
     bool acquire(const std::string& object,
                  std::chrono::milliseconds timeout,
-                 std::string* error = nullptr);
+                 std::string* error = nullptr,
+                 Failure* failure = nullptr);
     std::optional<ClassDefinition> definition(const std::string& object) const;
 
     std::optional<Variant> call(
@@ -54,7 +65,8 @@ public:
         const std::string& methodSignature,
         std::vector<Variant> arguments,
         std::chrono::milliseconds timeout,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        Failure* failure = nullptr);
 
     void setEventHandler(EventHandler handler);
     // Runs on the reader before public callback dispatch. Returning true

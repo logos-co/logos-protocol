@@ -719,6 +719,7 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
         bool done = false;
         Variant value;
         std::string error;
+        Client::Failure failure = Client::Failure::Transport;
     };
 
     mutable std::mutex mu;
@@ -799,6 +800,7 @@ struct Client::Impl : std::enable_shared_from_this<Client::Impl> {
             pending.erase(it);
             call->value = std::move(value);
             call->error = std::move(error);
+            if (!call->error.empty()) call->failure = Client::Failure::Failed;
             call->done = true;
         }
         call->cv.notify_all();
@@ -974,13 +976,18 @@ Client::~Client() { close(); }
 
 bool Client::connect(const std::string& localUrlOrPath,
                      std::chrono::milliseconds timeout,
-                     std::string* error)
+                     std::string* error,
+                     Failure* failure)
 {
+    const auto fail = [failure](Failure kind) {
+        if (failure) *failure = kind;
+        return false;
+    };
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     closeConnection(false);
     const std::string path = localSocketPath(localUrlOrPath);
     const NativeHandle socket = connectSocket(path, timeout, error);
-    if (socket == kInvalidHandle) return false;
+    if (socket == kInvalidHandle) return fail(Failure::Unavailable);
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
         if (!m_impl->eventExecutor) m_impl->eventExecutor = CallbackExecutor::start();
@@ -1008,7 +1015,7 @@ bool Client::connect(const std::string& localUrlOrPath,
         lock.unlock();
         close();
         setError(error, why);
-        return false;
+        return fail(Failure::Transport);
     }
     return true;
 }
@@ -1051,8 +1058,13 @@ bool Client::isConnected() const
 
 bool Client::acquire(const std::string& object,
                      std::chrono::milliseconds timeout,
-                     std::string* error)
+                     std::string* error,
+                     Failure* failure)
 {
+    const auto fail = [failure](Failure kind) {
+        if (failure) *failure = kind;
+        return false;
+    };
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     {
         std::unique_lock<std::mutex> lock(m_impl->mu);
@@ -1060,11 +1072,11 @@ bool Client::acquire(const std::string& object,
                 return m_impl->advertised.count(object) != 0 || !m_impl->failure.empty();
             })) {
             setError(error, "object was not advertised before the acquire deadline: " + object);
-            return false;
+            return fail(Failure::Unavailable);
         }
         if (!m_impl->failure.empty()) {
             setError(error, m_impl->failure);
-            return false;
+            return fail(Failure::Transport);
         }
         if (m_impl->definitions.count(object) != 0) return true;
         const auto unusable = [&] {
@@ -1073,14 +1085,14 @@ bool Client::acquire(const std::string& object,
             setError(error, "unusable QtRO definition for " + object + ": " + it->second);
             return true;
         };
-        if (unusable()) return false;
+        if (unusable()) return fail(Failure::Failed);
         if (m_impl->requested.insert(object).second) {
             lock.unlock();
             std::string writeError;
             if (!m_impl->send(addObjectPacket(object), &writeError, deadline)) {
                 setError(error, writeError);
                 closeConnection(false);
-                return false;
+                return fail(Failure::Transport);
             }
             lock.lock();
         }
@@ -1090,13 +1102,13 @@ bool Client::acquire(const std::string& object,
                     || !m_impl->failure.empty();
             })) {
             setError(error, "dynamic object definition timed out: " + object);
-            return false;
+            return fail(Failure::Unavailable);
         }
         if (!m_impl->failure.empty()) {
             setError(error, m_impl->failure);
-            return false;
+            return fail(Failure::Transport);
         }
-        if (unusable()) return false;
+        if (unusable()) return fail(Failure::Failed);
     }
     return true;
 }
@@ -1114,14 +1126,19 @@ std::optional<Variant> Client::call(
     const std::string& methodSignature,
     std::vector<Variant> arguments,
     std::chrono::milliseconds timeout,
-    std::string* error)
+    std::string* error,
+    Failure* failure)
 {
+    const auto fail = [failure](Failure kind) -> std::optional<Variant> {
+        if (failure) *failure = kind;
+        return std::nullopt;
+    };
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     if (!acquire(object,
                  std::max(std::chrono::milliseconds::zero(),
                           std::chrono::duration_cast<std::chrono::milliseconds>(
                               deadline - std::chrono::steady_clock::now())),
-                 error)) return std::nullopt;
+                 error, failure)) return std::nullopt;
 
     std::int32_t methodIndex = -1;
     std::int32_t serial = -1;
@@ -1132,7 +1149,7 @@ std::optional<Variant> Client::call(
         const auto definition = m_impl->definitions.find(object);
         if (definition == m_impl->definitions.end()) {
             setError(error, "object was removed before the call: " + object);
-            return std::nullopt;
+            return fail(Failure::Unavailable);
         }
         const auto& methods = definition->second.methodDefinitions;
         const auto it = std::find_if(methods.begin(), methods.end(), [&](const auto& method) {
@@ -1140,7 +1157,7 @@ std::optional<Variant> Client::call(
         });
         if (it == methods.end()) {
             setError(error, "method is absent from dynamic object: " + methodSignature);
-            return std::nullopt;
+            return fail(Failure::Failed);
         }
         methodIndex = static_cast<std::int32_t>(std::distance(methods.begin(), it));
         serial = m_impl->nextSerial == std::numeric_limits<std::int32_t>::max()
@@ -1155,7 +1172,7 @@ std::optional<Variant> Client::call(
         std::lock_guard<std::mutex> lock(m_impl->mu);
         m_impl->pending.erase(serial);
         setError(error, std::string("cannot encode QtRO call: ") + exception.what());
-        return std::nullopt;
+        return fail(Failure::Failed);
     }
     std::string writeError;
     if (!m_impl->send(request, &writeError, deadline)) {
@@ -1165,18 +1182,18 @@ std::optional<Variant> Client::call(
         }
         closeConnection(false);
         setError(error, writeError);
-        return std::nullopt;
+        return fail(Failure::Transport);
     }
 
     std::unique_lock<std::mutex> lock(m_impl->mu);
     if (!pending->cv.wait_until(lock, deadline, [&] { return pending->done; })) {
         m_impl->pending.erase(serial);
         setError(error, "QtRO invocation timed out: " + object + "." + methodSignature);
-        return std::nullopt;
+        return fail(Failure::Timeout);
     }
     if (!pending->error.empty()) {
         setError(error, pending->error);
-        return std::nullopt;
+        return fail(pending->failure);
     }
     return pending->value;
 }

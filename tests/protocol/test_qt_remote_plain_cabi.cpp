@@ -423,6 +423,76 @@ void runDestroyWithQueuedCallback(DestroyCallbackKind kind, QueuedWork queued,
     lp_provider_destroy(provider);
 }
 
+std::string errorCode(const char* errorJson)
+{
+    const auto parsed = nlohmann::json::parse(errorJson ? errorJson : "null", nullptr, false);
+    return parsed.is_object() && parsed.contains("code") && parsed["code"].is_string()
+        ? parsed["code"].get<std::string>() : std::string();
+}
+
+struct AsyncError {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool done = false;
+    std::string json;
+};
+
+void onAsyncError(int, const char* json, void* userData)
+{
+    auto* result = static_cast<AsyncError*>(userData);
+    std::lock_guard<std::mutex> lock(result->mutex);
+    result->json = json ? json : "";
+    result->done = true;
+    result->changed.notify_all();
+}
+
+// Detector: every failure but a refused token came back as "transport", a code
+// outside the documented vocabulary, where the Qt C ABI said which it was.
+TEST(QtRemotePlainCabiTest, CallErrorsUseTheDocumentedCodes)
+{
+    setInstanceId("qtro_cabi_error_codes_");
+    ASSERT_EQ(lp_token_save("absent_fixture", "secret"), LP_OK);
+    lp_client* absent = lp_client_create("absent_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(absent, nullptr);
+    char* result = nullptr;
+    char* error = nullptr;
+    EXPECT_NE(lp_invoke(absent, "echo", R"(["x"])", 300, &result, &error), LP_OK);
+    EXPECT_EQ(errorCode(error), "object_unavailable") << (error ? error : "");
+    lp_string_free(result);
+    lp_string_free(error);
+    AsyncError async;
+    ASSERT_EQ(lp_invoke_async(absent, "echo", R"(["x"])", 300, onAsyncError, &async), LP_OK);
+    {
+        std::unique_lock<std::mutex> lock(async.mutex);
+        ASSERT_TRUE(async.changed.wait_for(lock, std::chrono::seconds(5), [&] { return async.done; }));
+    }
+    EXPECT_EQ(errorCode(async.json.c_str()), "object_unavailable") << async.json;
+    lp_client_destroy(absent);
+
+    BlockingDispatchFixture blocking;
+    lp_provider* provider = lp_provider_create("slow_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, blockingDispatch, blockingMethods, nullptr,
+                                   &blocking), LP_OK);
+    ASSERT_EQ(lp_token_save("slow_fixture", "secret"), LP_OK);
+    lp_client* slow = lp_client_create("slow_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(slow, nullptr);
+    result = nullptr;
+    error = nullptr;
+    EXPECT_NE(lp_invoke(slow, "block", "[]", 500, &result, &error), LP_OK);
+    EXPECT_EQ(errorCode(error), "timeout") << (error ? error : "");
+    lp_string_free(result);
+    lp_string_free(error);
+    {
+        std::lock_guard<std::mutex> lock(blocking.mutex);
+        blocking.release = true;
+    }
+    blocking.changed.notify_all();
+    lp_client_destroy(slow);
+    lp_provider_destroy(provider);
+}
+
 // Detector: a transport set that did not parse (the plain host was handed
 // base64) was accepted and served local only, dropping its TCP listeners.
 TEST(QtRemotePlainCabiTest, AProviderIsNotCreatedFromAnUnusableTransportSet)

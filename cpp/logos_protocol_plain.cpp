@@ -3,6 +3,7 @@
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_network.h"
 #include "logos_codec.h"
+#include "logos_call_error.h"
 #include "logos_transport_config_json.h"
 
 #include <nlohmann/json.hpp>
@@ -518,12 +519,28 @@ bool hasSubscriptionPhase(const std::shared_ptr<ClientState>& state,
     return false;
 }
 
-bool ensureConnected(const std::shared_ptr<ClientState>& state,
-                     int timeout, std::string& error)
+const char* callErrorCode(Client::Failure failure)
 {
+    switch (failure) {
+    case Client::Failure::Unavailable: return "object_unavailable";
+    case Client::Failure::Timeout: return "timeout";
+    case Client::Failure::Failed: return "call_failed";
+    case Client::Failure::Transport: break;
+    }
+    return "transport_error";
+}
+
+// `code`, when given, names a failure in the protocol's call-error vocabulary.
+bool ensureConnected(const std::shared_ptr<ClientState>& state,
+                     int timeout, std::string& error, std::string* code = nullptr)
+{
+    const auto fail = [code](const char* value) {
+        if (code) *code = value;
+        return false;
+    };
     if (timeout <= 0 || !state->alive) {
         error = "connection timed out";
-        return false;
+        return fail(state->alive ? "timeout" : "transport_error");
     }
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
@@ -531,17 +548,17 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
                                                       std::defer_lock);
     if (!connectionLock.try_lock_until(deadline)) {
         error = "connection timed out";
-        return false;
+        return fail("timeout");
     }
     if (!state->alive) {
         error = "client destroyed";
-        return false;
+        return fail("transport_error");
     }
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
     if (remaining <= std::chrono::milliseconds::zero()) {
         error = "connection timed out";
-        return false;
+        return fail("timeout");
     }
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
@@ -549,11 +566,11 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         if (state->networkWire) state->networkWire->stop("reconnecting");
         auto wire = logos::plain::abi::connect(
             state->targetConfig, remaining, error, &state->alive);
-        if (!wire) return false;
+        if (!wire) return fail("object_unavailable");
         if (!state->alive) {
             wire->stop("client destroyed");
             error = "client destroyed";
-            return false;
+            return fail("transport_error");
         }
         std::weak_ptr<ClientState> weak = state;
         wire->setErrorHandler([weak](const std::string&) {
@@ -572,8 +589,9 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         return true;
     }
     if (state->wire->isConnected()) return true;
-    return state->wire->connect(endpoint(state->target),
-                                remaining, &error);
+    Client::Failure failure = Client::Failure::Transport;
+    if (state->wire->connect(endpoint(state->target), remaining, &error, &failure)) return true;
+    return fail(callErrorCode(failure));
 }
 
 void subscriptionLoop(const std::shared_ptr<ClientState>& state)
@@ -654,15 +672,16 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
                                     const std::string& object,
                                     const std::string& method,
                                     const json& args, const std::string& token,
-                                    int timeout, std::string& error)
+                                    int timeout, std::string& error, std::string& code)
 {
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
-    if (!ensureConnected(state, timeout, error)) return std::nullopt;
+    if (!ensureConnected(state, timeout, error, &code)) return std::nullopt;
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
     if (remaining <= std::chrono::milliseconds::zero()) {
         error = "invocation timed out";
+        code = "timeout";
         return std::nullopt;
     }
     std::shared_ptr<RpcConnectionBase> wire;
@@ -671,12 +690,14 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
                                                 std::defer_lock);
         if (!lock.try_lock_until(deadline)) {
             error = "invocation timed out";
+            code = "timeout";
             return std::nullopt;
         }
         wire = state->networkWire;
     }
     if (!wire || !wire->isOpen()) {
         error = "connection closed";
+        code = "transport_error";
         return std::nullopt;
     }
     CallMessage request;
@@ -690,11 +711,14 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
     if (future.wait_until(deadline) != std::future_status::ready) {
         wire->cancelPending(id);
         error = "invocation timed out";
+        code = "timeout";
         return std::nullopt;
     }
     auto result = future.get();
     if (!result.ok) {
-        error = result.err.empty() ? result.errCode : result.err;
+        const logos::CallError failure = logos::callErrorFromWire(object, result.errCode, result.err);
+        error = failure.message;
+        code = failure.code;
         return std::nullopt;
     }
     return std::move(result.value);
@@ -737,7 +761,7 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
                                   const std::string& object,
                                   const std::string& signature,
                                   std::vector<Variant> arguments,
-                                  int timeout, std::string& error)
+                                  int timeout, std::string& error, std::string& code)
 {
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
@@ -746,16 +770,24 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count()));
     };
+    Client::Failure failure = Client::Failure::Transport;
+    const auto failed = [&]() -> std::optional<Variant> {
+        code = callErrorCode(failure);
+        return std::nullopt;
+    };
     if (object != state->target) {
         Client temporary;
-        if (!temporary.connect(endpoint(object), std::chrono::milliseconds(remaining()), &error))
-            return std::nullopt;
-        return temporary.call(object, signature, std::move(arguments),
-                              std::chrono::milliseconds(remaining()), &error);
+        if (!temporary.connect(endpoint(object), std::chrono::milliseconds(remaining()), &error,
+                               &failure))
+            return failed();
+        auto result = temporary.call(object, signature, std::move(arguments),
+                                     std::chrono::milliseconds(remaining()), &error, &failure);
+        return result ? result : failed();
     }
-    if (!ensureConnected(state, remaining(), error)) return std::nullopt;
-    return state->wire->call(object, signature, std::move(arguments),
-                             std::chrono::milliseconds(remaining()), &error);
+    if (!ensureConnected(state, remaining(), error, &code)) return std::nullopt;
+    auto result = state->wire->call(object, signature, std::move(arguments),
+                                    std::chrono::milliseconds(remaining()), &error, &failure);
+    return result ? result : failed();
 }
 
 std::string mintToken(const std::shared_ptr<ClientState>& state,
@@ -860,12 +892,15 @@ std::string tokenFor(const std::shared_ptr<ClientState>& state, int timeout,
     return token;
 }
 
+// On failure `code` is the protocol's call-error code for it (logos_call_error.h).
 std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                               const std::string& method, const json& args,
-                              int timeout, std::string& error)
+                              int timeout, std::string& error, std::string& code)
 {
+    code = "transport_error";
     if (!args.is_array()) {
         error = "arguments must be a JSON array";
+        code = "invalid_arg";
         return std::nullopt;
     }
     const auto deadline = std::chrono::steady_clock::now()
@@ -879,7 +914,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         auto result = networkCall(state, state->target, method, args, token,
-                                  remaining(), error);
+                                  remaining(), error, code);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
             if (!value || !value->isMap()) return false;
             const RpcValue* status = value->asMap().find(kStatusKey);
@@ -889,10 +924,11 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             token = tokenFor(state, remaining(), error, token);
             if (!token.empty())
                 result = networkCall(state, state->target, method, args,
-                                     token, remaining(), error);
+                                     token, remaining(), error, code);
         }
         if (unauthorized(result)) {
             error = "token not recognized";
+            code = "unauthorized";
             return std::nullopt;
         }
         if (!result) return std::nullopt;
@@ -904,10 +940,14 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                     return !state->alive || state->completions.count(completion) != 0;
                 })) {
                 error = "deferred invocation timed out";
+                code = "timeout";
                 return std::nullopt;
             }
             auto found = state->completions.find(completion);
-            if (found == state->completions.end()) return std::nullopt;
+            if (found == state->completions.end()) {
+                error = "client destroyed";
+                return std::nullopt;
+            }
             Variant completed = Variant::fromRpc(std::move(found->second));
             state->completions.erase(found);
             return completed;
@@ -918,7 +958,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     auto result = directCall(state, state->target,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
-         std::move(arguments)}, remaining(), error);
+         std::move(arguments)}, remaining(), error, code);
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
         token = tokenFor(state, remaining(), error, token);
         if (!token.empty()) {
@@ -926,14 +966,16 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             result = directCall(state, state->target,
                 "callRemoteMethod(QString,QString,QVariantList)",
                 {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
-                 std::move(arguments)}, remaining(), error);
+                 std::move(arguments)}, remaining(), error, code);
         }
     }
     if (result && isUnauthorized(*result)) {
         error = "token not recognized";
+        code = "unauthorized";
         return std::nullopt;
     }
     if (result && result->opaque) {
+        code = "call_failed";
         error = "reply carries a Qt type the plain runtime cannot represent (metatype "
             + std::to_string(static_cast<std::uint32_t>(result->type))
             + (result->customType.empty() ? "" : " " + result->customType) + ")";
@@ -947,10 +989,14 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                     return !state->alive || state->completions.count(completion) != 0;
                 })) {
                 error = "deferred invocation timed out";
+                code = "timeout";
                 return std::nullopt;
             }
             auto found = state->completions.find(completion);
-            if (found == state->completions.end()) return std::nullopt;
+            if (found == state->completions.end()) {
+                error = "client destroyed";
+                return std::nullopt;
+            }
             Variant completed = Variant::fromRpc(std::move(found->second));
             state->completions.erase(found);
             return completed;
@@ -1385,11 +1431,10 @@ try {
         return LP_ERR_INVALID_ARG;
     }
     std::string error;
-    auto result = invoke(client->state, method, args, timeoutMs(timeout), error);
+    std::string code;
+    auto result = invoke(client->state, method, args, timeoutMs(timeout), error, code);
     if (!result) {
-        if (outErrorJson) *outErrorJson = duplicate(errorJson(
-            error == "token not recognized" ? "unauthorized" : "transport",
-            error, client->state->target));
+        if (outErrorJson) *outErrorJson = duplicate(errorJson(code.c_str(), error, client->state->target));
         return LP_ERR_UNAVAILABLE;
     }
     if (outResultJson) *outResultJson = duplicate(dumpJson(rpcToJson(result->value)));
@@ -1408,13 +1453,13 @@ try {
     const std::string methodName = method;
     std::function<void()> call = [state, methodName, args, timeout, callback, userData] {
         std::string error;
-        auto result = invoke(state, methodName, args, timeoutMs(timeout), error);
+        std::string code;
+        auto result = invoke(state, methodName, args, timeoutMs(timeout), error, code);
         std::lock_guard<std::recursive_mutex> lock(state->callbackMutex);
         if (!state->alive) return;
         const std::string text = result
             ? dumpJson(rpcToJson(result->value))
-            : errorJson(error == "token not recognized" ? "unauthorized" : "transport",
-                        error, state->target);
+            : errorJson(code.c_str(), error, state->target);
         CallbackScope scope(state.get());
         callback(result ? 1 : 0, text.c_str(), userData);
     };
@@ -1574,8 +1619,9 @@ try {
     std::string error;
     if (client->state->targetConfig.protocol == LogosProtocol::Tcp
         || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+        std::string code;
         auto result = networkCall(client->state, client->state->target,
-            "getPluginInterface", json::array(), {}, kDefaultTimeoutMs, error);
+            "getPluginInterface", json::array(), {}, kDefaultTimeoutMs, error, code);
         return result ? duplicate(dumpJson(rpcToJson(*result))) : nullptr;
     }
     if (!ensureConnected(client->state, kDefaultTimeoutMs, error)) return nullptr;
@@ -1701,10 +1747,11 @@ try {
         wire->sendToken({authToken, moduleName, token});
         return LP_OK;
     }
+    std::string code;
     auto result = directCall(client->state, client->state->target,
         "informModuleToken(QString,QString,QString)",
         {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
-         Variant::fromRpc(RpcValue{token})}, kDefaultTimeoutMs, error);
+         Variant::fromRpc(RpcValue{token})}, kDefaultTimeoutMs, error, code);
     return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
 } catch (...) {
     return LP_ERR_INTERNAL;
