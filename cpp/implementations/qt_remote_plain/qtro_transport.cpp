@@ -971,13 +971,21 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::map<std::string, Object> objects;
     std::vector<std::shared_ptr<Connection>> connections;
 
+    // The caller holds connection.sendMu.
+    static bool writeLocked(Connection& connection,
+                            const std::vector<std::uint8_t>& frame,
+                            std::string* error = nullptr)
+    {
+        const NativeHandle current = connection.fd.load();
+        return current != kInvalidHandle && writeAll(current, frame, error);
+    }
+
     bool send(const std::shared_ptr<Connection>& connection,
               const std::vector<std::uint8_t>& frame,
               std::string* error = nullptr)
     {
         std::lock_guard<std::mutex> lock(connection->sendMu);
-        const NativeHandle current = connection->fd.load();
-        return current != kInvalidHandle && writeAll(current, frame, error);
+        return writeLocked(*connection, frame, error);
     }
 
     std::vector<ObjectInfo> objectList() const
@@ -1012,6 +1020,9 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 if (frame.type == PacketType::AddObject) {
                     Reader payload(frame.payload);
                     const bool dynamic = payload.boolean();
+                    // Register and answer under one send lock: an event that
+                    // reaches a Qt replica before its definition crashes it.
+                    std::lock_guard<std::mutex> sendLock(connection->sendMu);
                     Object object;
                     bool found = false;
                     {
@@ -1024,7 +1035,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                         }
                     }
                     if (found)
-                        (void)send(connection, dynamic
+                        (void)writeLocked(*connection, dynamic
                             ? initDynamicPacket(frame.name, object.definition)
                             : initPacket(frame.name));
                     continue;
@@ -1154,6 +1165,9 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
 #endif
             auto connection = std::make_shared<Connection>(accepted);
             std::vector<ObjectInfo> currentObjects;
+            // publish() sees the connection as soon as it is registered; hold
+            // its send lock so nothing can precede the handshake.
+            std::unique_lock<std::mutex> greeting(connection->sendMu);
             {
                 std::lock_guard<std::mutex> lock(mu);
                 if (!running) {
@@ -1163,10 +1177,10 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 connections.push_back(connection);
                 currentObjects = objectList();
             }
-            if (!send(connection, handshakePacket())
-                || !send(connection, objectListPacket(currentObjects))) {
-                closeHandle(connection->fd);
-            }
+            const bool greeted = writeLocked(*connection, handshakePacket())
+                && writeLocked(*connection, objectListPacket(currentObjects));
+            greeting.unlock();
+            if (!greeted) closeHandle(connection->fd);
             auto state = shared_from_this();
             std::thread([state, connection] { state->connectionLoop(connection); }).detach();
         }

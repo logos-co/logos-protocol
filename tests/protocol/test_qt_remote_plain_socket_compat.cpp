@@ -565,6 +565,69 @@ TEST(QtRemotePlainSocketCompatTest, QtReplicaRecoversAfterPlainServerRepublishes
     server.stop();
 }
 
+// Detector: Qt 6.9.2 dereferences a null metaobject when an event reaches a
+// replica before its definition (qremoteobjectnode.cpp:1700).
+TEST(QtRemotePlainSocketCompatTest, DefinitionAlwaysPrecedesEvents)
+{
+    const std::string path = uniqueSocketPath("definition_first");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.publish(answeringFixture("x"), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    std::atomic<bool> emitting{true};
+    std::thread emitter([&] {
+        RpcList data;
+        data.items.emplace_back("payload");
+        const std::vector<Variant> arguments{Variant::fromRpc(RpcValue{"tick"}),
+                                             Variant::fromRpc(RpcValue{data})};
+        while (emitting) (void)server.emitSignal("fixture", 0, arguments);
+    });
+
+    int eventFirst = 0;
+    for (int round = 0; round < 300; ++round) {
+        auto peer = connectUnix(path);
+        ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::Handshake);
+        ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::ObjectList);
+        writeAll(peer.get(), addObjectPacket("fixture"));
+        if (decodeFrame(readFrame(peer.get())).type != PacketType::InitDynamic)
+            ++eventFirst;
+    }
+    emitting = false;
+    emitter.join();
+    server.stop();
+    EXPECT_EQ(eventFirst, 0);
+}
+
+// Detector: Qt drops a connection whose first frame is not the handshake and
+// never retries that endpoint.
+TEST(QtRemotePlainSocketCompatTest, HandshakeIsAlwaysTheFirstFrame)
+{
+    const std::string path = uniqueSocketPath("handshake_first");
+    std::string error;
+    Server server;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    std::atomic<bool> churning{true};
+    std::thread churn([&] {
+        while (churning) {
+            (void)server.publish(answeringFixture("x"));
+            server.unpublish("fixture");
+        }
+    });
+
+    int wrongFirst = 0;
+    for (int round = 0; round < 1000; ++round) {
+        auto peer = connectUnix(path);
+        if (decodeFrame(readFrame(peer.get())).type != PacketType::Handshake)
+            ++wrongFirst;
+    }
+    churning = false;
+    churn.join();
+    server.stop();
+    EXPECT_EQ(wrongFirst, 0);
+}
+
 #else
 
 TEST(QtRemotePlainSocketCompatTest, WindowsUsesTheNewPlainTransportOnly)
