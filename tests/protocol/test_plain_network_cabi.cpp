@@ -1,17 +1,23 @@
 #include "logos_protocol.h"
+#include "logos_protocol_plain_network.h"
 
 #include <gtest/gtest.h>
 
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/write.hpp>
 
 #include <nlohmann/json.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
@@ -110,9 +116,9 @@ void onAsyncDestroyResult(int success, const char*, void* user)
 }
 
 bool writeSelfSignedCert(const std::filesystem::path& certPath,
-                         const std::filesystem::path& keyPath)
+                         const std::filesystem::path& keyPath, bool rsa = false)
 {
-    EVP_PKEY* key = EVP_EC_gen("P-256");
+    EVP_PKEY* key = rsa ? EVP_RSA_gen(2048) : EVP_EC_gen("P-256");
     X509* cert = X509_new();
     bool ok = key && cert;
     if (ok) {
@@ -373,6 +379,322 @@ TEST(PlainNetworkCAbi, TcpAsyncResultCanDestroyClientWithQueuedEvent)
 TEST(PlainNetworkCAbi, TlsAsyncResultCanDestroyClientWithQueuedEvent)
 {
     runAsyncResultDestroyWithQueuedNetworkEvent(true);
+}
+
+std::uint16_t freePort()
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor reservation(io,
+        {boost::asio::ip::address_v4::loopback(), 0});
+    return reservation.local_endpoint().port();
+}
+
+std::string networkConfig(const char* protocol, std::uint16_t port, const char* extra = "")
+{
+    return std::string(R"({"protocol":")") + protocol + R"(","host":"127.0.0.1","port":)"
+        + std::to_string(port) + extra + "}";
+}
+
+std::filesystem::path certificateDirectory(const char* name, bool rsa = false)
+{
+    const auto directory = std::filesystem::temp_directory_path()
+        / (std::string(name) + "_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory);
+    EXPECT_TRUE(writeSelfSignedCert(directory / "cert.pem", directory / "key.pem", rsa));
+    return directory;
+}
+
+std::string tlsServerConfig(std::uint16_t port, const std::filesystem::path& directory)
+{
+    nlohmann::json config = nlohmann::json::parse(networkConfig("tcp_ssl", port));
+    config["cert_file"] = (directory / "cert.pem").string();
+    config["key_file"] = (directory / "key.pem").string();
+    return config.dump();
+}
+
+bool waitForEvent(lp_provider* provider, EventResult& received, std::chrono::seconds budget)
+{
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (provider) EXPECT_EQ(lp_provider_emit_event(provider, "tick", "[1]"), LP_OK);
+        std::unique_lock<std::mutex> lock(received.mutex);
+        if (received.changed.wait_for(lock, std::chrono::milliseconds(200),
+                                      [&] { return !received.value.empty(); }))
+            return true;
+    }
+    return false;
+}
+
+// Forwards bytes both ways, each chunk late by `delay`: a slow network path.
+class DelayingProxy {
+public:
+    DelayingProxy(std::uint16_t target, std::chrono::milliseconds delay)
+        : acceptor_(io_, {boost::asio::ip::address_v4::loopback(), 0}),
+          target_(target), delay_(delay), thread_([this] { acceptLoop(); }) {}
+
+    ~DelayingProxy()
+    {
+        // Closing the acceptor does not wake a blocked accept() on Linux.
+        stopped_ = true;
+        boost::system::error_code ignored;
+        boost::asio::ip::tcp::socket wake(io_);
+        wake.connect(acceptor_.local_endpoint(), ignored);
+        thread_.join();
+        acceptor_.close(ignored);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& socket : sockets_)
+                socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
+        }
+        for (auto& pump : pumps_) pump.join();
+    }
+
+    std::uint16_t port() const { return acceptor_.local_endpoint().port(); }
+
+private:
+    using Socket = std::shared_ptr<boost::asio::ip::tcp::socket>;
+
+    void acceptLoop()
+    {
+        for (;;) {
+            auto client = std::make_shared<boost::asio::ip::tcp::socket>(io_);
+            boost::system::error_code error;
+            acceptor_.accept(*client, error);
+            if (error || stopped_) return;
+            auto server = std::make_shared<boost::asio::ip::tcp::socket>(io_);
+            server->connect({boost::asio::ip::address_v4::loopback(), target_}, error);
+            if (error) continue;
+            std::lock_guard<std::mutex> lock(mutex_);
+            sockets_.push_back(client);
+            sockets_.push_back(server);
+            pumps_.emplace_back([this, client, server] { pump(client, server); });
+            pumps_.emplace_back([this, client, server] { pump(server, client); });
+        }
+    }
+
+    void pump(const Socket& from, const Socket& to)
+    {
+        std::array<char, 16384> buffer;
+        boost::system::error_code error;
+        for (;;) {
+            const std::size_t count = from->read_some(boost::asio::buffer(buffer), error);
+            if (error) break;
+            std::this_thread::sleep_for(delay_);
+            boost::asio::write(*to, boost::asio::buffer(buffer.data(), count), error);
+            if (error) break;
+        }
+        to->shutdown(boost::asio::ip::tcp::socket::shutdown_send, error);
+    }
+
+    boost::asio::io_context io_;
+    boost::asio::ip::tcp::acceptor acceptor_;
+    std::uint16_t target_;
+    std::chrono::milliseconds delay_;
+    std::atomic<bool> stopped_{false};
+    std::mutex mutex_;
+    std::vector<Socket> sockets_;
+    std::vector<std::thread> pumps_;
+    std::thread thread_;
+};
+
+// Detector: a subscription dialled with 250 ms for DNS, TCP and TLS together,
+// so behind a path slower than that a subscribe-only client never connected.
+TEST(PlainNetworkCAbi, ASubscriptionConnectsOverASlowTlsPath)
+{
+    const auto certificates = certificateDirectory("plain_slow_tls");
+    const std::uint16_t port = freePort();
+    const std::string set = "[" + tlsServerConfig(port, certificates) + "]";
+    lp_provider* provider = lp_provider_create("plain_slow_tls", set.c_str());
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "network_test", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, nullptr), LP_OK);
+    ASSERT_EQ(lp_token_save("plain_slow_tls", "secret"), LP_OK);
+
+    DelayingProxy proxy(port, std::chrono::milliseconds(200));
+    const std::string config = networkConfig("tcp_ssl", proxy.port(), R"(,"verify_peer":false)");
+    lp_client* client = lp_client_create("plain_slow_tls", "network_test",
+                                         config.c_str(), config.c_str());
+    ASSERT_NE(client, nullptr);
+    EventResult received;
+    lp_subscription* subscription = lp_subscribe(client, "tick", event, &received);
+    ASSERT_NE(subscription, nullptr);
+    EXPECT_TRUE(waitForEvent(provider, received, std::chrono::seconds(6)))
+        << "no event arrived through a 200 ms path";
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+    std::filesystem::remove_all(certificates);
+}
+
+// Detector: an event whose CBOR text was not valid UTF-8 threw out of the
+// consumer's event thread and aborted the process; the Qt client shows U+FFFD.
+TEST(PlainNetworkCAbi, AnEventWithInvalidUtf8ArrivesReplaced)
+{
+    using namespace logos::plain;
+    LogosTransportConfig serverConfig;
+    serverConfig.protocol = LogosProtocol::Tcp;
+    serverConfig.port = freePort();
+    serverConfig.codec = LogosWireCodec::Cbor;
+    logos::plain::abi::ServerEndpoint endpoint(serverConfig,
+        [](const CallMessage& request) {
+            ResultMessage result;
+            result.id = request.id;
+            result.ok = true;
+            return result;
+        },
+        [](const MethodsMessage& request) {
+            MethodsResultMessage result;
+            result.id = request.id;
+            result.ok = true;
+            return result;
+        },
+        [](const TokenMessage&) {});
+    ASSERT_TRUE(endpoint.start());
+
+    const std::string config = networkConfig("tcp", serverConfig.port, R"(,"codec":"cbor")");
+    lp_client* client = lp_client_create("plain_utf8_probe", "network_test",
+                                         config.c_str(), config.c_str());
+    ASSERT_NE(client, nullptr);
+    EventResult received;
+    lp_subscription* subscription = lp_subscribe(client, "tick", event, &received);
+    ASSERT_NE(subscription, nullptr);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool arrived = false;
+    while (!arrived && std::chrono::steady_clock::now() < deadline) {
+        endpoint.emit("plain_utf8_probe", "tick", {RpcValue{std::string("bad \xff\xfe")}});
+        std::unique_lock<std::mutex> lock(received.mutex);
+        arrived = received.changed.wait_for(lock, std::chrono::milliseconds(200),
+                                            [&] { return !received.value.empty(); });
+    }
+    ASSERT_TRUE(arrived);
+    EXPECT_NE(received.value.find("\xEF\xBF\xBD"), std::string::npos) << received.value;
+    lp_unsubscribe(subscription);
+    lp_client_destroy(client);
+    endpoint.stop();
+}
+
+struct SlowHandlers {
+    std::atomic<int> methods{0};
+    std::atomic<int> tokens{0};
+};
+
+char* slowMethods(void* user)
+{
+    ++static_cast<SlowHandlers*>(user)->methods;
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    return copy("[]");
+}
+
+int slowToken(const char*, const char*, void* user)
+{
+    ++static_cast<SlowHandlers*>(user)->tokens;
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    return LP_OK;
+}
+
+// Detector: getMethods and token delivery ran on the I/O thread every network
+// endpoint in the process shares, so one slow module stalled the others.
+TEST(PlainNetworkCAbi, ASlowModuleHandlerDoesNotStallAnotherEndpoint)
+{
+    const std::uint16_t slowPort = freePort();
+    const std::uint16_t fastPort = freePort();
+    const std::string slowConfig = networkConfig("tcp", slowPort);
+    const std::string fastConfig = networkConfig("tcp", fastPort);
+    SlowHandlers slow;
+    lp_provider* slowProvider = lp_provider_create("plain_slow_handlers",
+                                                   ("[" + slowConfig + "]").c_str());
+    ASSERT_NE(slowProvider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(slowProvider, "network_test", "secret"), LP_OK);
+    // A token push is taken only under the provider's own credential.
+    ASSERT_EQ(lp_provider_save_token(slowProvider, "core", "core_secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(slowProvider, dispatch, slowMethods, slowToken, &slow),
+              LP_OK);
+    lp_provider* fastProvider = lp_provider_create("plain_fast_handlers",
+                                                   ("[" + fastConfig + "]").c_str());
+    ASSERT_NE(fastProvider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(fastProvider, "network_test", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(fastProvider, dispatch, methods, token, nullptr), LP_OK);
+    ASSERT_EQ(lp_token_save("plain_fast_handlers", "secret"), LP_OK);
+    ASSERT_EQ(lp_token_save("plain_slow_handlers", "secret"), LP_OK);
+    lp_client* fast = lp_client_create("plain_fast_handlers", "network_test",
+                                       fastConfig.c_str(), fastConfig.c_str());
+    lp_client* slowClient = lp_client_create("plain_slow_handlers", "network_test",
+                                             slowConfig.c_str(), slowConfig.c_str());
+    ASSERT_TRUE(fast && slowClient);
+
+    const auto timedAnswer = [&] {
+        char* result = nullptr;
+        char* error = nullptr;
+        const auto started = std::chrono::steady_clock::now();
+        EXPECT_EQ(lp_invoke(fast, "answer", "[]", 5000, &result, &error), LP_OK)
+            << (error ? error : "");
+        lp_string_free(result);
+        lp_string_free(error);
+        return std::chrono::steady_clock::now() - started;
+    };
+    timedAnswer(); // connected first: what is timed below is dispatch, not a dial
+    const auto waitFor = [](const std::atomic<int>& counter, int count) {
+        for (int i = 0; i < 300 && counter.load() < count; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return counter.load() >= count;
+    };
+
+    // A token pushed to the slow module.
+    ASSERT_EQ(lp_inform_module_token(slowClient, "core_secret", "someone", "their_token"),
+              LP_OK);
+    ASSERT_TRUE(waitFor(slow.tokens, 1));
+    EXPECT_LT(timedAnswer(), std::chrono::milliseconds(800)) << "a token handler stalled it";
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+
+    // Its method list, as a Qt-side network client asks for it.
+    LogosTransportConfig raw;
+    raw.protocol = LogosProtocol::Tcp;
+    raw.port = slowPort;
+    std::string dialError;
+    auto wire = logos::plain::abi::connect(raw, std::chrono::seconds(2), dialError);
+    ASSERT_TRUE(wire) << dialError;
+    const int listedBefore = slow.methods.load();
+    auto listed = wire->sendMethods({wire->nextId(), "secret", "plain_slow_handlers"});
+    ASSERT_TRUE(waitFor(slow.methods, listedBefore + 1));
+    EXPECT_LT(timedAnswer(), std::chrono::milliseconds(800)) << "getMethods stalled it";
+    listed.wait_for(std::chrono::seconds(5));
+    wire->stop("done");
+
+    lp_client_destroy(slowClient);
+    lp_client_destroy(fast);
+    lp_provider_destroy(slowProvider);
+    lp_provider_destroy(fastProvider);
+}
+
+// Detector: the TLS server set only a TLS 1.2 minimum and negotiated static-RSA
+// suites without forward secrecy, which the Qt-side host refused.
+TEST(PlainNetworkCAbi, TlsServerRefusesSuitesWithoutForwardSecrecy)
+{
+    const auto certificates = certificateDirectory("plain_tls_policy", true);
+    const std::uint16_t port = freePort();
+    const std::string set = "[" + tlsServerConfig(port, certificates) + "]";
+    lp_provider* provider = lp_provider_create("plain_tls_policy", set.c_str());
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, nullptr), LP_OK);
+
+    const auto handshake = [port](const char* cipherList) {
+        boost::asio::io_context io;
+        boost::asio::ssl::context context(boost::asio::ssl::context::tls_client);
+        SSL_CTX_set_max_proto_version(context.native_handle(), TLS1_2_VERSION);
+        EXPECT_EQ(SSL_CTX_set_cipher_list(context.native_handle(), cipherList), 1);
+        context.set_verify_mode(boost::asio::ssl::verify_none);
+        boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream(io, context);
+        boost::system::error_code error;
+        stream.lowest_layer().connect({boost::asio::ip::address_v4::loopback(), port}, error);
+        if (!error) stream.handshake(boost::asio::ssl::stream_base::client, error);
+        return !error;
+    };
+    EXPECT_FALSE(handshake("AES128-GCM-SHA256:AES256-GCM-SHA384"))
+        << "static-RSA key exchange was negotiated";
+    EXPECT_TRUE(handshake("ECDHE-RSA-AES128-GCM-SHA256")) << "a forward-secret suite was refused";
+    lp_provider_destroy(provider);
+    std::filesystem::remove_all(certificates);
 }
 
 TEST(PlainNetworkCAbi, SilentTlsPeerCannotOutliveInvocationDeadline)

@@ -46,6 +46,9 @@ public:
     void onToken(const TokenMessage& request) override;
 
 private:
+    // Runs on this endpoint's worker, never on the process-wide I/O thread.
+    void enqueue(std::function<void()> job);
+
     LogosTransportConfig config_;
     CallHandler call_;
     MethodsHandler methods_;
@@ -54,10 +57,10 @@ private:
     std::shared_ptr<RpcServerSsl> tls_;
     std::mutex mutex_;
     std::map<std::string, std::map<std::string, std::map<const void*, EventSink>>> sinks_;
-    std::mutex callsMutex_;
-    std::condition_variable callsChanged_;
-    std::deque<std::pair<CallMessage, CallReply>> calls_;
-    bool callsStopped_ = false;
+    std::mutex jobsMutex_;
+    std::condition_variable jobsChanged_;
+    std::deque<std::function<void()>> jobs_;
+    bool jobsStopped_ = false;
     std::thread worker_;
 };
 

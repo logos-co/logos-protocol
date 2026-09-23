@@ -37,9 +37,19 @@ boost::asio::ssl::context tlsContext(const LogosTransportConfig& config, bool se
         : boost::asio::ssl::context::tls_client);
     context.set_options(boost::asio::ssl::context::default_workarounds
                         | boost::asio::ssl::context::no_sslv2
-                        | boost::asio::ssl::context::no_sslv3);
-    if (!SSL_CTX_set_min_proto_version(context.native_handle(), TLS1_2_VERSION))
-        throw std::runtime_error("TLS 1.2 minimum setup failed");
+                        | boost::asio::ssl::context::no_sslv3
+                        | boost::asio::ssl::context::single_dh_use);
+    // The Qt-side host's policy (plain_transport_host.cpp): TLS 1.2 or 1.3 with
+    // forward-secret suites only. Refused rather than weakened if it won't apply.
+    SSL_CTX* native = context.native_handle();
+    if (!SSL_CTX_set_min_proto_version(native, TLS1_2_VERSION)
+        || !SSL_CTX_set_max_proto_version(native, TLS1_3_VERSION)
+        || !SSL_CTX_set1_groups_list(native, "X25519:P-256:P-384:P-521")
+        || !SSL_CTX_set_ciphersuites(native, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                                             "TLS_CHACHA20_POLY1305_SHA256")
+        || !SSL_CTX_set_cipher_list(native, "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:"
+                                            "DHE+CHACHA20:!aNULL:!MD5:!DSS:!RC4:!3DES"))
+        throw std::runtime_error("TLS policy setup failed");
     if (!config.certFile.empty()) context.use_certificate_chain_file(config.certFile);
     if (!config.keyFile.empty())
         context.use_private_key_file(config.keyFile, boost::asio::ssl::context::pem);
@@ -251,25 +261,15 @@ ServerEndpoint::ServerEndpoint(LogosTransportConfig config, CallHandler call,
       methods_(std::move(methods)), token_(std::move(token)),
       worker_([this] {
           for (;;) {
-              std::pair<CallMessage, CallReply> item;
+              std::function<void()> job;
               {
-                  std::unique_lock<std::mutex> lock(callsMutex_);
-                  callsChanged_.wait(lock, [this] {
-                      return callsStopped_ || !calls_.empty();
-                  });
-                  if (calls_.empty() && callsStopped_) return;
-                  item = std::move(calls_.front());
-                  calls_.pop_front();
+                  std::unique_lock<std::mutex> lock(jobsMutex_);
+                  jobsChanged_.wait(lock, [this] { return jobsStopped_ || !jobs_.empty(); });
+                  if (jobs_.empty() && jobsStopped_) return;
+                  job = std::move(jobs_.front());
+                  jobs_.pop_front();
               }
-              try {
-                  item.second(call_(item.first));
-              } catch (const std::exception& ex) {
-                  ResultMessage failure;
-                  failure.id = item.first.id;
-                  failure.err = ex.what();
-                  failure.errCode = "METHOD_FAILED";
-                  item.second(std::move(failure));
-              }
+              job();
           }
       }) {}
 
@@ -312,10 +312,10 @@ void ServerEndpoint::stop()
         waited.wait();
     }
     {
-        std::lock_guard<std::mutex> lock(callsMutex_);
-        callsStopped_ = true;
+        std::lock_guard<std::mutex> lock(jobsMutex_);
+        jobsStopped_ = true;
     }
-    callsChanged_.notify_all();
+    jobsChanged_.notify_all();
     if (worker_.joinable()) worker_.join();
     std::lock_guard<std::mutex> lock(mutex_);
     sinks_.clear();
@@ -342,19 +342,45 @@ void ServerEndpoint::emit(const std::string& object, const std::string& event,
     for (const auto& sink : sinks) sink(message);
 }
 
-void ServerEndpoint::onCall(const CallMessage& request, CallReply reply)
+void ServerEndpoint::enqueue(std::function<void()> job)
 {
     {
-        std::lock_guard<std::mutex> lock(callsMutex_);
-        if (callsStopped_) return;
-        calls_.emplace_back(request, std::move(reply));
+        std::lock_guard<std::mutex> lock(jobsMutex_);
+        if (jobsStopped_) return;
+        jobs_.push_back(std::move(job));
     }
-    callsChanged_.notify_one();
+    jobsChanged_.notify_one();
 }
 
+void ServerEndpoint::onCall(const CallMessage& request, CallReply reply)
+{
+    enqueue([this, request, reply = std::move(reply)] {
+        try {
+            reply(call_(request));
+        } catch (const std::exception& ex) {
+            ResultMessage failure;
+            failure.id = request.id;
+            failure.err = ex.what();
+            failure.errCode = "METHOD_FAILED";
+            reply(std::move(failure));
+        }
+    });
+}
+
+// Like a call: a module's getMethods or token handler may be slow, and the
+// I/O thread serves every endpoint in the process.
 void ServerEndpoint::onMethods(const MethodsMessage& request, MethodsReply reply)
 {
-    reply(methods_(request));
+    enqueue([this, request, reply = std::move(reply)] {
+        try {
+            reply(methods_(request));
+        } catch (const std::exception& ex) {
+            MethodsResultMessage failure;
+            failure.id = request.id;
+            failure.err = ex.what();
+            reply(std::move(failure));
+        }
+    });
 }
 
 void ServerEndpoint::onSubscribe(const SubscribeMessage& request, EventSink sink,
@@ -393,7 +419,7 @@ void ServerEndpoint::onConnectionClosed(const void* connectionId)
 
 void ServerEndpoint::onToken(const TokenMessage& request)
 {
-    token_(request);
+    enqueue([this, request] { token_(request); });
 }
 
 } // namespace logos::plain::abi
