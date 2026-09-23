@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -625,7 +626,15 @@ std::string localSocketPath(std::string_view localUrlOrPath)
 #endif
     if (temp.empty()) temp = "/tmp";
     while (temp.size() > 1 && temp.back() == '/') temp.pop_back();
-    return temp + "/" + std::string(localUrlOrPath);
+    std::string path = temp + "/" + std::string(localUrlOrPath);
+    // A relative TMPDIR names a file relative to today's working directory; a
+    // server that later unlinks it from another one would miss it.
+    if (path.front() != '/') {
+        std::error_code error;
+        const auto absolute = std::filesystem::absolute(path, error);
+        if (!error) path = absolute.string();
+    }
+    return path;
 #endif
 }
 

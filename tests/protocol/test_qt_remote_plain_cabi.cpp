@@ -1706,6 +1706,34 @@ TEST(QtRemotePlainCabiTest, IntrospectionFallsBackForProvidersBeforeGetPluginInt
     EXPECT_EQ(described[1].at("type"), "event");
 }
 
+// Detector: an instance id the plain runtime made for itself was up to twenty
+// decimal digits; LogosInstance::id() has always made twelve hex ones, and the
+// id is part of every socket path.
+TEST(QtRemotePlainCabiTest, AGeneratedInstanceIdIsTwelveHexDigits)
+{
+    const char* saved = std::getenv("LOGOS_INSTANCE_ID");
+    const std::string previous = saved ? saved : "";
+#ifdef _WIN32
+    _putenv_s("LOGOS_INSTANCE_ID", "");
+#else
+    ::unsetenv("LOGOS_INSTANCE_ID");
+#endif
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("instance_probe", nullptr);
+    EXPECT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    const char* made = std::getenv("LOGOS_INSTANCE_ID");
+    const std::string id = made ? made : "";
+    lp_provider_destroy(provider);
+#ifdef _WIN32
+    _putenv_s("LOGOS_INSTANCE_ID", previous.c_str());
+#else
+    if (saved) ::setenv("LOGOS_INSTANCE_ID", previous.c_str(), 1);
+    else ::unsetenv("LOGOS_INSTANCE_ID");
+#endif
+    EXPECT_EQ(id.size(), 12u) << id;
+    EXPECT_EQ(id.find_first_not_of("0123456789abcdef"), std::string::npos) << id;
+}
+
 TEST(QtRemotePlainCabiTest, DeferredSubscriptionReconnectsAndManualPolicyHolds)
 {
     setInstanceId("qtro_cabi_restart_");

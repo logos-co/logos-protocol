@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -294,6 +295,36 @@ TEST(QtRemotePlainTransportTest, EverySocketIsCloseOnExec)
 
 // Detector: stop() removed the socket file only after its handlers finished,
 // by which time a successor could have bound the path.
+// Detector: a relative TMPDIR gave a relative socket path, so a server that
+// stopped after the working directory changed left the socket it bound.
+TEST(QtRemotePlainTransportTest, ARelativeTmpdirStillRemovesTheSocketItBound)
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("qtro_rel_" + std::to_string(::getpid()));
+    fs::create_directories(root / "rel");
+    fs::create_directories(root / "elsewhere");
+    const fs::path previousDir = fs::current_path();
+    const char* savedTmp = std::getenv("TMPDIR");
+    const std::string previousTmp = savedTmp ? savedTmp : "";
+    fs::current_path(root);
+    ::setenv("TMPDIR", "rel", 1);
+
+    Server server;
+    std::string error;
+    const bool started = server.start("local:logos_relative_probe", &error);
+    fs::current_path(root / "elsewhere");
+    server.stop();
+    const bool left = fs::exists(root / "rel" / "logos_relative_probe");
+
+    fs::current_path(previousDir);
+    if (savedTmp) ::setenv("TMPDIR", previousTmp.c_str(), 1);
+    else ::unsetenv("TMPDIR");
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    ASSERT_TRUE(started) << error;
+    EXPECT_FALSE(left) << "the server left the socket it bound";
+}
+
 TEST(QtRemotePlainTransportTest, StoppingNeverRemovesASuccessorsSocket)
 {
     const std::string path = transportSocketPath();

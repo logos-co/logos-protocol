@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -212,10 +213,15 @@ std::string instanceId()
 {
     if (const char* value = std::getenv("LOGOS_INSTANCE_ID"); value && *value)
         return value;
+    // Twelve hex digits, as LogosInstance::id() makes them: the id is in every
+    // socket path, and macOS caps those at 104 bytes.
     std::random_device random;
-    const auto stamp = static_cast<unsigned long long>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    const std::string value = std::to_string(stamp ^ random());
+    const std::uint64_t bits = (static_cast<std::uint64_t>(random()) << 32 | random())
+        ^ static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    char text[13];
+    std::snprintf(text, sizeof text, "%012llx",
+                  static_cast<unsigned long long>(bits & 0xffffffffffffULL));
+    const std::string value = text;
 #ifdef _WIN32
     _putenv_s("LOGOS_INSTANCE_ID", value.c_str());
 #else
