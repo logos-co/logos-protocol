@@ -1,0 +1,21 @@
+name: Windows
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: tests
+      smoke: |
+        run tests/bin/qt_remote_plain_wire_tests.exe
+        run tests/bin/qt_remote_plain_cabi_tests.exe

@@ -26,7 +26,9 @@
           lib = import ./nix/lib.nix { inherit pkgs common src; };
           plain-lib = import ./nix/plain-lib.nix { inherit pkgs common src; };
           include = import ./nix/include.nix { inherit pkgs common src; };
-          tests = import ./nix/tests.nix { inherit pkgs common src; };
+          tests = import (if common.isWindows then ./nix/tests-windows.nix else ./nix/tests.nix) {
+            inherit pkgs common src;
+          };
 
           # The module-impl C ABI as data, for the language backends to check
           # themselves against. See nix/module-impl-abi.nix.
