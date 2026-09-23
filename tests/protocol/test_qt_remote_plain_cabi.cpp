@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -1405,6 +1406,71 @@ TEST(QtRemotePlainCabiTest, DeclaredReturnTypeDisambiguatesMapAndLogosResult)
     ASSERT_TRUE(lidl.has_value()) << error;
     EXPECT_EQ(lidl->type, logos::qt_remote_plain::MetaType::User);
     EXPECT_EQ(lidl->customType, "LogosResult");
+
+    wire.close();
+    lp_provider_destroy(provider);
+}
+
+char* pendingResultDispatch(const char* method, const char*, void*)
+{
+    if (std::strcmp(method, "lidlResult") == 0)
+        return copyString(R"({"__logos_pending_call__":"lc-result"})");
+    if (std::strcmp(method, "mapCollision") == 0)
+        return copyString(R"({"__logos_pending_call__":"lc-map"})");
+    return copyString("null");
+}
+
+// Detector: a deferred LogosResult method's completion reached a Qt consumer as
+// a plain map, so a typed wrapper read success=false.
+TEST(QtRemotePlainCabiTest, DeferredCompletionsKeepTheDeclaredResultType)
+{
+    using logos::qt_remote_plain::MetaType;
+    using logos::qt_remote_plain::Variant;
+    setInstanceId("qtro_cabi_deferred_result_");
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("deferred_result", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, pendingResultDispatch, methods, token, &fixture), LP_OK);
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::map<std::string, Variant> completions;
+    logos::qt_remote_plain::Client wire;
+    wire.setEventHandler([&](const std::string&, std::int32_t, std::vector<Variant> arguments) {
+        if (arguments.size() != 2 || !arguments[0].value.isString()
+            || arguments[0].value.asString() != "__logos_call_complete__"
+            || arguments[1].nestedValues.size() != 2)
+            return;
+        std::lock_guard<std::mutex> lock(mutex);
+        completions[arguments[1].nestedValues[0].value.asString()] = arguments[1].nestedValues[1];
+        changed.notify_all();
+    });
+    std::string error;
+    ASSERT_TRUE(wire.connect("local:logos_deferred_result_" +
+        std::string(std::getenv("LOGOS_INSTANCE_ID")), std::chrono::seconds(1), &error)) << error;
+    ASSERT_TRUE(wire.acquire("deferred_result", std::chrono::seconds(1), &error)) << error;
+    for (const char* method : {"lidlResult", "mapCollision"}) {
+        ASSERT_TRUE(wire.call("deferred_result", "callRemoteMethod(QString,QString,QVariantList)",
+            {Variant::fromRpc(logos::plain::RpcValue{"secret"}),
+             Variant::fromRpc(logos::plain::RpcValue{method}),
+             Variant::fromRpc(logos::plain::RpcValue{logos::plain::RpcList{}})},
+            std::chrono::seconds(1), &error).has_value()) << error;
+    }
+    for (const char* id : {"lc-result", "lc-map"}) {
+        const std::string completion = std::string(R"([")") + id
+            + R"(",{"success":true,"value":42,"error":null}])";
+        ASSERT_EQ(lp_provider_emit_event(provider, "__logos_call_complete__", completion.c_str()),
+                  LP_OK);
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(changed.wait_for(lock, std::chrono::seconds(2),
+                                     [&] { return completions.size() == 2; }));
+    }
+    EXPECT_EQ(completions["lc-result"].type, MetaType::User);
+    EXPECT_EQ(completions["lc-result"].customType, "LogosResult");
+    EXPECT_EQ(completions["lc-map"].type, MetaType::VariantMap) << "a map method's stays a map";
 
     wire.close();
     lp_provider_destroy(provider);
