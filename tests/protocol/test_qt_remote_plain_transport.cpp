@@ -16,6 +16,13 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <process.h>
 #else
 #include <fcntl.h>
@@ -29,6 +36,15 @@ using namespace logos::plain;
 using namespace logos::qt_remote_plain;
 
 namespace {
+
+#ifdef _WIN32
+// Wine's ntdll exports wine_get_version; Windows' does not.
+bool runningUnderWine()
+{
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    return ntdll && ::GetProcAddress(ntdll, "wine_get_version");
+}
+#endif
 
 std::string transportSocketPath()
 {
@@ -152,6 +168,10 @@ TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
 // so a client could land on either.
 TEST(QtRemotePlainTransportTest, ASecondServerCannotTakeALiveEndpoint)
 {
+#ifdef _WIN32
+    // Windows refuses a second FILE_FLAG_FIRST_PIPE_INSTANCE server; Wine lets it start.
+    if (runningUnderWine()) GTEST_SKIP() << "Wine does not enforce FILE_FLAG_FIRST_PIPE_INSTANCE";
+#endif
     const std::string path = transportSocketPath();
     Server first;
     ASSERT_TRUE(first.publish(echoFixture()));
