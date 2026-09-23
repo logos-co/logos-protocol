@@ -169,6 +169,32 @@ bool isLogosResultType(const std::string& type)
         || (type.size() > 13 && type.compare(type.size() - 13, 13, "::LogosResult") == 0);
 }
 
+// Non-negative JSON integers reach Qt as qulonglong, as nlohmannToQVariant
+// sends them on the Qt path; RpcValue folds them into int64.
+void markUnsigned(Variant& variant, const json& value)
+{
+    if (value.is_number_unsigned()) {
+        variant.type = MetaType::ULongLong;
+    } else if (value.is_array() && variant.type == MetaType::VariantList
+               && variant.nestedValues.size() == value.size()) {
+        for (std::size_t i = 0; i < value.size(); ++i)
+            markUnsigned(variant.nestedValues[i], value[i]);
+    } else if (value.is_object() && variant.type == MetaType::VariantMap
+               && variant.nestedKeys.size() == variant.nestedValues.size()) {
+        for (std::size_t i = 0; i < variant.nestedKeys.size(); ++i) {
+            const auto found = value.find(variant.nestedKeys[i]);
+            if (found != value.end()) markUnsigned(variant.nestedValues[i], *found);
+        }
+    }
+}
+
+Variant jsonToVariant(const json& value)
+{
+    Variant variant = Variant::fromRpc(jsonToRpc(value));
+    markUnsigned(variant, value);
+    return variant;
+}
+
 Variant resultVariant(const json& value, const std::string& declaredReturnType)
 {
     if (isLogosResultType(declaredReturnType)
@@ -176,10 +202,10 @@ Variant resultVariant(const json& value, const std::string& declaredReturnType)
         && value.contains("success") && value["success"].is_boolean()
         && value.contains("value") && value.contains("error")) {
         return Variant::logosResult(value["success"].get<bool>(),
-                                    Variant::fromRpc(jsonToRpc(value["value"])),
-                                    Variant::fromRpc(jsonToRpc(value["error"])));
+                                    jsonToVariant(value["value"]),
+                                    jsonToVariant(value["error"]));
     }
-    return Variant::fromRpc(jsonToRpc(value));
+    return jsonToVariant(value);
 }
 
 std::string instanceId()
@@ -954,7 +980,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         }
         return wrapped;
     }
-    Variant arguments = Variant::fromRpc(jsonToRpc(args));
+    Variant arguments = jsonToVariant(args);
     auto result = directCall(state, state->target,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
@@ -962,7 +988,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
         token = tokenFor(state, remaining(), error, token);
         if (!token.empty()) {
-            arguments = Variant::fromRpc(jsonToRpc(args));
+            arguments = jsonToVariant(args);
             result = directCall(state, state->target,
                 "callRemoteMethod(QString,QString,QVariantList)",
                 {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
@@ -2027,7 +2053,7 @@ try {
     for (auto& endpoint : provider->networkEndpoints)
         endpoint->emit(provider->moduleName, eventName, arguments);
     if (!provider->qtroStarted) return LP_OK;
-    Variant payload = Variant::fromRpc(jsonToRpc(data));
+    Variant payload = jsonToVariant(data);
     if (!resultType.empty()) payload.nestedValues[1] = resultVariant(data[1], resultType);
     std::string error;
     return provider->server.emitSignal(provider->moduleName, 0,

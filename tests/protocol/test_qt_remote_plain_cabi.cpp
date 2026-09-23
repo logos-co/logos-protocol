@@ -1579,6 +1579,83 @@ TEST(QtRemotePlainCabiTest, EveryStoredTokenIsComparedWhicheverMatches)
     EXPECT_EQ(cost("nobody"), first);
 }
 
+char* numberDispatch(const char*, const char*, void*)
+{
+    return copyString(R"({"n":42,"negative":-3,"list":[1,-1]})");
+}
+
+// Detector: non-negative integers crossed as qlonglong in both directions,
+// where the Qt path (nlohmannToQVariant) sends qulonglong.
+TEST(QtRemotePlainCabiTest, NonNegativeIntegersCrossAsQulonglong)
+{
+    using logos::qt_remote_plain::MetaType;
+    using logos::qt_remote_plain::Variant;
+    setInstanceId("qtro_cabi_unsigned_");
+    const std::string instance = std::getenv("LOGOS_INSTANCE_ID");
+    const auto noArguments = Variant::fromRpc(logos::plain::RpcValue{logos::plain::RpcList{}});
+    std::string error;
+
+    // A plain provider answering an unchanged Qt consumer.
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("unsigned_provider", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, numberDispatch, methods, token, &fixture), LP_OK);
+    logos::qt_remote_plain::Client wire;
+    ASSERT_TRUE(wire.connect("local:logos_unsigned_provider_" + instance,
+                             std::chrono::seconds(1), &error)) << error;
+    const auto reply = wire.call("unsigned_provider", "callRemoteMethod(QString,QString,QVariantList)",
+        {Variant::fromRpc(logos::plain::RpcValue{"secret"}),
+         Variant::fromRpc(logos::plain::RpcValue{"numbers"}), noArguments},
+        std::chrono::seconds(1), &error);
+    wire.close();
+    lp_provider_destroy(provider);
+    ASSERT_TRUE(reply.has_value()) << error;
+    ASSERT_EQ(reply->type, MetaType::VariantMap);
+    std::map<std::string, Variant> fields;
+    for (std::size_t i = 0; i < reply->nestedKeys.size(); ++i)
+        fields[reply->nestedKeys[i]] = reply->nestedValues[i];
+    EXPECT_EQ(fields["n"].type, MetaType::ULongLong);
+    EXPECT_EQ(fields["negative"].type, MetaType::LongLong);
+    ASSERT_EQ(fields["list"].nestedValues.size(), 2u);
+    EXPECT_EQ(fields["list"].nestedValues[0].type, MetaType::ULongLong);
+    EXPECT_EQ(fields["list"].nestedValues[1].type, MetaType::LongLong);
+
+    // A plain consumer calling an unchanged Qt provider.
+    std::mutex mutex;
+    std::vector<MetaType> argumentTypes;
+    logos::qt_remote_plain::Server target;
+    logos::qt_remote_plain::Server::Object object;
+    object.name = "unsigned_target";
+    object.definition.typeName = "unsigned_target";
+    object.definition.methodDefinitions.push_back(
+        {"callRemoteMethod(QString,QString,QVariantList)", "QVariant",
+         {"authToken", "methodName", "args"}});
+    object.invoke = [&](std::int32_t, const std::vector<Variant>& arguments) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (arguments.size() == 3)
+            for (const auto& item : arguments[2].nestedValues) argumentTypes.push_back(item.type);
+        return Variant::fromRpc(logos::plain::RpcValue{"ok"});
+    };
+    ASSERT_TRUE(target.start("local:logos_unsigned_target_" + instance, &error)) << error;
+    ASSERT_TRUE(target.publish(std::move(object), &error)) << error;
+    ASSERT_EQ(lp_token_save("unsigned_target", "secret"), LP_OK);
+    lp_client* client = lp_client_create("unsigned_target", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    char* result = nullptr;
+    char* callError = nullptr;
+    EXPECT_EQ(lp_invoke(client, "echo", "[7,-7]", 2000, &result, &callError), LP_OK)
+        << (callError ? callError : "");
+    lp_string_free(result);
+    lp_string_free(callError);
+    lp_client_destroy(client);
+    target.stop();
+    std::lock_guard<std::mutex> lock(mutex);
+    ASSERT_EQ(argumentTypes.size(), 2u);
+    EXPECT_EQ(argumentTypes[0], MetaType::ULongLong);
+    EXPECT_EQ(argumentTypes[1], MetaType::LongLong);
+}
+
 TEST(QtRemotePlainCabiTest, DeferredSubscriptionReconnectsAndManualPolicyHolds)
 {
     setInstanceId("qtro_cabi_restart_");

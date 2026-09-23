@@ -12,6 +12,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QUrl>
 #include <QEventLoop>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -78,6 +79,12 @@ public:
             return QVariant::fromValue(1.5f);
         if (methodName == QStringLiteral("ints"))
             return QVariant::fromValue(QList<int>{1, 2, 3});
+        if (methodName == QStringLiteral("url"))
+            return QUrl(QStringLiteral("https://example.org/a b?q=1"));
+        if (methodName == QStringLiteral("nullString"))
+            return QString();
+        if (methodName == QStringLiteral("nullBytes"))
+            return QByteArray();
         return {};
     }
     QJsonArray getMethods() override { return {}; }
@@ -124,6 +131,8 @@ public:
             return QVariantList{QVariant::fromValue(LogosResult{true, 42, QVariant{}})};
         if (method == QStringLiteral("argumentType") && !args.isEmpty())
             return QString::fromLatin1(args[0].typeName());
+        if (method == QStringLiteral("echo") && !args.isEmpty())
+            return args[0];
         return QStringLiteral("immediate");
     }
 
@@ -288,6 +297,18 @@ TEST(QtRemotePlainAdapterTest, RealQroCallsKeepDeferredControlAndNestedTypes)
     EXPECT_EQ(invoke(QStringLiteral("argumentType"),
                      {QVariant::fromValue(LogosResult{true, 42, QVariant{}})}).toString(),
               QStringLiteral("LogosResult"));
+    const QVariant link = invoke(QStringLiteral("echo"),
+                                 {QUrl(QStringLiteral("https://example.org/a b?q=1"))});
+    EXPECT_EQ(link.metaType(), QMetaType::fromType<QUrl>());
+    EXPECT_EQ(link.toUrl(), QUrl(QStringLiteral("https://example.org/a b?q=1")));
+    const QVariant nullString = invoke(QStringLiteral("echo"), {QString()});
+    EXPECT_EQ(nullString.metaType(), QMetaType::fromType<QString>());
+    EXPECT_TRUE(nullString.toString().isNull());
+    const QVariant nullBytes = invoke(QStringLiteral("echo"), {QByteArray()});
+    EXPECT_EQ(nullBytes.metaType(), QMetaType::fromType<QByteArray>());
+    EXPECT_TRUE(nullBytes.toByteArray().isNull());
+    EXPECT_EQ(invoke(QStringLiteral("echo"), {QVariant::fromValue(qulonglong{7})}).metaType(),
+              QMetaType::fromType<qulonglong>());
 
     std::promise<std::pair<QVariant, logos::CallError>> eventResult;
     auto eventFuture = eventResult.get_future();
@@ -520,6 +541,15 @@ TEST(QtRemotePlainAdapterTest, AdapterHostDeliversQtTypesToAnUnchangedQtConsumer
     EXPECT_EQ(when.toDateTime(), QDateTime(QDate(2026, 9, 23), QTime(10, 0), QTimeZone::UTC));
     EXPECT_EQ(call("single").metaType(), QMetaType::fromType<float>());
     EXPECT_EQ(call("ints").value<QList<int>>(), (QList<int>{1, 2, 3}));
+    const QVariant link = call("url");
+    EXPECT_EQ(link.metaType(), QMetaType::fromType<QUrl>());
+    EXPECT_EQ(link.toUrl(), QUrl(QStringLiteral("https://example.org/a b?q=1")));
+    const QVariant nullString = call("nullString");
+    EXPECT_EQ(nullString.metaType(), QMetaType::fromType<QString>());
+    EXPECT_TRUE(nullString.toString().isNull());
+    const QVariant nullBytes = call("nullBytes");
+    EXPECT_EQ(nullBytes.metaType(), QMetaType::fromType<QByteArray>());
+    EXPECT_TRUE(nullBytes.toByteArray().isNull());
 
     provider.fire(QStringLiteral("tick"),
         {QStringList{QStringLiteral("x")},
