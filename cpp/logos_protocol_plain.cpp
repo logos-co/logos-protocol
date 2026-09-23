@@ -213,11 +213,21 @@ LogosTransportConfig parsePlainConfig(const char* text)
     return set.empty() ? config : set.front();
 }
 
+struct TokenFlight {
+    bool finished = false;
+    std::string token;
+    std::string error;
+};
+
 struct TokenStore {
     std::mutex mutex;
     std::map<std::string, std::string> outbound;
     std::map<std::string, std::string> inbound;
     std::string credential;
+    // One capability request per target at a time: each token it issues
+    // replaces the previous one, so concurrent requests revoke each other.
+    std::map<std::string, std::shared_ptr<TokenFlight>> flights;
+    std::condition_variable flightDone;
 };
 
 std::mutex gTokenMutex;
@@ -755,6 +765,54 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
     return token;
 }
 
+// The token to call the target with, requested at most once at a time.
+// `rejected` is one the target just refused: it is replaced, unless another
+// call has already replaced it.
+std::string tokenFor(const std::shared_ptr<ClientState>& state, int timeout,
+                     std::string& error, const std::string& rejected = {})
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout);
+    TokenStore& store = *state->tokens;
+    std::unique_lock<std::mutex> lock(store.mutex);
+    for (;;) {
+        const auto current = store.outbound.find(state->target);
+        const std::string known = current == store.outbound.end() ? std::string()
+                                                                  : current->second;
+        if ((!known.empty() && known != rejected) || state->target == "capability_module")
+            return known;
+        const auto running = store.flights.find(state->target);
+        if (running == store.flights.end()) break;
+        const std::shared_ptr<TokenFlight> flight = running->second;
+        if (!store.flightDone.wait_until(lock, deadline, [&] { return flight->finished; })) {
+            error = "capability request timed out";
+            return {};
+        }
+        if (flight->token.empty()) {
+            error = flight->error;
+            return {};
+        }
+    }
+    const auto current = store.outbound.find(state->target);
+    if (current != store.outbound.end() && current->second == rejected)
+        store.outbound.erase(current);
+    auto flight = std::make_shared<TokenFlight>();
+    store.flights[state->target] = flight;
+    lock.unlock();
+    std::string token = mintToken(state, std::max(0, static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count())), error);
+    lock.lock();
+    flight->finished = true;
+    flight->token = token;
+    flight->error = error;
+    const auto mine = store.flights.find(state->target);
+    if (mine != store.flights.end() && mine->second == flight) store.flights.erase(mine);
+    lock.unlock();
+    store.flightDone.notify_all();
+    return token;
+}
+
 std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                               const std::string& method, const json& args,
                               int timeout, std::string& error)
@@ -770,9 +828,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count()));
     };
-    std::string token = tokenGet(state->tokens, state->target);
-    if (token.empty() && state->target != "capability_module")
-        token = mintToken(state, remaining(), error);
+    std::string token = tokenFor(state, remaining(), error);
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         auto result = networkCall(state, state->target, method, args, token,
@@ -783,11 +839,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             return status && status->isString() && status->asString() == "unauthorized";
         };
         if (unauthorized(result) && state->target != "capability_module") {
-            {
-                std::lock_guard<std::mutex> lock(state->tokens->mutex);
-                state->tokens->outbound.erase(state->target);
-            }
-            token = mintToken(state, remaining(), error);
+            token = tokenFor(state, remaining(), error, token);
             if (!token.empty())
                 result = networkCall(state, state->target, method, args,
                                      token, remaining(), error);
@@ -821,11 +873,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
          std::move(arguments)}, remaining(), error);
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
-        {
-            std::lock_guard<std::mutex> lock(state->tokens->mutex);
-            state->tokens->outbound.erase(state->target);
-        }
-        token = mintToken(state, remaining(), error);
+        token = tokenFor(state, remaining(), error, token);
         if (!token.empty()) {
             arguments = Variant::fromRpc(jsonToRpc(args));
             result = directCall(state, state->target,
