@@ -526,6 +526,22 @@ target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
 )
 gtest_discover_tests(qt_remote_plain_cabi_tests PROPERTIES TIMEOUT 8)
 
+# A real Qt Remote Objects host exercises callback-initiated teardown of the
+# Qt-free client across the legacy/plain interoperability boundary. Qt's local
+# socket path compatibility is required on Unix; Windows modules use plain.
+if(LOGOS_PROTOCOL_BUILD_QT AND UNIX)
+add_executable(qt_remote_plain_qro_callback_destroy_tests
+    test_qt_remote_plain_qro_callback_destroy.cpp
+)
+target_link_libraries(qt_remote_plain_qro_callback_destroy_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+)
+gtest_discover_tests(qt_remote_plain_qro_callback_destroy_tests PROPERTIES TIMEOUT 8)
+endif()
+
 # ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
 #
 # A SECOND executable, for one reason: QCoreApplication is a process-wide

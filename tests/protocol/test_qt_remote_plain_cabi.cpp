@@ -319,6 +319,108 @@ void runDisconnectDuringEvent(bool withStatus, bool manualRestart,
     if (!destroyInCallback) lp_client_destroy(client);
 }
 
+enum class DestroyCallbackKind { AsyncResult, SubscriptionStatus };
+enum class QueuedWork { None, Event, Disconnect };
+
+struct DestroyFromCallbackResult {
+    lp_client* client = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool proceed = false;
+    std::atomic<bool> done{false};
+    std::atomic<int> asyncSuccess{-1};
+    std::atomic<int> deliveredEvents{0};
+};
+
+void destroyAfterQueuedWork(DestroyFromCallbackResult* result)
+{
+    {
+        std::unique_lock<std::mutex> lock(result->mutex);
+        result->entered = true;
+        result->changed.notify_all();
+        result->changed.wait(lock, [&] { return result->proceed; });
+    }
+    lp_client_destroy(result->client);
+    result->client = nullptr;
+    result->done = true;
+}
+
+void onDestroyingAsyncResult(int success, const char*, void* userData)
+{
+    auto* result = static_cast<DestroyFromCallbackResult*>(userData);
+    result->asyncSuccess = success;
+    destroyAfterQueuedWork(result);
+}
+
+void onDestroyingStatus(int status, unsigned long long, const char*, void* userData)
+{
+    if (status == LP_SUB_ARMED)
+        destroyAfterQueuedWork(static_cast<DestroyFromCallbackResult*>(userData));
+}
+
+void onQueuedEvent(const char*, const char*, void* userData)
+{
+    ++static_cast<DestroyFromCallbackResult*>(userData)->deliveredEvents;
+}
+
+void runDestroyWithQueuedCallback(DestroyCallbackKind kind, QueuedWork queued,
+                                  const std::string& id)
+{
+    setInstanceId(id);
+    Fixture fixture;
+    lp_provider* provider = lp_provider_create("destroy_queued_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("destroy_queued_fixture", "secret"), LP_OK);
+    DestroyFromCallbackResult result;
+    result.client = lp_client_create("destroy_queued_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(result.client, nullptr);
+    ASSERT_EQ(lp_client_set_subscription_status_cb(result.client,
+        kind == DestroyCallbackKind::SubscriptionStatus
+            ? onDestroyingStatus : onDisconnectStatus, &result), 1);
+    lp_subscription* subscription = lp_subscribe(
+        result.client, "tick", onQueuedEvent, &result);
+    ASSERT_NE(subscription, nullptr);
+    if (kind == DestroyCallbackKind::AsyncResult) {
+        ASSERT_TRUE(waitUntil([&] {
+            return lp_client_subscription_generation(result.client) == 1;
+        }));
+        ASSERT_EQ(lp_invoke_async(result.client, "echo", R"(["async"])", 1000,
+                                  onDestroyingAsyncResult, &result), LP_OK);
+    }
+    {
+        std::unique_lock<std::mutex> lock(result.mutex);
+        ASSERT_TRUE(result.changed.wait_for(lock, std::chrono::seconds(2), [&] {
+            return result.entered;
+        }));
+    }
+    if (queued == QueuedWork::Event)
+        ASSERT_EQ(lp_provider_emit_event(provider, "tick", "[]"), LP_OK);
+    else if (queued == QueuedWork::Disconnect) {
+        lp_provider_destroy(provider);
+        provider = nullptr;
+    }
+    // Give the reader/status worker time to queue work behind callbackMutex.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    {
+        std::lock_guard<std::mutex> lock(result.mutex);
+        result.proceed = true;
+    }
+    result.changed.notify_all();
+    if (!waitUntil([&] { return result.done.load(); },
+                   std::chrono::seconds(2))) {
+        ADD_FAILURE() << "Client destruction blocked behind a queued callback";
+        std::_Exit(2); // Each GTest case runs in its own CTest process.
+    }
+    if (kind == DestroyCallbackKind::AsyncResult)
+        EXPECT_EQ(result.asyncSuccess.load(), 1);
+    EXPECT_EQ(result.deliveredEvents.load(), 0);
+    lp_unsubscribe(subscription);
+    lp_provider_destroy(provider);
+}
+
 TEST(QtRemotePlainCabiTest, ProviderClientTokenIntrospectionAndEventNeedNoQt)
 {
     setInstanceId("qtro_cabi_");
@@ -485,6 +587,36 @@ TEST(QtRemotePlainCabiTest, CallbackCanDestroyClientAfterDisconnectWithManualRes
 TEST(QtRemotePlainCabiTest, CallbackCanDestroyClientAfterDisconnectWithoutStatusCallback)
 {
     runDisconnectDuringEvent(false, false, true, "ddn");
+}
+
+TEST(QtRemotePlainCabiTest, AsyncResultCanDestroyClientWithQueuedEvent)
+{
+    runDestroyWithQueuedCallback(DestroyCallbackKind::AsyncResult,
+                                 QueuedWork::Event, "dae");
+}
+
+TEST(QtRemotePlainCabiTest, AsyncResultCanDestroyClientWithQueuedDisconnectStatus)
+{
+    runDestroyWithQueuedCallback(DestroyCallbackKind::AsyncResult,
+                                 QueuedWork::Disconnect, "dad");
+}
+
+TEST(QtRemotePlainCabiTest, StatusCanDestroyClientWithQueuedEvent)
+{
+    runDestroyWithQueuedCallback(DestroyCallbackKind::SubscriptionStatus,
+                                 QueuedWork::Event, "dse");
+}
+
+TEST(QtRemotePlainCabiTest, AsyncResultCanDestroyClientWithoutQueuedWork)
+{
+    runDestroyWithQueuedCallback(DestroyCallbackKind::AsyncResult,
+                                 QueuedWork::None, "dan");
+}
+
+TEST(QtRemotePlainCabiTest, StatusCanDestroyClientWithoutQueuedWork)
+{
+    runDestroyWithQueuedCallback(DestroyCallbackKind::SubscriptionStatus,
+                                 QueuedWork::None, "dsn");
 }
 
 TEST(QtRemotePlainCabiTest, SlowEventCallbackDoesNotBlockConcurrentReplies)
