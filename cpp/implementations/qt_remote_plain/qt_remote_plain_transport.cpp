@@ -12,6 +12,7 @@
 #include <QDataStream>
 #include <QIODevice>
 #include <QDebug>
+#include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <map>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -294,6 +296,29 @@ void QtRemotePlainTransportHost::unpublishObject(const QString& name)
     m_server.unpublish(key);
 }
 
+namespace {
+
+// A blocking call made on a thread with a Qt event loop keeps the loop
+// turning, as QRemoteObjectPendingCall::waitForFinished does, so a call back
+// into this module (A -> B -> A) is served meanwhile instead of deadlocking.
+template <typename Fn>
+auto withEventsFlowing(Fn&& fn) -> decltype(fn())
+{
+    if (!QCoreApplication::instance() || !QThread::currentThread()->eventDispatcher())
+        return fn();
+    std::optional<decltype(fn())> result;
+    QEventLoop loop;
+    std::thread worker([&] {
+        result.emplace(fn());
+        QMetaObject::invokeMethod(&loop, [&loop] { loop.quit(); }, Qt::QueuedConnection);
+    });
+    loop.exec(QEventLoop::ExcludeUserInputEvents | QEventLoop::WaitForMoreEvents);
+    worker.join();
+    return std::move(*result);
+}
+
+} // namespace
+
 struct QtRemotePlainTransportConnection::Shared {
     std::shared_ptr<Client> client = std::make_shared<Client>();
     std::mutex mutex;
@@ -317,6 +342,14 @@ public:
     QVariant callMethodWithError(const QString& authToken, const QString& methodName,
                                  const QVariantList& args, int timeoutMs,
                                  logos::CallError* error) override
+    {
+        return withEventsFlowing([&] {
+            return blockingCall(authToken, methodName, args, timeoutMs, error);
+        });
+    }
+
+    QVariant blockingCall(const QString& authToken, const QString& methodName,
+                          const QVariantList& args, int timeoutMs, logos::CallError* error)
     {
         if (error) error->clear();
         Variant wireArgs = fromQVariant(args);
@@ -391,12 +424,14 @@ public:
     bool informModuleToken(const QString& authToken, const QString& moduleName,
                            const QString& token, int timeoutMs) override
     {
-        std::string error;
-        auto result = m_shared->client->call(m_object,
-            "informModuleToken(QString,QString,QString)",
-            {fromQVariant(authToken), fromQVariant(moduleName), fromQVariant(token)},
-            timeoutFor(timeoutMs), &error);
-        return result && toQVariant(*result).toBool();
+        return withEventsFlowing([&] {
+            std::string error;
+            auto result = m_shared->client->call(m_object,
+                "informModuleToken(QString,QString,QString)",
+                {fromQVariant(authToken), fromQVariant(moduleName), fromQVariant(token)},
+                timeoutFor(timeoutMs), &error);
+            return result && toQVariant(*result).toBool();
+        });
     }
 
     void onEvent(const QString& eventName, EventCallback callback) override
@@ -416,10 +451,12 @@ public:
 
     QJsonArray getMethods() override
     {
-        std::string error;
-        auto result = m_shared->client->call(m_object, "getPluginMethods()", {},
-                                             timeoutFor(kDefaultTimeoutMs), &error);
-        return result ? toQVariant(*result).toJsonArray() : QJsonArray{};
+        return withEventsFlowing([&] {
+            std::string error;
+            auto result = m_shared->client->call(m_object, "getPluginMethods()", {},
+                                                 timeoutFor(kDefaultTimeoutMs), &error);
+            return result ? toQVariant(*result).toJsonArray() : QJsonArray{};
+        });
     }
 
     void release() override
