@@ -1733,28 +1733,56 @@ try {
     return nullptr;
 }
 
+// Always capability_module, as documented: through the client's own connection
+// when that is its target, otherwise over the capability transport. Pushing a
+// token at any other module is lp_inform_module_token_to's, behind its grant.
 int lp_inform_module_token(lp_client* client, const char* authToken,
                            const char* moduleName, const char* token)
 try {
     if (!client || !authToken || !moduleName || !token) return LP_ERR_INVALID_ARG;
+    const auto& state = client->state;
+    const bool own = state->target == "capability_module";
+    const LogosTransportConfig& config = own ? state->targetConfig : state->capabilityConfig;
+    const Variant args[] = {Variant::fromRpc(RpcValue{authToken}),
+                            Variant::fromRpc(RpcValue{moduleName}),
+                            Variant::fromRpc(RpcValue{token})};
     std::string error;
-    if (client->state->targetConfig.protocol == LogosProtocol::Tcp
-        || client->state->targetConfig.protocol == LogosProtocol::TcpSsl) {
-        if (!ensureConnected(client->state, kDefaultTimeoutMs, error))
-            return LP_ERR_INTERNAL;
-        std::shared_ptr<RpcConnectionBase> wire;
-        {
-            std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
-            wire = client->state->networkWire;
+    if (config.protocol == LogosProtocol::Tcp || config.protocol == LogosProtocol::TcpSsl) {
+        if (own) {
+            if (!ensureConnected(state, kDefaultTimeoutMs, error)) return LP_ERR_INTERNAL;
+            std::shared_ptr<RpcConnectionBase> wire;
+            {
+                std::lock_guard<std::timed_mutex> lock(state->connectionMutex);
+                wire = state->networkWire;
+            }
+            wire->sendToken({authToken, moduleName, token});
+            return LP_OK;
         }
+        auto wire = logos::plain::abi::connect(
+            config, std::chrono::milliseconds(kDefaultTimeoutMs), error, &state->alive);
+        if (!wire) return LP_ERR_INTERNAL;
         wire->sendToken({authToken, moduleName, token});
-        return LP_OK;
+        // A reply to a later frame means the token frame was read before the close.
+        auto barrier = wire->sendMethods({wire->nextId(), authToken, "capability_module"});
+        const bool read = barrier.wait_for(std::chrono::milliseconds(kDefaultTimeoutMs))
+            == std::future_status::ready;
+        wire->stop("capability token delivered");
+        return read ? LP_OK : LP_ERR_INTERNAL;
     }
-    std::string code;
-    auto result = directCall(client->state, client->state->target,
-        "informModuleToken(QString,QString,QString)",
-        {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
-         Variant::fromRpc(RpcValue{token})}, kDefaultTimeoutMs, error, code);
+    std::optional<Variant> result;
+    if (own) {
+        std::string code;
+        result = directCall(state, state->target, "informModuleToken(QString,QString,QString)",
+                            {args[0], args[1], args[2]}, kDefaultTimeoutMs, error, code);
+    } else {
+        Client capability;
+        if (!capability.connect(endpoint("capability_module"),
+                                std::chrono::milliseconds(kDefaultTimeoutMs), &error))
+            return LP_ERR_INTERNAL;
+        result = capability.call("capability_module", "informModuleToken(QString,QString,QString)",
+                                 {args[0], args[1], args[2]},
+                                 std::chrono::milliseconds(kDefaultTimeoutMs), &error);
+    }
     return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
 } catch (...) {
     return LP_ERR_INTERNAL;

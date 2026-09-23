@@ -175,6 +175,64 @@ void callDeferredFromEvent(const char*, const char*, void* user)
     state.changed.notify_all();
 }
 
+struct InformedToken {
+    std::mutex mutex;
+    std::string module;
+    std::string token;
+};
+
+int recordToken(const char* module, const char* value, void* userData)
+{
+    auto& informed = *static_cast<InformedToken*>(userData);
+    std::lock_guard<std::mutex> lock(informed.mutex);
+    informed.module = module;
+    informed.token = value;
+    return LP_OK;
+}
+
+std::string reservedTcpConfig()
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor reservation(io, {boost::asio::ip::address_v4::loopback(), 0});
+    const auto port = reservation.local_endpoint().port();
+    reservation.close();
+    return std::string(R"({"protocol":"tcp","host":"127.0.0.1","port":)") + std::to_string(port)
+        + "}";
+}
+
+// Detector: over tcp the consumer-half token went down the target's connection
+// instead of to capability_module.
+TEST(PlainNetworkCAbi, InformModuleTokenReachesCapabilityModuleOverTcp)
+{
+    const std::string capabilityConfig = reservedTcpConfig();
+    const std::string otherConfig = reservedTcpConfig();
+    InformedToken atCapability;
+    InformedToken atOther;
+    lp_provider* capability =
+        lp_provider_create("capability_module", ("[" + capabilityConfig + "]").c_str());
+    lp_provider* other = lp_provider_create("inform_other_tcp", ("[" + otherConfig + "]").c_str());
+    ASSERT_NE(capability, nullptr);
+    ASSERT_NE(other, nullptr);
+    for (lp_provider* provider : {capability, other})
+        ASSERT_EQ(lp_provider_save_token(provider, "core", "core-secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(capability, dispatch, methods, recordToken, &atCapability),
+              LP_OK);
+    ASSERT_EQ(lp_provider_register(other, dispatch, methods, recordToken, &atOther), LP_OK);
+
+    lp_client* client = lp_client_create("inform_other_tcp", "core", otherConfig.c_str(),
+                                         capabilityConfig.c_str());
+    ASSERT_NE(client, nullptr);
+    EXPECT_EQ(lp_inform_module_token(client, "core-secret", "loaded_module", "loaded-token"),
+              LP_OK);
+    lp_client_destroy(client);
+    lp_provider_destroy(other);
+    lp_provider_destroy(capability);
+
+    EXPECT_EQ(atCapability.module, "loaded_module");
+    EXPECT_EQ(atCapability.token, "loaded-token");
+    EXPECT_TRUE(atOther.module.empty()) << "the token went down the target's connection";
+}
+
 TEST(PlainNetworkCAbi, TcpCallAndEventWithoutQt)
 {
     boost::asio::io_context io;
@@ -616,12 +674,9 @@ TEST(PlainNetworkCAbi, ASlowModuleHandlerDoesNotStallAnotherEndpoint)
     ASSERT_EQ(lp_provider_save_token(fastProvider, "network_test", "secret"), LP_OK);
     ASSERT_EQ(lp_provider_register(fastProvider, dispatch, methods, token, nullptr), LP_OK);
     ASSERT_EQ(lp_token_save("plain_fast_handlers", "secret"), LP_OK);
-    ASSERT_EQ(lp_token_save("plain_slow_handlers", "secret"), LP_OK);
     lp_client* fast = lp_client_create("plain_fast_handlers", "network_test",
                                        fastConfig.c_str(), fastConfig.c_str());
-    lp_client* slowClient = lp_client_create("plain_slow_handlers", "network_test",
-                                             slowConfig.c_str(), slowConfig.c_str());
-    ASSERT_TRUE(fast && slowClient);
+    ASSERT_NE(fast, nullptr);
 
     const auto timedAnswer = [&] {
         char* result = nullptr;
@@ -640,18 +695,20 @@ TEST(PlainNetworkCAbi, ASlowModuleHandlerDoesNotStallAnotherEndpoint)
         return counter.load() >= count;
     };
 
-    // A token pushed to the slow module.
-    ASSERT_EQ(lp_inform_module_token(slowClient, "core_secret", "someone", "their_token"),
-              LP_OK);
-    ASSERT_TRUE(waitFor(slow.tokens, 1));
-    EXPECT_LT(timedAnswer(), std::chrono::milliseconds(800)) << "a token handler stalled it";
-    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
-
-    // Its method list, as a Qt-side network client asks for it.
+    // A token pushed to the slow module, as a Qt-side network client pushes it.
     LogosTransportConfig raw;
     raw.protocol = LogosProtocol::Tcp;
     raw.port = slowPort;
     std::string dialError;
+    auto tokenWire = logos::plain::abi::connect(raw, std::chrono::seconds(2), dialError);
+    ASSERT_TRUE(tokenWire) << dialError;
+    tokenWire->sendToken({"core_secret", "someone", "their_token"});
+    ASSERT_TRUE(waitFor(slow.tokens, 1));
+    EXPECT_LT(timedAnswer(), std::chrono::milliseconds(800)) << "a token handler stalled it";
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    tokenWire->stop("done");
+
+    // Its method list, as that client asks for it.
     auto wire = logos::plain::abi::connect(raw, std::chrono::seconds(2), dialError);
     ASSERT_TRUE(wire) << dialError;
     const int listedBefore = slow.methods.load();
@@ -661,7 +718,6 @@ TEST(PlainNetworkCAbi, ASlowModuleHandlerDoesNotStallAnotherEndpoint)
     listed.wait_for(std::chrono::seconds(5));
     wire->stop("done");
 
-    lp_client_destroy(slowClient);
     lp_client_destroy(fast);
     lp_provider_destroy(slowProvider);
     lp_provider_destroy(fastProvider);
