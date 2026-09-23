@@ -61,7 +61,11 @@ typedef void (*logos_module_emit_cb)(const char* event_name,
 /* Dispatch a method call. Returns the result JSON value as a heap string
  * (free with logos_module_string_free); an unknown method answers the
  * "unknown_method" error object. NULL means dispatch failed structurally (a
- * NULL from a backend predating unknown_method may also mean an unknown name). */
+ * NULL from a backend predating unknown_method may also mean an unknown name).
+ *
+ * "name", "version" and "lidl" answer from the module's declaration, without
+ * constructing the module or needing its context or tokens: a host calls
+ * dispatch("name", "[]") to verify an image before it delivers either. */
 LOGOS_MODULE_IMPL_EXPORT char* logos_module_dispatch(const char* method,
                                                      const char* args_json);
 
@@ -69,8 +73,9 @@ LOGOS_MODULE_IMPL_EXPORT char* logos_module_dispatch(const char* method,
  * LogosProviderObject::getMethods() (entries tagged "method"/"event"). */
 LOGOS_MODULE_IMPL_EXPORT char* logos_module_get_methods(void);
 
-/* Module identity/context, stamped by the host before the first dispatch:
- * module path, instance id, per-instance persistence path. Mirrors
+/* Module identity/context, stamped by the host before the first dispatch of
+ * a module method (the identity methods above may come earlier): module path,
+ * instance id, per-instance persistence path. Mirrors
  * LogosModuleContext / RustModuleContext. Any argument may be NULL. */
 LOGOS_MODULE_IMPL_EXPORT void logos_module_set_context(
     const char* module_path,
