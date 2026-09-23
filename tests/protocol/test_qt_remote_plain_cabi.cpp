@@ -14,6 +14,7 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -521,6 +522,64 @@ TEST(QtRemotePlainCabiTest, ProviderCanValidatePersistentTokensOnDemand)
     lp_string_free(error);
     lp_client_destroy(client);
     lp_provider_destroy(provider);
+}
+
+struct AffinityFixture {
+    std::mutex mutex;
+    std::set<std::thread::id> threads;
+    std::atomic<int> running{0};
+    std::atomic<int> peak{0};
+};
+
+char* affinityDispatch(const char*, const char*, void* userData)
+{
+    auto& fixture = *static_cast<AffinityFixture*>(userData);
+    const int now = ++fixture.running;
+    int seen = fixture.peak.load();
+    while (now > seen && !fixture.peak.compare_exchange_weak(seen, now)) {}
+    {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        fixture.threads.insert(std::this_thread::get_id());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    --fixture.running;
+    return copyString("true");
+}
+
+// A host that runs a module single-threaded gets every call on one thread.
+TEST(QtRemotePlainCabiTest, AProviderLimitedToOneCallRunsEveryCallOnOneThread)
+{
+    setInstanceId("qtro_cabi_affinity_");
+    AffinityFixture fixture;
+    lp_provider* provider = lp_provider_create("affinity_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 1), LP_OK);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, affinityDispatch, methods, token, &fixture), LP_OK);
+    ASSERT_EQ(lp_token_save("affinity_fixture", "secret"), LP_OK);
+
+    std::vector<std::thread> callers;
+    std::atomic<int> succeeded{0};
+    for (int i = 0; i < 8; ++i) {
+        callers.emplace_back([&] {
+            lp_client* client = lp_client_create("affinity_fixture", "caller", nullptr, nullptr);
+            for (int call = 0; call < 5; ++call) {
+                char* result = nullptr;
+                char* error = nullptr;
+                if (lp_invoke(client, "work", "[]", 5000, &result, &error) == LP_OK)
+                    ++succeeded;
+                lp_string_free(result);
+                lp_string_free(error);
+            }
+            lp_client_destroy(client);
+        });
+    }
+    for (auto& caller : callers) caller.join();
+    lp_provider_destroy(provider);
+
+    EXPECT_EQ(succeeded.load(), 40);
+    EXPECT_EQ(fixture.peak.load(), 1);
+    EXPECT_EQ(fixture.threads.size(), 1u);
 }
 
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)

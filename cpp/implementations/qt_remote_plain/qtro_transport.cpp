@@ -39,6 +39,8 @@ constexpr std::size_t kMaximumFrame = 64u << 20;
 // a peer may read nothing while frames wait. Qt buffers without bound.
 constexpr std::size_t kDefaultMaxQueuedBytes = 64u << 20;
 constexpr std::chrono::milliseconds kDefaultStallTimeout{30000};
+// Calls a server runs at once, each on a long-lived worker.
+constexpr std::size_t kDefaultMaxConcurrentCalls = 64;
 using Deadline = std::chrono::steady_clock::time_point;
 using NativeHandle = std::intptr_t;
 constexpr NativeHandle kInvalidHandle = -1;
@@ -1187,6 +1189,14 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     bool acceptExited = true;
     std::size_t activeInvocations = 0;
     std::size_t activeWriters = 0;
+    // Calls start in arrival order on at most maxConcurrentCalls long-lived
+    // workers; with 1, every call runs on the same thread, as on a Qt source.
+    std::size_t maxConcurrentCalls = kDefaultMaxConcurrentCalls;
+    std::deque<std::function<void()>> calls;
+    std::condition_variable callsChanged;
+    std::size_t callWorkers = 0;
+    std::size_t idleCallWorkers = 0;
+    std::set<std::thread::id> callWorkerIds;
     std::size_t maxQueuedBytes = kDefaultMaxQueuedBytes;
     std::chrono::milliseconds stallTimeout = kDefaultStallTimeout;
     std::string path;
@@ -1256,6 +1266,48 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     {
         std::lock_guard<std::mutex> lock(connection->sendMu);
         return enqueueLocked(*connection, std::move(frame), error);
+    }
+
+    // The caller holds mu. False when no worker can run the call.
+    bool startCallLocked(std::function<void()> call)
+    {
+        calls.push_back(std::move(call));
+        if (idleCallWorkers < calls.size() && callWorkers < maxConcurrentCalls) {
+            auto state = shared_from_this();
+            try {
+                std::thread([state] { state->callWorkerLoop(); }).detach();
+                ++callWorkers;
+            } catch (...) {
+                if (callWorkers == 0) {
+                    calls.pop_back();
+                    return false;
+                }
+            }
+        }
+        callsChanged.notify_one();
+        return true;
+    }
+
+    void callWorkerLoop()
+    {
+        std::unique_lock<std::mutex> lock(mu);
+        callWorkerIds.insert(std::this_thread::get_id());
+        for (;;) {
+            ++idleCallWorkers;
+            callsChanged.wait(lock, [&] { return !calls.empty() || !running; });
+            --idleCallWorkers;
+            if (calls.empty()) break;
+            std::function<void()> call = std::move(calls.front());
+            calls.pop_front();
+            lock.unlock();
+            call();
+            call = nullptr;
+            lock.lock();
+        }
+        callWorkerIds.erase(std::this_thread::get_id());
+        --callWorkers;
+        lock.unlock();
+        changed.notify_all();
     }
 
     void writerLoop(const std::shared_ptr<Connection>& connection)
@@ -1378,16 +1430,16 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                         }
                     }
                     if (found && callKind == 0 && object.invoke) {
+                        auto state = shared_from_this();
+                        const std::string objectName = std::move(frame.name);
+                        bool started = false;
                         {
                             std::lock_guard<std::mutex> lock(mu);
                             ++activeInvocations;
-                        }
-                        auto state = shared_from_this();
-                        const std::string objectName = std::move(frame.name);
-                        try {
-                            std::thread([state, connection, object = std::move(object),
-                                         objectName, methodIndex, serial,
-                                         arguments = std::move(arguments)]() mutable {
+                            started = startCallLocked([state, connection,
+                                                       object = std::move(object), objectName,
+                                                       methodIndex, serial,
+                                                       arguments = std::move(arguments)]() {
                                 Variant result;
                                 try {
                                     result = object.invoke(methodIndex, arguments);
@@ -1401,24 +1453,21 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                                     } catch (const std::exception&) {
                                         reply = invokeReplyPacket(objectName, serial, Variant{});
                                     }
-                                    (void)state->send(connection, reply);
+                                    (void)state->send(connection, std::move(reply));
                                 }
                                 {
                                     std::lock_guard<std::mutex> lock(state->mu);
                                     --state->activeInvocations;
                                 }
                                 state->changed.notify_all();
-                            }).detach();
-                        } catch (...) {
-                            {
-                                std::lock_guard<std::mutex> lock(mu);
-                                --activeInvocations;
-                            }
+                            });
+                            if (!started) --activeInvocations;
+                        }
+                        if (!started) {
                             changed.notify_all();
                             if (serial >= 0)
                                 (void)send(connection, invokeReplyPacket(
-                                    objectName, serial,
-                                    Variant::fromRpc(plain::RpcValue{})));
+                                    objectName, serial, Variant::fromRpc(plain::RpcValue{})));
                         }
                     }
                 }
@@ -1599,11 +1648,15 @@ void Server::stop()
         std::lock_guard<std::mutex> lock(m_impl->mu);
         if (!m_impl->running && m_impl->listener.load() == kInvalidHandle
             && m_impl->connections.empty() && m_impl->activeInvocations == 0
-            && m_impl->activeWriters == 0) return;
+            && m_impl->activeWriters == 0 && m_impl->callWorkers == 0) return;
         m_impl->running = false;
         connections = m_impl->connections;
         path = m_impl->path;
+        // Calls that have not started are dropped with their connections.
+        m_impl->activeInvocations -= m_impl->calls.size();
+        m_impl->calls.clear();
     }
+    m_impl->callsChanged.notify_all();
     closeHandle(m_impl->listener);
     for (const auto& connection : connections) Impl::abandon(*connection);
     std::unique_lock<std::mutex> lock(m_impl->mu);
@@ -1614,6 +1667,7 @@ void Server::stop()
         return m_impl->acceptExited
             && m_impl->activeInvocations == 0
             && m_impl->activeWriters == 0
+            && m_impl->callWorkers == m_impl->callWorkerIds.count(caller)
             && std::all_of(m_impl->connections.begin(), m_impl->connections.end(),
                 [&](const auto& connection) { return connection->worker == caller; });
     });
@@ -1699,6 +1753,12 @@ bool Server::emitSignal(const std::string& object,
     for (const auto& connection : listeners)
         ok = m_impl->send(connection, frame, error) && ok;
     return ok;
+}
+
+void Server::setMaxConcurrentCalls(std::size_t maxCalls)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    m_impl->maxConcurrentCalls = maxCalls > 0 ? maxCalls : kDefaultMaxConcurrentCalls;
 }
 
 void Server::setWriteLimits(std::size_t maxQueuedBytes, std::chrono::milliseconds stallTimeout)

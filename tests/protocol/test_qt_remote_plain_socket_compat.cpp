@@ -27,6 +27,9 @@
 #include <future>
 #include <limits>
 #include <optional>
+#include <mutex>
+#include <set>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -751,6 +754,94 @@ TEST(QtRemotePlainSocketCompatTest, AConsumerThatStopsReadingIsDroppedAfterTheSt
     EXPECT_TRUE(drainsToEndOfStream(stalled.get(), 5000))
         << "a consumer that read nothing past the stall timeout was not dropped";
     server.stop();
+}
+
+// Records each call's sequence number and thread, then answers it.
+struct CallLog {
+    std::mutex mutex;
+    std::vector<std::int64_t> order;
+    std::set<std::thread::id> threads;
+    std::atomic<int> running{0};
+    std::atomic<int> peak{0};
+
+    Server::Object object(std::chrono::milliseconds work)
+    {
+        return {"fixture", moduleProxyDefinition(),
+            [this, work](std::int32_t, const std::vector<Variant>& arguments) {
+                const int now = ++running;
+                int seen = peak.load();
+                while (now > seen && !peak.compare_exchange_weak(seen, now)) {}
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    order.push_back(arguments.at(0).value.asInt());
+                    threads.insert(std::this_thread::get_id());
+                }
+                std::this_thread::sleep_for(work);
+                --running;
+                return Variant::fromRpc(RpcValue{true});
+            }};
+    }
+};
+
+// Sends `count` calls back to back on one connection, then reads every reply.
+void pipelineCalls(const std::string& path, int count)
+{
+    auto peer = connectUnix(path);
+    (void)readFrame(peer.get());
+    (void)readFrame(peer.get());
+    writeAll(peer.get(), addObjectPacket("fixture"));
+    ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::InitDynamic);
+    std::vector<std::uint8_t> burst;
+    for (int i = 0; i < count; ++i) {
+        const auto frame = invokePacket("fixture", 0, 0,
+            {Variant::fromRpc(RpcValue{std::int64_t{i}})}, i);
+        burst.insert(burst.end(), frame.begin(), frame.end());
+    }
+    writeAll(peer.get(), burst);
+    for (int i = 0; i < count; ++i)
+        ASSERT_EQ(decodeFrame(readFrame(peer.get())).type, PacketType::InvokeReply);
+}
+
+// Detector: every call ran on a fresh detached thread, so a module a host
+// runs single-threaded saw calls out of order and on a different thread
+// each time.
+TEST(QtRemotePlainSocketCompatTest, SerialCallsRunInArrivalOrderOnOneThread)
+{
+    const std::string path = uniqueSocketPath("serial_calls");
+    std::string error;
+    CallLog log;
+    Server server;
+    server.setMaxConcurrentCalls(1);
+    ASSERT_TRUE(server.publish(log.object(std::chrono::milliseconds(1)), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    constexpr int kCalls = 200;
+    pipelineCalls(path, kCalls);
+    server.stop();
+
+    std::vector<std::int64_t> expected(kCalls);
+    std::iota(expected.begin(), expected.end(), 0);
+    EXPECT_EQ(log.order, expected);
+    EXPECT_EQ(log.threads.size(), 1u);
+    EXPECT_EQ(log.peak.load(), 1);
+}
+
+TEST(QtRemotePlainSocketCompatTest, ConcurrentCallsStayWithinTheLimit)
+{
+    const std::string path = uniqueSocketPath("bounded_calls");
+    std::string error;
+    CallLog log;
+    Server server;
+    server.setMaxConcurrentCalls(4);
+    ASSERT_TRUE(server.publish(log.object(std::chrono::milliseconds(20)), &error)) << error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    pipelineCalls(path, 100);
+    server.stop();
+
+    EXPECT_EQ(log.order.size(), 100u);
+    EXPECT_LE(log.peak.load(), 4);
+    EXPECT_LE(log.threads.size(), 4u);
 }
 
 // Detector: one reply the codec cannot decode used to drop the whole
