@@ -15,7 +15,8 @@ jobs:
     uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
     secrets: inherit
     with:
-      targets: tests
+      targets: tests tests-qt
       smoke: |
         run tests/bin/qt_remote_plain_wire_tests.exe
         run tests/bin/qt_remote_plain_cabi_tests.exe
+        run tests-qt/bin/transport_resolution_tests.exe
