@@ -222,6 +222,11 @@ public:
         return m_nextId.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // A stopping server's side: calls arriving from now on are not started.
+    void beginDrain() { m_draining.store(true); }
+    // Every call it started has answered and every frame it queued is written.
+    bool drained() const { return m_callsRunning.load() == 0 && m_framesUnwritten.load() == 0; }
+
 private:
     void doRead();
     void handleFrame(MessageType tag, std::vector<uint8_t> payload);
@@ -270,6 +275,10 @@ private:
     std::atomic<uint64_t>                        m_nextId{1};
     std::atomic<bool>                            m_stopped{false};
     std::atomic<bool>                            m_started{false};
+    // What RpcServer*::stop() waits for before it closes the connection.
+    std::atomic<bool>                            m_draining{false};
+    std::atomic<std::size_t>                     m_callsRunning{0};
+    std::atomic<std::size_t>                     m_framesUnwritten{0};
 };
 
 // ── Template implementation (must be visible at instantiation sites) ─────
@@ -410,17 +419,23 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
             for (auto& cb : cbs) cb(m);
 
         } else if constexpr (std::is_same_v<T, CallMessage>) {
-            if (!m_handler) return;
+            // A stopping server answers only the calls it had started.
+            if (!m_handler || m_draining.load()) return;
             auto self = this->shared_from_this();
+            m_callsRunning.fetch_add(1);
             m_handler->onCall(m, [self](ResultMessage res) {
+                // Queue the reply before the count drops, so drained() can't miss it.
                 self->writeFrame(encodeFrame(*self->m_codec, AnyMessage{std::move(res)}));
+                self->m_callsRunning.fetch_sub(1);
             });
 
         } else if constexpr (std::is_same_v<T, MethodsMessage>) {
-            if (!m_handler) return;
+            if (!m_handler || m_draining.load()) return;
             auto self = this->shared_from_this();
+            m_callsRunning.fetch_add(1);
             m_handler->onMethods(m, [self](MethodsResultMessage res) {
                 self->writeFrame(encodeFrame(*self->m_codec, AnyMessage{std::move(res)}));
+                self->m_callsRunning.fetch_sub(1);
             });
 
         } else if constexpr (std::is_same_v<T, SubscribeMessage>) {
@@ -717,12 +732,13 @@ template <typename Stream>
 void RpcConnection<Stream>::writeFrame(std::vector<uint8_t> frame)
 {
     if (m_stopped.load()) return;
+    m_framesUnwritten.fetch_add(1);
     auto self = this->shared_from_this();
     boost::asio::post(m_strand, [self, frame = std::move(frame)]() mutable {
         // Re-check inside the strand: the load above is a hint, and fail()
         // can land between it and this handler. Without this the queued
         // frame would start an async_write on a socket fail() is closing.
-        if (self->m_stopped.load()) return;
+        if (self->m_stopped.load()) { self->m_framesUnwritten.fetch_sub(1); return; }
         self->m_writeQueue.push_back(std::move(frame));
         if (!self->m_writing) {
             self->m_writing = true;
@@ -745,6 +761,7 @@ void RpcConnection<Stream>::doWrite()
             [self](const boost::system::error_code& ec, std::size_t /*n*/) {
                 if (ec) { self->fail(ec.message()); return; }
                 self->m_writeQueue.pop_front();
+                self->m_framesUnwritten.fetch_sub(1);
                 if (self->m_writeQueue.empty()) {
                     self->m_writing = false;
                 } else {

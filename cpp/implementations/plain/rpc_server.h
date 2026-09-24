@@ -51,6 +51,8 @@ public:
     // Actual bound port (useful when the caller requested port=0).
     uint16_t boundPort() const { return m_boundPort; }
 
+    // Lets calls already started answer, and queued frames leave, for at most
+    // a second before it closes the connections.
     void stop();
 
 private:
@@ -59,6 +61,7 @@ private:
     void closeAcceptor();
     void closeAcceptorOnStrand();
 
+    boost::asio::io_context&          m_ioc;
     boost::asio::ip::tcp::acceptor    m_acceptor;
     // Serializes every operation on m_acceptor after listen(): the accept
     // initiations and the close. Same reason RpcConnection has one for its
@@ -96,6 +99,7 @@ public:
     // See RpcServerTcp::start().
     bool start();
     uint16_t boundPort() const { return m_boundPort; }
+    // See RpcServerTcp::stop().
     void stop();
 
 private:
@@ -104,6 +108,7 @@ private:
     void closeAcceptor();
     void closeAcceptorOnStrand();
 
+    boost::asio::io_context&         m_ioc;
     boost::asio::ip::tcp::acceptor   m_acceptor;
     // See RpcServerTcp::m_strand.
     boost::asio::strand<boost::asio::any_io_executor> m_strand;
