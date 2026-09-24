@@ -604,13 +604,18 @@ LogosObject* QtRemotePlainTransportConnection::requestObject(const QString& obje
     const auto budget = timeoutMs > 0 ? std::chrono::milliseconds(timeoutMs) : kImmediateWait;
     const auto deadline = std::chrono::steady_clock::now() + budget;
     const auto listenerWait = timeoutMs > 0 ? budget : std::chrono::milliseconds(0);
-    if (!dial(*m_shared, m_url, listenerWait, budget)) return nullptr;
-    const auto left = std::max(std::chrono::milliseconds(1),
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()));
-    std::string error;
     const std::string object = objectName.toStdString();
-    if (!m_shared->client->acquire(object, left, &error)) return nullptr;
+    const auto acquire = [&] {
+        if (!dial(*m_shared, m_url, listenerWait, budget)) return false;
+        const auto left = std::max(std::chrono::milliseconds(1),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()));
+        std::string error;
+        return m_shared->client->acquire(object, left, &error);
+    };
+    // A caller that waits keeps its thread's events flowing, as calls here and
+    // qt_remote's acquire do, so a peer this thread serves can answer.
+    if (!(timeoutMs > 0 ? withEventsFlowing(acquire) : acquire())) return nullptr;
     auto state = std::make_shared<HandleState>();
     {
         std::lock_guard<std::mutex> lock(m_shared->mutex);
