@@ -566,6 +566,20 @@ target_link_libraries(qt_remote_plain_cabi_shared_tests PRIVATE
 )
 gtest_discover_tests(qt_remote_plain_cabi_shared_tests PROPERTIES TIMEOUT 8)
 
+# A process that called over TLS through the shared runtime must exit: the
+# child makes one call and returns, and the test runs it many times.
+add_executable(plain_exit_child plain_exit_child.cpp)
+target_link_libraries(plain_exit_child PRIVATE logos_protocol_plain_shared)
+add_executable(qt_remote_plain_exit_tests test_plain_exit.cpp)
+target_link_libraries(qt_remote_plain_exit_tests PRIVATE
+    logos_protocol_plain_shared
+    GTest::gtest_main
+)
+target_compile_definitions(qt_remote_plain_exit_tests PRIVATE
+    PLAIN_EXIT_CHILD="$<TARGET_FILE:plain_exit_child>")
+add_dependencies(qt_remote_plain_exit_tests plain_exit_child)
+gtest_discover_tests(qt_remote_plain_exit_tests PROPERTIES TIMEOUT 600)
+
 # A real Qt Remote Objects host exercises callback-initiated teardown of the
 # Qt-free client across the legacy/plain interoperability boundary. Qt's local
 # socket path compatibility is required on Unix; Windows modules use plain.
