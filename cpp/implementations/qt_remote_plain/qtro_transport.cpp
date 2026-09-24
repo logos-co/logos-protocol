@@ -194,12 +194,19 @@ void shutdownHandle(NativeHandle handle)
     ::DisconnectNamedPipe(winHandle(handle));
 }
 
+// Ends pending I/O only. Disconnecting would also discard what the peer has
+// not read yet, which is how a stopping server lost replies it had written.
+void cancelHandle(NativeHandle handle)
+{
+    if (handle != kInvalidHandle) ::CancelIoEx(winHandle(handle), nullptr);
+}
+
 bool readExact(NativeHandle handle, std::uint8_t* output, std::size_t size,
                const std::atomic<bool>* running)
 {
-    (void)running;
     std::size_t offset = 0;
     while (offset < size) {
+        if (running && !running->load()) return false;
         DWORD received = 0;
         const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(
             size - offset, std::numeric_limits<DWORD>::max()));
@@ -321,6 +328,12 @@ bool writeAllOrStall(NativeHandle fd, const std::vector<std::uint8_t>& data,
 void shutdownHandle(NativeHandle fd)
 {
     if (fd != kInvalidHandle) ::shutdown(static_cast<int>(fd), SHUT_RDWR);
+}
+
+// A socket's peer keeps what was already sent, so this is shutdownHandle.
+void cancelHandle(NativeHandle fd)
+{
+    shutdownHandle(fd);
 }
 
 bool readExact(NativeHandle fd, std::uint8_t* output, std::size_t size,
@@ -451,15 +464,17 @@ InvokeFrame decodeInvoke(const std::vector<std::uint8_t>& payload)
     return frame;
 }
 
-void closeHandle(std::atomic<NativeHandle>& handle)
+// With keepUnread, a pipe's peer can still read what was written before the close.
+void closeHandle(std::atomic<NativeHandle>& handle, bool keepUnread = false)
 {
     const NativeHandle value = handle.exchange(kInvalidHandle);
     if (value == kInvalidHandle) return;
 #ifdef _WIN32
     ::CancelIoEx(winHandle(value), nullptr);
-    ::DisconnectNamedPipe(winHandle(value));
+    if (!keepUnread) ::DisconnectNamedPipe(winHandle(value));
     ::CloseHandle(winHandle(value));
 #else
+    (void)keepUnread;
     {
         ::shutdown(value, SHUT_RDWR);
         ::close(value);
@@ -1304,8 +1319,8 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::vector<std::shared_ptr<Connection>> connections;
 
     // Drops what is queued and ends the connection's I/O; its reader then
-    // closes it.
-    static void abandon(Connection& connection)
+    // closes it. With keepUnread, what was already written stays readable.
+    static void abandon(Connection& connection, bool keepUnread = false)
     {
         {
             std::lock_guard<std::mutex> lock(connection.outMu);
@@ -1315,7 +1330,8 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         }
         connection.outChanged.notify_all();
         std::lock_guard<std::mutex> lock(connection.fdMu);
-        shutdownHandle(connection.fd.load());
+        if (keepUnread) cancelHandle(connection.fd.load());
+        else shutdownHandle(connection.fd.load());
     }
 
     // The caller holds connection.sendMu.
@@ -1581,14 +1597,16 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 break;
             }
         }
-        abandon(*connection);
+        // A stopping server leaves its answers readable after the close.
+        const bool stopping = !serving;
+        abandon(*connection, stopping);
         {
             std::unique_lock<std::mutex> lock(connection->outMu);
             connection->outChanged.wait(lock, [&] { return connection->writerDone; });
         }
         {
             std::lock_guard<std::mutex> lock(connection->fdMu);
-            closeHandle(connection->fd);
+            closeHandle(connection->fd, stopping);
         }
         {
             std::lock_guard<std::mutex> lock(mu);
@@ -1867,9 +1885,9 @@ void Server::stop()
         });
     }
     m_impl->serving = false;
-    for (const auto& connection : connections) Impl::abandon(*connection);
+    for (const auto& connection : connections) Impl::abandon(*connection, true);
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    m_impl->changed.wait(lock, [&] {
+    const auto stopped = [&] {
         // A caller's own connection closes once the caller returns; its
         // writer, like every other, has already stopped.
         return m_impl->acceptExited
@@ -1878,7 +1896,22 @@ void Server::stop()
             && m_impl->callWorkers == m_impl->callWorkerIds.count(caller)
             && std::all_of(m_impl->connections.begin(), m_impl->connections.end(),
                 [&](const auto& connection) { return connection->worker == caller; });
-    });
+    };
+#ifdef _WIN32
+    // A cancel reaches only a read already issued; one issued after it waits
+    // for the peer, so cancel again until every reader is out.
+    while (!m_impl->changed.wait_for(lock, std::chrono::milliseconds(50), stopped)) {
+        const auto open = m_impl->connections;
+        lock.unlock();
+        for (const auto& connection : open) {
+            std::lock_guard<std::mutex> fdLock(connection->fdMu);
+            cancelHandle(connection->fd.load());
+        }
+        lock.lock();
+    }
+#else
+    m_impl->changed.wait(lock, stopped);
+#endif
 #ifdef _WIN32
     if (m_impl->stopEvent) {
         ::CloseHandle(m_impl->stopEvent);
