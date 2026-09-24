@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_object.h"
 #include "logos_async_dispatch.h"
 #include "logos_api_consumer.h"
@@ -344,14 +345,13 @@ TEST_F(RemoteEventTest, ConsumerReusesCachedHandleAcrossSyncAndAsyncCalls)
 {
     const QString registryUrl = LogosInstance::id("echo_module");
 
-    RemoteTransportHost host(registryUrl);
+    auto host = makeLocalHost(registryUrl);
     EchoProvider provider;
     ModuleProxy proxy(&provider);
     ASSERT_TRUE(proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok")));
-    ASSERT_TRUE(host.publishObject("echo_module", &proxy));
+    ASSERT_TRUE(host->publishObject("echo_module", &proxy));
 
-    // Remote mode → the qt_remote local-socket transport (RemoteTransportConnection,
-    // the same path a UI plugin uses), matching the RemoteTransportHost above.
+    // Remote mode → the local transport a UI plugin uses, matching the host above.
     LogosModeConfig::setMode(LogosMode::Remote);
     LogosAPIConsumer consumer(QStringLiteral("echo_module"), QStringLiteral("caller"),
                               /*token_manager=*/nullptr);
@@ -382,5 +382,6 @@ TEST_F(RemoteEventTest, ConsumerReusesCachedHandleAcrossSyncAndAsyncCalls)
     for (int i = 0; i < N; ++i) EXPECT_EQ(results[i], i) << "async echo " << i;
 
     // The whole point: 2*N calls, but the handle was acquired exactly once.
-    EXPECT_EQ(RemoteTransportConnection::acquireCount(), 1);
+    // Only QtRO counts its acquires.
+    if (!localIsPlain()) EXPECT_EQ(RemoteTransportConnection::acquireCount(), 1);
 }

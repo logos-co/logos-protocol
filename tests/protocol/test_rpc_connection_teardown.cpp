@@ -39,8 +39,7 @@
 #include "rpc_connection.h"
 #include "rpc_message.h"
 
-#include <boost/asio/local/connect_pair.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
+#include "connected_pair.h"
 
 #include <chrono>
 #include <csignal>
@@ -59,7 +58,7 @@ using namespace logos::plain;
 
 namespace {
 
-using LocalSocket     = boost::asio::local::stream_protocol::socket;
+using LocalSocket     = PairSocket;
 using LocalConnection = RpcConnection<LocalSocket>;
 
 // Number of open file descriptors held by this process, or -1 when the
@@ -88,12 +87,15 @@ int openFdCount()
 // process — asio sets SO_NOSIGPIPE on sockets it creates with socket(), but
 // not on the pair socketpair() hands back. Ignore it for the duration, then
 // put the previous disposition back so no other test inherits the change.
+// Windows has no SIGPIPE: the write fails with an error instead.
 class SigPipeGuard {
+#ifdef SIGPIPE
 public:
     SigPipeGuard()  : m_prev(std::signal(SIGPIPE, SIG_IGN)) {}
     ~SigPipeGuard() { std::signal(SIGPIPE, m_prev); }
 private:
     void (*m_prev)(int);
+#endif
 };
 
 }  // namespace
@@ -116,7 +118,7 @@ TEST(RpcConnectionTeardownTest, StopWhileWritesAreInFlight)
         LocalSocket mine(ioc);
         LocalSocket peer(ioc);
         boost::system::error_code ec;
-        boost::asio::local::connect_pair(mine, peer, ec);
+        connectPair(mine, peer, ec);
         ASSERT_FALSE(ec) << "connect_pair failed: " << ec.message();
 
         auto conn = std::make_shared<LocalConnection>(std::move(mine), codec, nullptr);

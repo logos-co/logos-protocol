@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_call_error.h"
 #include "logos_instance.h"
@@ -131,8 +132,8 @@ protected:
 // a target that has not published, and comes back empty.
 TEST_F(ReadinessGatedExchangeTest, TheExchangeIsNotAttemptedUntilTheTargetHasPublished)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -148,7 +149,7 @@ TEST_F(ReadinessGatedExchangeTest, TheExchangeIsNotAttemptedUntilTheTargetHasPub
     const QString bootstrap = QStringLiteral("bootstrap-tok-gate");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -159,9 +160,11 @@ TEST_F(ReadinessGatedExchangeTest, TheExchangeIsNotAttemptedUntilTheTargetHasPub
     // defect: publishing before the call means the mint lands against a live target either
     // way, and the test passes with or without the gate. A sync invoke spins QtRO's nested
     // event loop, so this timer fires inside it.
-    QTimer::singleShot(500, [&] {
+    // Owned here, so a call that returns early cannot leave it to fire into the next test.
+    QObject timerContext;
+    QTimer::singleShot(500, &timerContext, [&] {
         published.store(true);
-        targetHost.publishObject("target_module", &targetProxy);
+        targetHost->publishObject("target_module", &targetProxy);
     });
 
     QVariant r = client.invokeRemoteMethod(QStringLiteral("target_module"),
@@ -182,7 +185,7 @@ TEST_F(ReadinessGatedExchangeTest, TheExchangeIsNotAttemptedUntilTheTargetHasPub
 // and pay the same budget again. The gate must RETURN.
 TEST_F(ReadinessGatedExchangeTest, AFirstCallToAnAbsentTargetPaysTheAcquireBudgetOnlyOnce)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
 
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
@@ -190,7 +193,7 @@ TEST_F(ReadinessGatedExchangeTest, AFirstCallToAnAbsentTargetPaysTheAcquireBudge
     const QString bootstrap = QStringLiteral("bootstrap-tok-absent");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -214,8 +217,8 @@ TEST_F(ReadinessGatedExchangeTest, AFirstCallToAnAbsentTargetPaysTheAcquireBudge
 // The control. Without it a green suite cannot tell the fix from a mis-wired fixture.
 TEST_F(ReadinessGatedExchangeTest, ACallToATargetThatIsAlreadyUpIsNotDelayedByTheGate)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -228,8 +231,8 @@ TEST_F(ReadinessGatedExchangeTest, ACallToATargetThatIsAlreadyUpIsNotDelayedByTh
     const QString bootstrap = QStringLiteral("bootstrap-tok-warm");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -253,7 +256,7 @@ TEST_F(ReadinessGatedExchangeTest, ACallToATargetThatIsAlreadyUpIsNotDelayedByTh
 
 TEST_F(ReadinessGatedExchangeTest, AnAsyncCallToATargetThatNeverAppearsStillAnswersItsCaller)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
 
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
@@ -261,7 +264,7 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncCallToATargetThatNeverAppearsStillAnsw
     const QString bootstrap = QStringLiteral("bootstrap-tok-async-absent");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -290,8 +293,8 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncCallToATargetThatNeverAppearsStillAnsw
 
 TEST_F(ReadinessGatedExchangeTest, AnAsyncBurstToALateTargetMintsOnceAndCompletesWhenItAppears)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -307,7 +310,7 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncBurstToALateTargetMintsOnceAndComplete
     const QString bootstrap = QStringLiteral("bootstrap-tok-async-late");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -326,7 +329,7 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncBurstToALateTargetMintsOnceAndComplete
 
     // The target appears late, as a real module process does.
     pumpEventLoop(500);
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
     published.store(true);
     pumpEventLoop(2500);
 
@@ -341,8 +344,8 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncBurstToALateTargetMintsOnceAndComplete
 
 TEST_F(ReadinessGatedExchangeTest, AnAsyncCallToAWarmTargetIsNotDelayedByTheGate)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -355,8 +358,8 @@ TEST_F(ReadinessGatedExchangeTest, AnAsyncCallToAWarmTargetIsNotDelayedByTheGate
     const QString bootstrap = QStringLiteral("bootstrap-tok-async-warm");
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrap);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrap));
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),

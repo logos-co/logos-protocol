@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
@@ -73,12 +74,12 @@ public:
 struct Publisher {
     EchoProvider echo;
     ModuleProxy proxy;
-    RemoteTransportHost host;
+    std::unique_ptr<LogosTransportHost> host;
     explicit Publisher(const QString& moduleName)
-        : proxy(&echo), host(LogosInstance::id(moduleName))
+        : proxy(&echo), host(makeLocalHost(LogosInstance::id(moduleName)))
     {
         proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok"));
-        host.publishObject(moduleName, &proxy);
+        host->publishObject(moduleName, &proxy);
     }
 };
 
