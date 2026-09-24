@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_consumer.h"
 #include "logos_instance.h"
 #include "logos_provider_interface.h"
@@ -105,14 +106,14 @@ protected:
 TEST_F(HandshakeTransportTest, TokenReachesAModuleWhoseBusinessObjectIsNotPublishedYet)
 {
     const QString module = QStringLiteral("hsx_early_module");
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
 
     RecordingProvider provider;
     ModuleProxy proxy(&provider);
     ModuleHandshakeProxy handshake(&proxy);
 
     // Only the handshake surface goes up. This is the state during init().
-    ASSERT_TRUE(host.publishObject(logos::handshakeObjectName(module), &handshake))
+    ASSERT_TRUE(host->publishObject(logos::handshakeObjectName(module), &handshake))
         << "the transport refused to publish the token-only surface";
 
     // The trust anchor the publisher seeds before going live (qt-sdk
@@ -143,12 +144,12 @@ TEST_F(HandshakeTransportTest, TokenReachesAModuleWhoseBusinessObjectIsNotPublis
 TEST_F(HandshakeTransportTest, AnUnseededAnchorRefusesEvenThoughTheSurfaceIsReachable)
 {
     const QString module = QStringLiteral("hsx_unseeded_module");
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
 
     RecordingProvider provider;
     ModuleProxy proxy(&provider);
     ModuleHandshakeProxy handshake(&proxy);
-    ASSERT_TRUE(host.publishObject(logos::handshakeObjectName(module), &handshake));
+    ASSERT_TRUE(host->publishObject(logos::handshakeObjectName(module), &handshake));
 
     // Neither trust key exists — the pre-seeding state.
     ScopedToken restoreCore(QStringLiteral("core"));
@@ -178,13 +179,13 @@ TEST_F(HandshakeTransportTest, AnUnseededAnchorRefusesEvenThoughTheSurfaceIsReac
 TEST_F(HandshakeTransportTest, ALegacyModuleFallsBackAndIsNotReProbed)
 {
     const QString module = QStringLiteral("hsx_legacy_module");
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
 
     RecordingProvider provider;
     ModuleProxy proxy(&provider);
 
     // Only the BUSINESS object — a module built before the handshake surface.
-    ASSERT_TRUE(host.publishObject(module, &proxy));
+    ASSERT_TRUE(host->publishObject(module, &proxy));
 
     ScopedToken core(QStringLiteral("core"), QStringLiteral("coretok"));
     ScopedToken peer(QStringLiteral("peer"));

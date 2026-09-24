@@ -243,8 +243,8 @@ add_executable(protocol_tests
     # whole deadline and is then told "timeout" for a connection that was
     # already gone. Predates the fold (master has it on the promise path).
     # Builds the interleaving by parking the caller on the connection's own
-    # mutex rather than racing for it. POSIX only: it builds on socketpair().
-    $<$<NOT:$<PLATFORM_ID:Windows>>:test_plain_send_after_fail.cpp>
+    # mutex rather than racing for it.
+    test_plain_send_after_fail.cpp
     # release() racing a call still running on another thread — a PRE-EXISTING
     # use-after-free (reproduced identically on master, on #45 and on #46), now
     # FIXED by a live-reference count: release() drops the owner's reference and
@@ -309,8 +309,7 @@ add_executable(protocol_tests
     # not on the caller's thread — a caller-thread close ran concurrently with
     # the io thread initiating async_write and segfaulted inside asio's
     # reactor. Also guards the fix against leaking descriptors or hanging.
-    # POSIX only: it builds on socketpair().
-    $<$<NOT:$<PLATFORM_ID:Windows>>:test_rpc_connection_teardown.cpp>
+    test_rpc_connection_teardown.cpp
     # The acceptor half of the same race: RpcServer::stop() closed m_acceptor on
     # the caller's thread while doAccept() re-armed async_accept on the io
     # thread. Also guards that arming the first accept on the strand (rather

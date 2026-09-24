@@ -40,6 +40,8 @@
 
 #include <gtest/gtest.h>
 
+#include "implementations/qt_remote_plain/qt_remote_plain_transport.h"
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_async_dispatch.h"
 #include "logos_instance.h"
@@ -126,7 +128,8 @@ public:
 };
 
 enum class ProviderKind { Qt, Universal };
-enum class TransportKind { QtRemote, QtLocal, Plain };
+// QtRemotePlain is the local transport Windows resolves every local connection to.
+enum class TransportKind { QtRemote, QtLocal, Plain, QtRemotePlain };
 
 const char* nameOf(ProviderKind p) { return p == ProviderKind::Qt ? "QtProvider" : "UniversalProvider"; }
 
@@ -176,6 +179,7 @@ const char* nameOf(TransportKind t) {
     case TransportKind::QtRemote: return "qt_remote";
     case TransportKind::QtLocal:  return "qt_local";
     case TransportKind::Plain:    return "plain_tcp";
+    case TransportKind::QtRemotePlain: return "qt_remote_plain";
     }
     return "?";
 }
@@ -237,6 +241,11 @@ public:
         case TransportKind::Plain:
             m_plainHost->publishObject(m_name, m_proxy.get());
             break;
+        case TransportKind::QtRemotePlain:
+            m_plainLocalHost = std::make_unique<logos::qt_remote_plain::QtRemotePlainTransportHost>(
+                LogosInstance::id(m_name));
+            m_plainLocalHost->publishObject(m_name, m_proxy.get());
+            break;
         }
         m_up = true;
     }
@@ -248,6 +257,7 @@ public:
         case TransportKind::QtRemote: m_remoteHost.reset(); break;
         case TransportKind::QtLocal:  m_localHost->unpublishObject(m_name); m_localHost.reset(); break;
         case TransportKind::Plain:    m_plainHost->unpublishObject(m_name); break;
+        case TransportKind::QtRemotePlain: m_plainLocalHost.reset(); break;
         }
         m_up = false;
     }
@@ -279,6 +289,8 @@ public:
             cfg.protocol = LogosProtocol::Tcp;
             cfg.host = "127.0.0.1";
             cfg.port = m_port;
+        } else if (m_transport == TransportKind::QtRemotePlain) {
+            cfg.protocol = LogosProtocol::QtRemotePlain;
         }
         return cfg;
     }
@@ -287,6 +299,7 @@ public:
     // "process default", which is right for everything but plain.
     std::string lpEndpoint() const
     {
+        if (m_transport == TransportKind::QtRemotePlain) return "{\"protocol\":\"qt_remote_plain\"}";
         if (m_transport != TransportKind::Plain) return std::string();
         return "{\"protocol\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":"
              + std::to_string(m_port) + "}";
@@ -306,6 +319,7 @@ private:
     std::unique_ptr<RemoteTransportHost> m_remoteHost;
     std::unique_ptr<LocalTransportHost> m_localHost;
     std::unique_ptr<logos::plain::PlainTransportHost> m_plainHost;
+    std::unique_ptr<logos::qt_remote_plain::QtRemotePlainTransportHost> m_plainLocalHost;
     bool m_plainStarted = false;
     uint16_t m_port = 0;
 };
@@ -368,6 +382,10 @@ class EventDeliveryMatrix : public ::testing::TestWithParam<MatrixCase> {
 protected:
     void SetUp() override
     {
+        // The qt_remote kind hosts on Qt, and a local consumer here resolves to
+        // qt_remote_plain; the qt_remote_plain rows are that pairing's coverage.
+        if (GetParam().transport == TransportKind::QtRemote && localIsPlain())
+            GTEST_SKIP() << "qt_remote is not the local transport here (it resolves to qt_remote_plain)";
         ensureApp();
         // The mode is process-global and is read when the consumer is built, so
         // it has to be set before any client in the case is constructed.
@@ -924,7 +942,9 @@ INSTANTIATE_TEST_SUITE_P(
         MatrixCase{TransportKind::QtLocal,  ProviderKind::Qt},
         MatrixCase{TransportKind::QtLocal,  ProviderKind::Universal},
         MatrixCase{TransportKind::Plain,    ProviderKind::Qt},
-        MatrixCase{TransportKind::Plain,    ProviderKind::Universal}),
+        MatrixCase{TransportKind::Plain,    ProviderKind::Universal},
+        MatrixCase{TransportKind::QtRemotePlain, ProviderKind::Qt},
+        MatrixCase{TransportKind::QtRemotePlain, ProviderKind::Universal}),
     [](const ::testing::TestParamInfo<MatrixCase>& i) {
         return std::string(nameOf(i.param.transport)) + "_" + nameOf(i.param.provider);
     });

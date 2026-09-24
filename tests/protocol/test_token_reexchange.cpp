@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_provider_interface.h"
@@ -206,7 +207,7 @@ TEST_F(TokenReexchangeTest, SentinelDecodesLikeEmptyForOldConsumers)
 
 namespace {
 // Common rig wiring for the client-level integration tests.
-void wireRig(RemoteTransportHost& capHost, RemoteTransportHost& targetHost,
+void wireRig(LogosTransportHost& capHost, LogosTransportHost& targetHost,
              ModuleProxy& capProxy, ModuleProxy& targetProxy,
              CapabilityProvider& capProvider, SimTargetProvider& targetProvider,
              const QString& bootstrapToken)
@@ -225,15 +226,15 @@ void wireRig(RemoteTransportHost& capHost, RemoteTransportHost& targetHost,
 // ── Consumer side: a rejection triggers exactly one re-exchange + retry ───────
 TEST_F(TokenReexchangeTest, SyncRejectionReexchangesAndRetriesOnce)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     SimTargetProvider targetProvider(SimTargetProvider::RejectOnceThenOk);
     ModuleProxy       targetProxy(&targetProvider);
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
 
-    wireRig(capHost, targetHost, capProxy, targetProxy, capProvider, targetProvider,
+    wireRig(*capHost, *targetHost, capProxy, targetProxy, capProvider, targetProvider,
             QStringLiteral("bootstrap-tok-sync"));
 
     LogosAPIClient client(QStringLiteral("target_module"), QStringLiteral("test_origin"),
@@ -255,15 +256,15 @@ TEST_F(TokenReexchangeTest, SyncRejectionReexchangesAndRetriesOnce)
 // ── Bounded: a provider that always rejects retries once, then gives up ───────
 TEST_F(TokenReexchangeTest, SyncPersistentRejectionRetriesOnceThenGivesUp)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     SimTargetProvider targetProvider(SimTargetProvider::AlwaysReject);
     ModuleProxy       targetProxy(&targetProvider);
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
 
-    wireRig(capHost, targetHost, capProxy, targetProxy, capProvider, targetProvider,
+    wireRig(*capHost, *targetHost, capProxy, targetProxy, capProvider, targetProvider,
             QStringLiteral("bootstrap-tok-bounded"));
 
     LogosAPIClient client(QStringLiteral("target_module"), QStringLiteral("test_origin"),
@@ -286,15 +287,15 @@ TEST_F(TokenReexchangeTest, SyncPersistentRejectionRetriesOnceThenGivesUp)
 // ── False-positive guard: a legitimately empty result must NOT re-exchange ────
 TEST_F(TokenReexchangeTest, SyncEmptyResultDoesNotReexchange)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     SimTargetProvider targetProvider(SimTargetProvider::AlwaysEmpty);
     ModuleProxy       targetProxy(&targetProvider);
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
 
-    wireRig(capHost, targetHost, capProxy, targetProxy, capProvider, targetProvider,
+    wireRig(*capHost, *targetHost, capProxy, targetProxy, capProvider, targetProvider,
             QStringLiteral("bootstrap-tok-empty"));
 
     LogosAPIClient client(QStringLiteral("target_module"), QStringLiteral("test_origin"),
@@ -314,15 +315,15 @@ TEST_F(TokenReexchangeTest, SyncEmptyResultDoesNotReexchange)
 // ── Async path re-exchanges + retries on a rejection ─────────────────────────
 TEST_F(TokenReexchangeTest, AsyncRejectionReexchangesAndRetriesOnce)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     SimTargetProvider targetProvider(SimTargetProvider::RejectOnceThenOk);
     ModuleProxy       targetProxy(&targetProvider);
     CapabilityProvider capProvider;
     ModuleProxy        capProxy(&capProvider);
 
-    wireRig(capHost, targetHost, capProxy, targetProxy, capProvider, targetProvider,
+    wireRig(*capHost, *targetHost, capProxy, targetProxy, capProvider, targetProvider,
             QStringLiteral("bootstrap-tok-async"));
 
     LogosAPIClient client(QStringLiteral("target_module"), QStringLiteral("test_origin"),

@@ -62,8 +62,7 @@
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/local/connect_pair.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
+#include "connected_pair.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -84,7 +83,7 @@ using namespace logos::plain;
 
 namespace {
 
-using LocalSocket     = boost::asio::local::stream_protocol::socket;
+using LocalSocket     = PairSocket;
 using LocalConnection = RpcConnection<LocalSocket>;
 
 // An io_context with its own thread, so the two ends of the socketpair really
@@ -276,7 +275,7 @@ TEST(PlainCompletionSubOrderTest, AConcurrentFirstCallCannotOutrunTheSubscriptio
     LocalSocket clientSock(clientIo.ctx());
     LocalSocket serverSock(serverIo.ctx());
     boost::system::error_code ec;
-    boost::asio::local::connect_pair(clientSock, serverSock, ec);
+    connectPair(clientSock, serverSock, ec);
     ASSERT_FALSE(ec) << "connect_pair failed: " << ec.message();
 
     InstantMultiProvider provider;

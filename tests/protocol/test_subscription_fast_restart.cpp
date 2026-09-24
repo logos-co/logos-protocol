@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
@@ -65,11 +66,12 @@ struct Provider {
     void emitEvent() { echo.emitFn(QStringLiteral("ev"), QVariantList{tag}); }
 };
 
-// A live host whose published object is swapped without dropping the connection (RemoveObject path).
-struct SwappableHost {
+// A live QtRO host whose published object is swapped without dropping the connection
+// (RemoveObject path).
+struct QtSwappableHost {
     QRemoteObjectRegistryHost host;
     QString name;
-    explicit SwappableHost(const QString& mod) : name(mod) {
+    explicit QtSwappableHost(const QString& mod) : name(mod) {
         EXPECT_TRUE(host.setRegistryUrl(QUrl(LogosInstance::id(mod))));
     }
     void publish(Provider& p) { EXPECT_TRUE(host.enableRemoting(&p.proxy, name)); }
@@ -79,13 +81,35 @@ struct SwappableHost {
     }
 };
 
+// A fast restart on the local transport. qt_remote swaps the source on the live
+// connection; a qt_remote_plain host is a process, so it restarts as a new host.
+struct SwappableHost {
+    std::unique_ptr<QtSwappableHost> qt;
+    std::unique_ptr<LogosTransportHost> plain;
+    QString name;
+    explicit SwappableHost(const QString& mod) : name(mod) {
+        if (localIsPlain()) plain = makeLocalHost(LogosInstance::id(mod));
+        else qt = std::make_unique<QtSwappableHost>(mod);
+    }
+    void publish(Provider& p) {
+        if (qt) qt->publish(p);
+        else EXPECT_TRUE(plain->publishObject(name, &p.proxy));
+    }
+    void replace(Provider& from, Provider& to) {
+        if (qt) return qt->replace(from, to);
+        plain.reset();
+        plain = makeLocalHost(LogosInstance::id(name));
+        EXPECT_TRUE(plain->publishObject(name, &to.proxy));
+    }
+};
+
 // A whole host that is torn down and rebound on the same socket, like a module process swap.
 struct Publisher {
     Provider provider;
-    RemoteTransportHost host;
+    std::unique_ptr<LogosTransportHost> host;
     Publisher(const QString& mod, const QString& tag)
-        : provider(tag), host(LogosInstance::id(mod)) {
-        EXPECT_TRUE(host.publishObject(mod, &provider.proxy));
+        : provider(tag), host(makeLocalHost(LogosInstance::id(mod))) {
+        EXPECT_TRUE(host->publishObject(mod, &provider.proxy));
     }
 };
 
@@ -330,7 +354,7 @@ TEST_F(FastProviderRestartTest, ABoundHandleStopsAtTheLossAnUnboundOneDoesNot)
 {
     const QString mod = QStringLiteral("fast_restart_bound_module");
     Provider p1(QStringLiteral("p1")), p2(QStringLiteral("p2"));
-    SwappableHost host(mod);
+    QtSwappableHost host(mod);
     host.publish(p1);
 
     RemoteTransportConnection conn(LogosInstance::id(mod));
