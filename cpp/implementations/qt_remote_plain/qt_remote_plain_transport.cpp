@@ -38,6 +38,11 @@ using plain::RpcMap;
 using plain::RpcValue;
 
 constexpr int kDefaultTimeoutMs = 20000;
+// A zero-timeout acquire (the consumer's retry tick) waits no longer than this
+// for what is already there; an absent peer costs one dial attempt.
+constexpr std::chrono::milliseconds kImmediateWait{20};
+// How long a peer that is listening gets to send its greeting.
+constexpr std::chrono::milliseconds kGreetingWait{5000};
 
 std::chrono::milliseconds timeoutFor(int timeoutMs)
 {
@@ -323,7 +328,25 @@ struct QtRemotePlainTransportConnection::Shared {
     std::shared_ptr<Client> client = std::make_shared<Client>();
     std::mutex mutex;
     std::unordered_map<std::string, std::vector<std::weak_ptr<HandleState>>> handles;
+    // Set by connectToHost(), as qt_remote's node is by connectToNode().
+    std::atomic<bool> armed{false};
+    // Client::connect() drops a live connection, so one dial at a time.
+    std::mutex dialMutex;
 };
+
+namespace {
+
+// Dials unless connected. A listenerWait of 0 is a single attempt.
+bool dial(QtRemotePlainTransportConnection::Shared& shared, const std::string& url,
+          std::chrono::milliseconds listenerWait, std::chrono::milliseconds timeout)
+{
+    std::lock_guard<std::mutex> lock(shared.dialMutex);
+    if (shared.client->isConnected()) return true;
+    std::string error;
+    return shared.client->connect(url, timeout, &error, nullptr, listenerWait);
+}
+
+} // namespace
 
 namespace {
 
@@ -550,18 +573,21 @@ QtRemotePlainTransportConnection::~QtRemotePlainTransportConnection()
     m_shared->client->close();
 }
 
+// As qt_remote's connectToNode(): records the endpoint and returns. A peer that
+// is not listening yet is dialled again by isConnected() and requestObject().
 bool QtRemotePlainTransportConnection::connectToHost()
 {
-    if (m_shared->client->isConnected()) return true;
-    std::string error;
-    const bool connected = m_shared->client->connect(m_url, std::chrono::seconds(5), &error);
-    if (!connected) qWarning() << "QtRemotePlainTransportConnection:" << error.c_str();
-    return connected;
+    if (m_url.empty()) return false;
+    m_shared->armed = true;
+    dial(*m_shared, m_url, std::chrono::milliseconds(0), kGreetingWait);
+    return true;
 }
 
+// Truthful, as qt_remote's is: a peer that has come up since is dialled once.
 bool QtRemotePlainTransportConnection::isConnected() const
 {
-    return m_shared->client->isConnected();
+    if (m_shared->client->isConnected()) return true;
+    return m_shared->armed && dial(*m_shared, m_url, std::chrono::milliseconds(0), kGreetingWait);
 }
 
 bool QtRemotePlainTransportConnection::reconnect()
@@ -570,13 +596,21 @@ bool QtRemotePlainTransportConnection::reconnect()
     return connectToHost();
 }
 
+// timeoutMs bounds the dial and the acquire together; 0 waits for nothing that
+// is not there already, as the consumer's retry tick requires.
 LogosObject* QtRemotePlainTransportConnection::requestObject(const QString& objectName,
                                                              int timeoutMs)
 {
-    if (!connectToHost()) return nullptr;
+    const auto budget = timeoutMs > 0 ? std::chrono::milliseconds(timeoutMs) : kImmediateWait;
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    const auto listenerWait = timeoutMs > 0 ? budget : std::chrono::milliseconds(0);
+    if (!dial(*m_shared, m_url, listenerWait, budget)) return nullptr;
+    const auto left = std::max(std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()));
     std::string error;
     const std::string object = objectName.toStdString();
-    if (!m_shared->client->acquire(object, timeoutFor(timeoutMs), &error)) return nullptr;
+    if (!m_shared->client->acquire(object, left, &error)) return nullptr;
     auto state = std::make_shared<HandleState>();
     {
         std::lock_guard<std::mutex> lock(m_shared->mutex);

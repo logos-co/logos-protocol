@@ -1,4 +1,7 @@
 #include "implementations/qt_remote_plain/qt_remote_plain_transport.h"
+#include "logos_api_client.h"
+#include "logos_instance.h"
+#include "logos_transport_config.h"
 #include "logos_mode.h"
 #include "logos_object.h"
 #include "logos_provider_interface.h"
@@ -13,6 +16,7 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QUrl>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -29,6 +33,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <memory>
 #include <string>
 
 #ifndef _WIN32
@@ -189,6 +194,81 @@ TEST(QtRemotePlainAdapterTest, ConfigRoundTripsAndFactorySelectsAQtFreeConnectio
     auto connection = LogosTransportFactory::createConnection(config, "local:missing");
     ASSERT_NE(connection, nullptr);
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(config));
+}
+
+// Detector: the adapter dialled for 5 s whatever the caller's budget, so the
+// consumer's zero-timeout retry and a 600 ms call both waited out all of it.
+TEST(QtRemotePlainAdapterTest, AnAbsentPeerCostsACallerOnlyItsOwnBudget)
+{
+    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(realQroSocket());
+    QElapsedTimer t;
+    t.start();
+    EXPECT_TRUE(connection.connectToHost());
+    EXPECT_FALSE(connection.isConnected());
+    EXPECT_EQ(connection.requestObject(QStringLiteral("fixture"), 0), nullptr);
+    EXPECT_LT(t.elapsed(), 250) << "nothing listens, so there is nothing to wait for";
+
+    t.restart();
+    EXPECT_EQ(connection.requestObject(QStringLiteral("fixture"), 600), nullptr);
+    EXPECT_GE(t.elapsed(), 500) << "a budget is a wait for the peer, not a single try";
+    EXPECT_LT(t.elapsed(), 1400) << "spent " << t.elapsed() << " ms on a 600 ms budget";
+}
+
+TEST(QtRemotePlainAdapterTest, APeerThatComesUpLaterIsReachedByTheNextAcquire)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    const QString url = realQroSocket();
+    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(url);
+    ASSERT_TRUE(connection.connectToHost());
+    EXPECT_FALSE(connection.isConnected());
+
+    AdapterProvider provider;
+    ModuleProxy proxy(&provider);
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture"), &proxy));
+
+    EXPECT_TRUE(connection.isConnected());
+    LogosObject* object = connection.requestObject(QStringLiteral("fixture"), 1000);
+    ASSERT_NE(object, nullptr);
+    object->release();
+}
+
+// Detector: on the plain transport, which Windows always uses, constructing a
+// client and subscribing to a module that is not up blocked the calling (GUI)
+// thread for 5 s each; qt_remote returns at once and arms when the module comes.
+TEST(QtRemotePlainAdapterTest, ASubscriptionToAModuleThatIsNotUpNeitherBlocksNorGetsLost)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    LogosModeConfig::setMode(LogosMode::Remote);
+    const LogosTransportConfig saved = LogosTransportConfigGlobal::getDefault();
+    LogosTransportConfig plain;
+    plain.protocol = LogosProtocol::QtRemotePlain;
+    LogosTransportConfigGlobal::setDefault(plain);
+
+    const QString mod = QStringLiteral("plain_late_module_%1").arg(QCoreApplication::applicationPid());
+    TokenManager::instance().saveToken(mod, QStringLiteral("tok"));
+    std::atomic<int> received{0};
+    QElapsedTimer t;
+    t.start();
+    auto client = std::make_unique<LogosAPIClient>(mod, QStringLiteral("caller"),
+                                                   &TokenManager::instance());
+    const quint64 id = client->onEventWhenAvailable(
+        mod, QStringLiteral("ev"), [&](const QString&, const QVariantList&) { ++received; });
+    EXPECT_NE(id, 0u);
+    EXPECT_LT(t.elapsed(), 250) << "constructing and subscribing blocked for " << t.elapsed() << " ms";
+
+    AdapterProvider provider;
+    ModuleProxy proxy(&provider);
+    proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok"));
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(LogosInstance::id(mod));
+    ASSERT_TRUE(host.publishObject(mod, &proxy));
+    EXPECT_TRUE(spinUntil([&] {
+        provider.fire(QStringLiteral("ev"), {1});
+        return received.load() > 0;
+    }, 15000)) << "the subscription never armed once the module came up";
+
+    client.reset();
+    LogosTransportConfigGlobal::setDefault(saved);
 }
 
 #ifndef _WIN32
