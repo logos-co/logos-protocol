@@ -43,6 +43,8 @@ constexpr std::size_t kDefaultMaxQueuedBytes = 64u << 20;
 constexpr std::chrono::milliseconds kDefaultStallTimeout{30000};
 // Calls a server runs at once, each on a long-lived worker.
 constexpr std::size_t kDefaultMaxConcurrentCalls = 64;
+// How long stop() lets running calls finish and their replies leave.
+constexpr std::chrono::milliseconds kStopDrainTimeout{1000};
 using Deadline = std::chrono::steady_clock::time_point;
 using NativeHandle = std::intptr_t;
 constexpr NativeHandle kInvalidHandle = -1;
@@ -1261,6 +1263,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         std::deque<SharedFrame> outbox;
         std::size_t queuedBytes = 0;
         bool closing = false;
+        bool writing = false;
         bool writerDone = false;
         // Only the reader closes the handle, once the writer is done with it.
         std::mutex fdMu;
@@ -1270,6 +1273,8 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
     std::condition_variable changed;
     std::atomic<NativeHandle> listener{kInvalidHandle};
     std::atomic<bool> running{false};
+    // Connections keep reading until stop() has let running calls answer.
+    std::atomic<bool> serving{false};
     bool acceptExited = true;
     std::size_t activeInvocations = 0;
     std::size_t activeWriters = 0;
@@ -1411,6 +1416,9 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
             SharedFrame frame;
             {
                 std::unique_lock<std::mutex> lock(connection->outMu);
+                connection->writing = false;
+                // Wakes a stop() waiting for this connection's replies to leave.
+                if (connection->outbox.empty()) connection->outChanged.notify_all();
                 connection->outChanged.wait(lock, [&] {
                     return connection->closing || !connection->outbox.empty();
                 });
@@ -1418,6 +1426,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                 frame = std::move(connection->outbox.front());
                 connection->outbox.pop_front();
                 connection->queuedBytes -= frame->size();
+                connection->writing = true;
             }
             std::string error;
             if (!writeAllOrStall(connection->fd.load(), *frame, &error,
@@ -1456,7 +1465,7 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
         std::vector<std::uint8_t> bytes;
         std::string error;
         OversizedFrame oversized;
-        while (running && readPacket(connection->fd.load(), bytes, &error, &running, &oversized)) {
+        while (serving && readPacket(connection->fd.load(), bytes, &error, &serving, &oversized)) {
             try {
                 const Frame frame = decodeFrame(bytes);
                 if (oversized.present) {
@@ -1530,6 +1539,8 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                         bool started = false;
                         {
                             std::lock_guard<std::mutex> lock(mu);
+                            // A stopping server answers only the calls it had started.
+                            if (!running) continue;
                             ++activeInvocations;
                             started = startCallLocked([state, connection,
                                                        object = std::move(object), objectName,
@@ -1735,6 +1746,7 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
         m_impl->listener = reinterpret_cast<NativeHandle>(first);
         m_impl->stopEvent = stopEvent;
         m_impl->running = true;
+        m_impl->serving = true;
         m_impl->acceptExited = false;
     }
 #else
@@ -1790,6 +1802,7 @@ bool Server::start(const std::string& localUrlOrPath, std::string* error)
         m_impl->wakeRead = wake[0];
         m_impl->wakeWrite = wake[1];
         m_impl->running = true;
+        m_impl->serving = true;
         m_impl->acceptExited = false;
     }
 #endif
@@ -1836,9 +1849,26 @@ void Server::stop()
         && current.st_dev == m_impl->boundDevice && current.st_ino == m_impl->boundInode)
         ::unlink(path.c_str());
 #endif
+    const auto caller = std::this_thread::get_id();
+    // Calls already running finish and their replies leave before the
+    // connections close: the call that asked for this stop still hears back.
+    const auto drainDeadline = std::chrono::steady_clock::now() + kStopDrainTimeout;
+    {
+        std::unique_lock<std::mutex> lock(m_impl->mu);
+        const std::size_t own = m_impl->callWorkerIds.count(caller);
+        m_impl->changed.wait_until(lock, drainDeadline,
+                                   [&] { return m_impl->activeInvocations <= own; });
+    }
+    for (const auto& connection : connections) {
+        std::unique_lock<std::mutex> lock(connection->outMu);
+        connection->outChanged.wait_until(lock, drainDeadline, [&] {
+            return connection->closing
+                || (connection->outbox.empty() && !connection->writing);
+        });
+    }
+    m_impl->serving = false;
     for (const auto& connection : connections) Impl::abandon(*connection);
     std::unique_lock<std::mutex> lock(m_impl->mu);
-    const auto caller = std::this_thread::get_id();
     m_impl->changed.wait(lock, [&] {
         // A caller's own connection closes once the caller returns; its
         // writer, like every other, has already stopped.

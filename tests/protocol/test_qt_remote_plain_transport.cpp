@@ -480,6 +480,141 @@ TEST(QtRemotePlainTransportTest, StopWaitsForAnOutstandingHandler)
     client.close();
 }
 
+// Detector: stop() closed every connection before the calls it was running
+// returned, so their replies were dropped; `logosctl daemon stop` lost its own.
+TEST(QtRemotePlainTransportTest, ACallRunningWhenStopBeginsStillGetsItsReply)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    std::mutex handlerMutex;
+    std::condition_variable handlerChanged;
+    bool entered = false;
+    bool release = false;
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture", {}, {{"block()", "QString", {}}}, {},
+    };
+    object.invoke = [&](std::int32_t, const std::vector<Variant>&) {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        entered = true;
+        handlerChanged.notify_all();
+        handlerChanged.wait(lock, [&] { return release; });
+        return Variant::fromRpc(RpcValue{"done"});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    std::optional<Variant> result;
+    std::string callError;
+    std::thread call([&] {
+        result = client.call("fixture", "block()", {}, std::chrono::seconds(5), &callError);
+    });
+    {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        ASSERT_TRUE(handlerChanged.wait_for(lock, std::chrono::seconds(1), [&] {
+            return entered;
+        }));
+    }
+
+    std::thread stopper([&] { server.stop(); });
+    // Released once stop() is under way.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+        std::lock_guard<std::mutex> lock(handlerMutex);
+        release = true;
+    }
+    handlerChanged.notify_all();
+    stopper.join();
+    call.join();
+    ASSERT_TRUE(result.has_value()) << callError;
+    EXPECT_EQ(result->value.asString(), "done");
+    client.close();
+}
+
+// Detector: stop() cleared the outbox and shut the socket while a reply was
+// still being written, so a peer that read slowly got a truncated frame.
+TEST(QtRemotePlainTransportTest, AReplyBeingWrittenWhenStopBeginsIsDelivered)
+{
+    const std::string path = transportSocketPath();
+    const std::string big(8u << 20, 'x');
+    Server server;
+    std::atomic<bool> replied{false};
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture",
+        {{"eventResponse(QString,QVariantList)", {"eventName", "data"}}},
+        {{"big()", "QString", {}}},
+        {},
+    };
+    object.invoke = [&](std::int32_t, const std::vector<Variant>&) {
+        replied = true;
+        return Variant::fromRpc(RpcValue{big});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    // The client's reader blocks in this handler, so the reply fills the
+    // socket and stays in the server's writer until it is released.
+    std::mutex readerMutex;
+    std::condition_variable readerChanged;
+    bool reading = false;
+    bool resume = false;
+    client.setInternalEventHandler(
+        [&](const std::string&, std::int32_t, const std::vector<Variant>&) {
+            std::unique_lock<std::mutex> lock(readerMutex);
+            reading = true;
+            readerChanged.notify_all();
+            readerChanged.wait(lock, [&] { return resume; });
+            return true;
+        });
+    RpcList payload;
+    payload.items.emplace_back("hold");
+    ASSERT_TRUE(server.emitSignal("fixture", 0,
+        {Variant::fromRpc(RpcValue{"hold"}),
+         Variant::fromRpc(RpcValue{std::move(payload)})}, &error)) << error;
+    {
+        std::unique_lock<std::mutex> lock(readerMutex);
+        ASSERT_TRUE(readerChanged.wait_for(lock, std::chrono::seconds(2), [&] {
+            return reading;
+        }));
+    }
+
+    std::optional<Variant> result;
+    std::string callError;
+    std::thread call([&] {
+        result = client.call("fixture", "big()", {}, std::chrono::seconds(10), &callError);
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!replied && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_TRUE(replied.load());
+    // Long enough for the reply to fill the socket and stall the writer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::thread stopper([&] { server.stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard<std::mutex> lock(readerMutex);
+        resume = true;
+    }
+    readerChanged.notify_all();
+    stopper.join();
+    call.join();
+    ASSERT_TRUE(result.has_value()) << callError;
+    EXPECT_EQ(result->value.asString().size(), big.size());
+    client.close();
+}
+
 TEST(QtRemotePlainTransportTest, ConcurrentCallsOnOneClientCanOverlap)
 {
     const std::string path = transportSocketPath();
