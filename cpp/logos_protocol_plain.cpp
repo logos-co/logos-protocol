@@ -439,11 +439,11 @@ struct SendTurn {
     {
         if (finished) return;
         finished = true;
-        {
-            std::lock_guard<std::mutex> lock(state->asyncMutex);
-            state->asyncSent.insert(ticket);
-            while (state->asyncSent.erase(state->asyncNextToSend)) ++state->asyncNextToSend;
-        }
+        // Notified under the lock: on mingw a notify_all after unlocking was seen
+        // to miss a waiter, and every later call waited out its deadline behind it.
+        std::lock_guard<std::mutex> lock(state->asyncMutex);
+        state->asyncSent.insert(ticket);
+        while (state->asyncSent.erase(state->asyncNextToSend)) ++state->asyncNextToSend;
         state->asyncTurn.notify_all();
     }
     ~SendTurn() { finish(); }
