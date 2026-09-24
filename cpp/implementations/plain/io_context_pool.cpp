@@ -21,8 +21,15 @@ IoContextPool::~IoContextPool()
 
 IoContextPool& IoContextPool::shared()
 {
+#ifdef _WIN32
+    // Never destroyed on Windows: by the time a DLL's statics are destroyed the
+    // worker has been killed, maybe mid-handler, and ~io_context would wait on it forever.
+    static IoContextPool* pool = new IoContextPool;
+    return *pool;
+#else
     static IoContextPool pool;
     return pool;
+#endif
 }
 
 } // namespace logos::plain
