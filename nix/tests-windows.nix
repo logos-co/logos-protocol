@@ -3,6 +3,16 @@
 # build machine, so nothing is discovered or run here; a Windows box runs them.
 { pkgs, common, src }:
 
+let
+  # What Windows CI runs, with the per-case deadlines tests/protocol/CMakeLists.txt gives ctest.
+  manifest = builtins.toFile "protocol-plain-tests.json" (builtins.toJSON {
+    suites = [
+      { name = "wire"; exe = "bin/qt_remote_plain_wire_tests.exe"; }
+      { name = "cabi"; exe = "bin/qt_remote_plain_cabi_tests.exe"; timeout = 8; }
+      { name = "cabi_shared"; exe = "bin/qt_remote_plain_cabi_shared_tests.exe"; timeout = 8; }
+    ];
+  });
+in
 pkgs.stdenv.mkDerivation {
   pname = "${common.pname}-tests";
   version = common.version;
@@ -20,9 +30,10 @@ pkgs.stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/bin
+    mkdir -p $out/bin $out/share/logos-tests
     cp protocol/qt_remote_plain_wire_tests.exe protocol/qt_remote_plain_cabi_tests.exe \
        protocol/qt_remote_plain_cabi_shared_tests.exe bin/liblogos_protocol_plain.dll $out/bin/
+    cp ${manifest} $out/share/logos-tests/protocol-plain.json
     runHook postInstall
   '';
 
