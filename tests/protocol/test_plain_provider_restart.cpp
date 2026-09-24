@@ -209,23 +209,27 @@ public:
         // Connect until one stalls: that stall is the drop (Linux queues two first, macOS one).
         for (int i = 0; i < 16; ++i) {
             auto s = std::make_unique<tcp::socket>(m_ioc);
-            auto state = std::make_shared<int>(0);   // 0 pending, 1 connected, 2 failed
-            s->async_connect(m_acceptor.local_endpoint(),
-                             [state](const boost::system::error_code& ec) { *state = ec ? 2 : 1; });
+            auto state = std::make_shared<int>(0);   // 0 pending, 1 connected, 2 failed, 3 reset
+            s->async_connect(m_acceptor.local_endpoint(), [state](const boost::system::error_code& ec) {
+                namespace err = boost::asio::error;
+                *state = !ec ? 1 : (ec == err::connection_reset || ec == err::connection_refused) ? 3 : 2;
+            });
             m_ioc.restart();
             m_ioc.run_for(std::chrono::milliseconds(300));
-            if (*state != 1) { m_dropping = *state == 0; break; }
+            if (*state != 1) { m_dropping = *state == 0; m_resets = *state == 3; break; }
             m_fillers.push_back(std::move(s));
         }
     }
     uint16_t port() const { return m_acceptor.local_endpoint().port(); }
     bool dropsSyns() const { return m_dropping; }
+    bool resetsInstead() const { return m_resets; }
 
 private:
     boost::asio::io_context m_ioc;
     boost::asio::ip::tcp::acceptor m_acceptor;
     std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> m_fillers;
     bool m_dropping = false;
+    bool m_resets = false;
 };
 
 long long elapsedMs(std::chrono::steady_clock::time_point since)
@@ -628,6 +632,8 @@ TEST_F(PlainProviderRestartTest, AConsumerOfASilentTlsPeerIsConstructedInTime)
 TEST_F(PlainProviderRestartTest, AFirstConnectToAHostThatDropsSynsTimesOut)
 {
     SynDroppingListener dropping;
+    if (dropping.resetsInstead())   // Darwin 27 does
+        GTEST_SKIP() << "this kernel resets a connect to a full accept queue instead of dropping its SYN";
     ASSERT_TRUE(dropping.dropsSyns()) << "precondition: a full accept queue did not make this kernel drop SYNs";
     auto conn = std::make_shared<logos::plain::PlainTransportConnection>(tcpConfig(dropping.port()));
     bool connected = true;
