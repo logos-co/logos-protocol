@@ -53,9 +53,9 @@ std::string makeErrorJson(const char* code, const std::string& message,
     return e.dump();
 }
 
-// Parse a single-transport JSON object (the lp_* shape) by reusing the
-// transport-set parser (which expects an array). NULL / empty / "null"
-// fall back to the process default.
+// Parse a single-transport JSON object (the lp_* shape) with the strict
+// transport-set parser: an unknown protocol or a mistyped field is refused,
+// not read as local. NULL / empty / "null" fall back to the process default.
 bool parseTransportJson(const char* transport_json, LogosTransportConfig& out)
 {
     if (!transport_json || !*transport_json
@@ -63,9 +63,10 @@ bool parseTransportJson(const char* transport_json, LogosTransportConfig& out)
         out = LogosTransportConfigGlobal::getDefault();
         return true;
     }
-    const LogosTransportSet set = logos::transportSetFromJsonString(
-        std::string("[") + transport_json + "]");
-    if (set.empty()) return false;  // parse error (parser yields empty set)
+    LogosTransportSet set;
+    if (!logos::parseTransportSet(std::string("[") + transport_json + "]", &set)
+        || set.size() != 1)
+        return false;
     out = set.front();
     return true;
 }
@@ -199,6 +200,11 @@ int lp_protocol_abi_major(void)
 void lp_string_free(char* s)
 {
     std::free(s);
+}
+
+char* lp_string_copy(const char* s)
+{
+    return s ? lpStrdup(s) : nullptr;
 }
 
 /* ----------------------------------------------------- mode / transports */
@@ -447,7 +453,7 @@ lp_subscription* lp_subscribe(lp_client* client,
                               lp_event_cb cb,
                               void* user_data)
 {
-    if (!client || !client->client || !event_name || !*event_name || !cb)
+    if (!client || !client->client || !event_name || !cb)
         return nullptr;
 
     // Deliberately NOT requestObject() + onEvent().
@@ -932,12 +938,19 @@ int lp_grant_host_services(const char* services_json)
     return LP_OK;
 }
 
+const char* lp_current_caller_json(void)
+{
+    return "{\"kind\":\"unknown\"}";
+}
+
 /* -------------------------------------------------- provider (groundwork) */
 
 lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json)
 {
     if (!module_name || !*module_name) return nullptr;
+    if (transport_set_json && !logos::parseTransportSet(transport_set_json, nullptr))
+        return nullptr;
     auto* provider = new lp_provider();
     provider->moduleName = module_name;
     provider->transportSetJson =
@@ -950,11 +963,11 @@ void lp_provider_destroy(lp_provider* provider)
     delete provider;
 }
 
-int lp_provider_register(lp_provider* provider,
-                         lp_dispatch_cb dispatch,
-                         lp_getmethods_cb get_methods,
-                         lp_token_cb on_token,
-                         void* user_data)
+int lp_provider_prepare(lp_provider* provider,
+                        lp_dispatch_cb dispatch,
+                        lp_getmethods_cb get_methods,
+                        lp_token_cb on_token,
+                        void* user_data)
 {
     if (!provider || !dispatch) return LP_ERR_INVALID_ARG;
     provider->dispatch = dispatch;
@@ -962,6 +975,15 @@ int lp_provider_register(lp_provider* provider,
     provider->onToken = on_token;
     provider->userData = user_data;
     return LP_OK;
+}
+
+int lp_provider_register(lp_provider* provider,
+                         lp_dispatch_cb dispatch,
+                         lp_getmethods_cb get_methods,
+                         lp_token_cb on_token,
+                         void* user_data)
+{
+    return lp_provider_prepare(provider, dispatch, get_methods, on_token, user_data);
 }
 
 int lp_provider_emit_event(lp_provider* provider,
@@ -983,6 +1005,23 @@ int lp_provider_save_token(lp_provider* provider,
 {
     (void)module_name;
     (void)token;
+    if (!provider) return LP_ERR_INVALID_ARG;
+    return LP_ERR_UNSUPPORTED;
+}
+
+int lp_provider_set_token_validator(lp_provider* provider,
+                                    lp_validate_token_cb validate,
+                                    void* user_data)
+{
+    (void)validate;
+    (void)user_data;
+    if (!provider) return LP_ERR_INVALID_ARG;
+    return LP_ERR_UNSUPPORTED;
+}
+
+int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned max_calls)
+{
+    (void)max_calls;
     if (!provider) return LP_ERR_INVALID_ARG;
     return LP_ERR_UNSUPPORTED;
 }

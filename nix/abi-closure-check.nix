@@ -19,5 +19,5 @@ pkgs.runCommand "logos-abi-closure-check"
   # Absolute interpreter: the Linux build sandbox has no /usr/bin/env.
   patchShebangs $out/bin
   wrapProgram $out/bin/logos-abi-closure-check \
-    --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}
+    --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.jq ]}
 ''

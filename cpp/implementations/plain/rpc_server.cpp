@@ -4,11 +4,35 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/address.hpp>
 
-#include <QDebug>
-
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 
 namespace logos::plain {
+
+namespace {
+
+// How long stop() lets started calls answer and queued frames leave.
+constexpr std::chrono::milliseconds kStopDrainTimeout{1000};
+
+template <typename Connection>
+void drainBeforeStop(boost::asio::io_context& ioc,
+                     const std::vector<std::shared_ptr<Connection>>& conns)
+{
+    for (const auto& c : conns) c->beginDrain();
+    // The I/O thread writes the replies; waiting on it would only stall them.
+    if (ioc.get_executor().running_in_this_thread()) return;
+    const auto drained = [&] {
+        return std::all_of(conns.begin(), conns.end(),
+                           [](const auto& c) { return !c->isOpen() || c->drained(); });
+    };
+    const auto deadline = std::chrono::steady_clock::now() + kStopDrainTimeout;
+    while (!drained() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+}
+
+} // namespace
 
 // ── RpcServerTcp ──────────────────────────────────────────────────────────
 
@@ -17,7 +41,8 @@ RpcServerTcp::RpcServerTcp(boost::asio::io_context& ioc,
                            uint16_t port,
                            std::shared_ptr<IWireCodec> codec,
                            IncomingCallHandler* handler)
-    : m_acceptor(ioc)
+    : m_ioc(ioc)
+    , m_acceptor(ioc)
     , m_strand(boost::asio::make_strand(m_acceptor.get_executor()))
     , m_codec(std::move(codec))
     , m_handler(handler)
@@ -70,9 +95,17 @@ void RpcServerTcp::stop()
     {
         std::lock_guard<std::mutex> g(m_mu);
         m_stopped = true;
-        conns.swap(m_conns);
+        conns = m_conns;
     }
     closeAcceptorOnStrand();
+    // Calls already started answer, and queued frames leave, before the
+    // connections close: the call that asked for this stop still hears back.
+    drainBeforeStop(m_ioc, conns);
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        conns.clear();
+        conns.swap(m_conns);
+    }
     for (auto& c : conns) c->stop("server stopped");
 }
 
@@ -161,7 +194,8 @@ RpcServerSsl::RpcServerSsl(boost::asio::io_context& ioc,
                            boost::asio::ssl::context sslCtx,
                            std::shared_ptr<IWireCodec> codec,
                            IncomingCallHandler* handler)
-    : m_acceptor(ioc)
+    : m_ioc(ioc)
+    , m_acceptor(ioc)
     , m_strand(boost::asio::make_strand(m_acceptor.get_executor()))
     , m_sslCtx(std::move(sslCtx))
     , m_codec(std::move(codec))
@@ -202,9 +236,15 @@ void RpcServerSsl::stop()
     {
         std::lock_guard<std::mutex> g(m_mu);
         m_stopped = true;
-        conns.swap(m_conns);
+        conns = m_conns;
     }
     closeAcceptorOnStrand();
+    drainBeforeStop(m_ioc, conns);
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        conns.clear();
+        conns.swap(m_conns);
+    }
     for (auto& c : conns) c->stop("server stopped");
 }
 
@@ -249,10 +289,9 @@ void RpcServerSsl::doAccept()
                         // is unavailable, or the listener picked a
                         // version the client refuses). Category + code
                         // + message give enough to grep for.
-                        qWarning().nospace()
-                            << "RpcServerSsl: TLS handshake failed: "
-                            << hs.category().name() << ':' << hs.value()
-                            << " (" << QString::fromStdString(hs.message()) << ")";
+                        std::fprintf(stderr,
+                                     "RpcServerSsl: TLS handshake failed: %s:%d (%s)\n",
+                                     hs.category().name(), hs.value(), hs.message().c_str());
                         return;
                     }
                     // Hand the SslStream off to a connection that owns

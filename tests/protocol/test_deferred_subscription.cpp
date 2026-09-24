@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
@@ -72,8 +73,21 @@ public:
 struct Publisher {
     EchoProvider echo;
     ModuleProxy proxy;
-    RemoteTransportHost host;
+    std::unique_ptr<LogosTransportHost> host;
     explicit Publisher(const QString& moduleName)
+        : proxy(&echo), host(makeLocalHost(LogosInstance::id(moduleName)))
+    {
+        proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok"));
+        host->publishObject(moduleName, &proxy);
+    }
+};
+
+// For the tests that drive a QtRO connection directly: its own host.
+struct QtPublisher {
+    EchoProvider echo;
+    ModuleProxy proxy;
+    RemoteTransportHost host;
+    explicit QtPublisher(const QString& moduleName)
         : proxy(&echo), host(LogosInstance::id(moduleName))
     {
         proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok"));
@@ -132,7 +146,7 @@ TEST_F(DeferredSubscriptionTest, RequestObjectWhenAvailable_ArmsAfterPublish)
     pump(300);
     ASSERT_EQ(got, nullptr) << "delivered a handle for a module that was never published";
 
-    Publisher pub(mod);
+    QtPublisher pub(mod);
     for (int i = 0; i < 100 && !got; ++i) pump(50);
 
     ASSERT_NE(got, nullptr) << "handle never arrived after the module was published";
@@ -144,7 +158,7 @@ TEST_F(DeferredSubscriptionTest, RequestObjectWhenAvailable_ArmsAfterPublish)
 TEST_F(DeferredSubscriptionTest, RequestObjectWhenAvailable_AlreadyPublished_Control)
 {
     const QString mod = QStringLiteral("async_ready_module");
-    Publisher pub(mod);
+    QtPublisher pub(mod);
 
     RemoteTransportConnection conn(LogosInstance::id(mod));
     ASSERT_TRUE(conn.connectToHost());

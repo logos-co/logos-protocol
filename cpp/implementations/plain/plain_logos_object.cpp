@@ -122,9 +122,15 @@ public:
     static DeadlineService& shared()
     {
         // Lazy, like IoContextPool::shared(): a process that never makes an
-        // async plain call never starts this thread.
+        // async plain call never starts this thread. Never destroyed on Windows,
+        // for the reason IoContextPool::shared() gives.
+#ifdef _WIN32
+        static DeadlineService* svc = new DeadlineService;
+        return *svc;
+#else
         static DeadlineService svc;
         return svc;
+#endif
     }
 
     boost::asio::io_context& context() { return m_ioc; }

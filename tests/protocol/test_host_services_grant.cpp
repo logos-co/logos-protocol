@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
 #include "logos_protocol.h"
@@ -182,12 +183,12 @@ TEST_F(HostServicesGrantTest, TokenDeliveryIsClosedUntilGranted)
 TEST_F(HostServicesGrantTest, GrantedDeliveryReachesAModuleThatIsNotCapabilityModule)
 {
     const QString module = QStringLiteral("grant_target_module");
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
 
     RecordingProvider provider;
     ModuleProxy proxy(&provider);
     ModuleHandshakeProxy handshake(&proxy);
-    ASSERT_TRUE(host.publishObject(logos::handshakeObjectName(module), &handshake));
+    ASSERT_TRUE(host->publishObject(logos::handshakeObjectName(module), &handshake));
 
     // The trust anchor the publisher seeds before going live; without it
     // ModuleProxy's gate refuses every push (see test_handshake_surface.cpp).

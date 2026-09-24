@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_consumer.h"
 #include "logos_instance.h"
 #include "logos_provider_interface.h"
@@ -100,11 +101,11 @@ TEST_F(HandshakeNegativeCacheTest, AModuleThatWasMerelyLateIsProbedAgainRatherTh
         << "a grant to a module that is not there cannot succeed";
 
     // The module comes up. Only the handshake surface, as during init().
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
     CountingProvider provider;
     ModuleProxy proxy(&provider);
     ModuleHandshakeProxy handshake(&proxy);
-    ASSERT_TRUE(host.publishObject(logos::handshakeObjectName(module), &handshake));
+    ASSERT_TRUE(host->publishObject(logos::handshakeObjectName(module), &handshake));
 
     EXPECT_TRUE(consumer.informModuleToken_module(
         QStringLiteral("coretok"), module, QStringLiteral("peer"),
@@ -128,10 +129,10 @@ TEST_F(HandshakeNegativeCacheTest, AModuleWithNoHandshakeSurfaceIsStillRemembere
     ScopedToken peer(QStringLiteral("peer"));
 
     // Business object only — a module built before the handshake surface existed.
-    RemoteTransportHost host(LogosInstance::id(module));
+    auto host = makeLocalHost(LogosInstance::id(module));
     CountingProvider provider;
     ModuleProxy proxy(&provider);
-    ASSERT_TRUE(host.publishObject(module, &proxy));
+    ASSERT_TRUE(host->publishObject(module, &proxy));
 
     LogosAPIConsumer consumer(module, QStringLiteral("capability_module"),
                               &TokenManager::instance());
@@ -146,8 +147,10 @@ TEST_F(HandshakeNegativeCacheTest, AModuleWithNoHandshakeSurfaceIsStillRemembere
     EXPECT_TRUE(consumer.informModuleToken_module(
         QStringLiteral("coretok"), module, QStringLiteral("peer2"),
         QStringLiteral("peertok2"), 3000));
-    EXPECT_EQ(RemoteTransportConnection::acquireCount(), 0)
-        << "the second grant re-acquired something: the proven absence was not remembered, "
-           "so every token from here pays the blocking handshake probe again";
+    // Only QtRO counts its acquires.
+    if (!localIsPlain())
+        EXPECT_EQ(RemoteTransportConnection::acquireCount(), 0)
+            << "the second grant re-acquired something: the proven absence was not remembered, "
+               "so every token from here pays the blocking handshake probe again";
     EXPECT_EQ(provider.tokenPushes, 2);
 }

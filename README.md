@@ -21,8 +21,9 @@ versioned boundary instead of re-wrapping the C++/Qt SDK.
   `lp_protocol_abi_major()`). JSON-in-strings data model; bytes cross the
   boundary as `{"_bytes":"<base64url>"}` (lossless, NUL-safe).
 - **Transports** — plain TCP / TCP+TLS (Boost.Asio + OpenSSL + nlohmann,
-  Qt-free), `qt_local`, in-memory mock, and Qt Remote Objects
-  (`qt_remote` — the only Qt-bearing transport).
+  Qt-free), `qt_local`, in-memory mock, Qt Remote Objects (`qt_remote`), and
+  `qt_remote_plain`, a Qt-free implementation of the QtRO 2.0 wire profile used
+  by Logos modules.
 - **Consumer core** — `LogosAPIClient` / `LogosAPIConsumer` including the
   automatic `capability_module.requestModule` token-fetch flow (behind the
   protocol boundary: every language gets it for free).
@@ -84,6 +85,18 @@ nix build
 # Tests
 nix build .#tests
 ```
+
+The Qt-free package is available separately:
+
+```bash
+nix build .#logos-protocol-plain
+```
+
+It exports the same `logos_protocol.h` C ABI and links only the
+`qt_remote_plain` client/provider runtime. Current Qt modules interoperate with
+it over local sockets on Linux and macOS. Windows plain modules communicate
+over byte-mode named pipes and are intended to be rebuilt together; Qt-version
+wire compatibility on Windows is outside the supported migration path.
 
 ## Layering invariant
 

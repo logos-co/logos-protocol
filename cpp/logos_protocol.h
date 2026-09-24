@@ -29,12 +29,13 @@
  *   - Handles are thread-safe per-handle: calls on one handle may be made
  *     from any thread; the library marshals to the handle's owner thread
  *     internally where required.
- *   - Qt-free transports (plain tcp/tcp_ssl, mock) are serviced by the
- *     library's own workers — no caller event loop is needed.
+ *   - Qt-free transports (plain tcp/tcp_ssl, qt_remote_plain, mock) are
+ *     serviced by the library's own workers — no caller event loop is needed.
  *   - The Qt Remote Objects transport (the current default inside module
  *     processes) ADDITIONALLY requires a running Qt event loop in the
  *     process. Every Logos module process has one (logos_host runs it).
- *     Standalone non-Qt consumers must use the plain transport.
+ *     Standalone non-Qt consumers can use qt_remote_plain for QtRO wire
+ *     compatibility, or the independent plain TCP transports.
  *     A client on that transport is created on — and owned by — the Qt main
  *     thread no matter which thread calls lp_client_create(), because its
  *     node and socket are only serviced by that thread's loop. Calls from
@@ -267,9 +268,21 @@
 // name and mis-call it with no diagnostic. The generation counter is maintained
 // for EVERY client, so gap detection reaches a consumer that changes nothing;
 // only the live callback is opt-in.
-#define LOGOS_PROTOCOL_VERSION_MINOR 9
+// 0.12: the qt_remote_plain wave, all additive:
+//   * qt_remote_plain, a Qt-free implementation of the Qt Remote Objects 2.0
+//     dynamic-object wire. qt_remote is unchanged and shares the wire on
+//     Unix; Windows plain peers use named pipes on both sides.
+//   * lp_current_caller_json() for native module hosts.
+//   * lp_provider_set_token_validator(), for hosts whose accepted credentials
+//     live outside the protocol token registry.
+//   * the empty event name, public as the wildcard subscription.
+//   * staged publication (lp_provider_prepare) and lp_string_copy().
+// MINORs 10 and 11 only ever named revisions of this wave on its branches, and
+// the unmerged feat/optional-dependencies uses 10 for lp_target_presence. A
+// MINOR guard cannot tell those apart; guard on the feature macros below.
+#define LOGOS_PROTOCOL_VERSION_MINOR 12
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.12.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -290,6 +303,20 @@
 // — `logosctl watch <module>` with no --event did — guards on this to know
 // whether it still can. Absent before the reservation, never undefined after.
 #define LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES 1
+
+// FEATURE MACRO: lp_provider_set_max_concurrent_calls() exists, so a host can
+// run a module's calls in arrival order on one thread.
+#define LOGOS_PROTOCOL_HAS_PROVIDER_CONCURRENCY 1
+
+// FEATURE MACROS for the rest of the 0.12 wave (see the version above). Each is
+// defined in both runtimes where its symbol or behaviour exists, and never
+// undefined after.
+#define LOGOS_PROTOCOL_HAS_QT_REMOTE_PLAIN 1          /* LogosProtocol::QtRemotePlain */
+#define LOGOS_PROTOCOL_HAS_CURRENT_CALLER_JSON 1      /* lp_current_caller_json */
+#define LOGOS_PROTOCOL_HAS_PROVIDER_TOKEN_VALIDATOR 1 /* lp_provider_set_token_validator */
+#define LOGOS_PROTOCOL_HAS_WILDCARD_SUBSCRIBE 1       /* lp_subscribe with "" */
+#define LOGOS_PROTOCOL_HAS_STAGED_PUBLICATION 1       /* lp_provider_prepare */
+#define LOGOS_PROTOCOL_HAS_STRING_COPY 1              /* lp_string_copy */
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -350,13 +377,21 @@ LP_API int lp_protocol_abi_major(void);
 /** Free a string returned by this library. Safe to call with NULL. */
 LP_API void lp_string_free(char* s);
 
+/** Copy a NUL-terminated string into memory owned by this protocol library.
+ *  The caller frees the result with lp_string_free(). Returns NULL for a NULL
+ *  input or allocation failure. This is the allocator-boundary bridge for
+ *  hosts that receive strings from independently-built module runtimes. */
+LP_API char* lp_string_copy(const char* s);
+
 /* ---------------------------------------------------------------------------
  * Process-global mode / transport defaults
  * ------------------------------------------------------------------------- */
 
 /** Set the process-wide communication mode: "remote" (IPC, default),
  *  "local" (in-process registry) or "mock" (in-memory, for tests).
- *  Returns LP_OK or LP_ERR_INVALID_ARG. */
+ *  Returns LP_OK, or LP_ERR_INVALID_ARG for NULL or an unknown mode. The
+ *  Qt-free runtime has only "remote" and returns LP_ERR_UNSUPPORTED for the
+ *  other two. */
 LP_API int lp_set_mode(const char* mode);
 
 /** Current mode as "remote" | "local" | "mock". Static string — do not free. */
@@ -367,7 +402,9 @@ LP_API const char* lp_get_mode(void);
  *    {"protocol":"tcp","host":"127.0.0.1","port":6001,"codec":"json"}
  *    {"protocol":"tcp_ssl","host":"...","port":6443,"codec":"cbor",
  *     "ca_file":"...","cert_file":"...","key_file":"...","verify_peer":true}
- *  Returns LP_OK or LP_ERR_INVALID_ARG on parse failure. */
+ *  "protocol" is one of "local", "qt_remote_plain", "tcp" or "tcp_ssl". Returns
+ *  LP_OK, or LP_ERR_INVALID_ARG for malformed JSON, an unknown protocol or
+ *  codec, or a mistyped field. lp_client_create refuses the same inputs. */
 LP_API int lp_set_default_transport(const char* transport_json);
 
 /* ---------------------------------------------------------------------------
@@ -436,8 +473,8 @@ typedef void (*lp_subscription_status_cb)(int state, unsigned long long generati
  * Owner thread: for a Qt-affine transport (Qt Remote Objects / local mode) the
  * client is constructed on the Qt main thread — blocking this call until that
  * thread runs it — because its node and socket are only serviced there. Any
- * thread may call this. For the Qt-free transports (tcp / tcp_ssl / mock) the
- * calling thread becomes the owner thread, as before.
+ * thread may call this. Qt-free transports (qt_remote_plain / tcp / tcp_ssl /
+ * mock) own their protocol workers and require no caller event loop.
  *
  * Returns NULL on invalid arguments.
  */
@@ -523,7 +560,8 @@ LP_API int lp_invoke_async(lp_client* client,
  * inside its own init() can still be missed; if that event matters, expose a
  * method the subscriber can call after subscribing.
  *
- * Returns NULL only for a null/empty client, event name or callback.
+ * An empty event name subscribes to every non-reserved event on the target.
+ * Returns NULL only for a null client, event-name pointer, or callback.
  */
 LP_API lp_subscription* lp_subscribe(lp_client* client,
                               const char* event_name,
@@ -918,9 +956,37 @@ typedef char* (*lp_getmethods_cb)(void* user_data);
 typedef int (*lp_token_cb)(const char* module_name, const char* token,
                            void* user_data);
 
+/** Validate a credential not present in the provider's in-memory token map.
+ *  `transport_protocol` uses the public names "local", "tcp", or "tcp_ssl".
+ *  Return LP_OK to accept it. The callback may read persistent state and is
+ *  evaluated for every otherwise-unknown token, so revocation takes effect
+ *  without restarting the provider. */
+typedef int (*lp_validate_token_cb)(const char* token,
+                                    const char* transport_protocol,
+                                    void* user_data);
+
+/** Identity authenticated for the provider dispatch currently running on this
+ *  thread, as the canonical caller JSON document. The pointer is borrowed and
+ *  remains valid only until the dispatch callback returns. Outside a provider
+ *  dispatch this returns {"kind":"unknown"}. A native module host forwards
+ *  this value through logos_module_set_call_caller(). */
+LP_API const char* lp_current_caller_json(void);
+
+/** NULL for an empty module name, or for a transport set that is not a valid
+ *  transport-set JSON array (unknown protocols and malformed entries included):
+ *  a provider is never created serving less than it was asked to. */
 LP_API lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json);
 LP_API void lp_provider_destroy(lp_provider* provider);
+/** Start the provider endpoint and publish only the token-handshake object.
+ *  Call lp_provider_register with the same callbacks after module
+ *  initialization to publish the business object. Existing callers may skip
+ *  this staged form and call lp_provider_register directly. */
+LP_API int lp_provider_prepare(lp_provider* provider,
+                         lp_dispatch_cb dispatch,
+                         lp_getmethods_cb get_methods,
+                         lp_token_cb on_token,
+                         void* user_data);
 LP_API int lp_provider_register(lp_provider* provider,
                          lp_dispatch_cb dispatch,
                          lp_getmethods_cb get_methods,
@@ -932,6 +998,16 @@ LP_API int lp_provider_emit_event(lp_provider* provider,
 LP_API int lp_provider_save_token(lp_provider* provider,
                            const char* module_name,
                            const char* token);
+LP_API int lp_provider_set_token_validator(lp_provider* provider,
+                           lp_validate_token_cb validate,
+                           void* user_data);
+/** Calls start in the order they arrive and at most `max_calls` run at once,
+ *  each on one of that many long-lived threads; 1 runs every call on the same
+ *  thread. 0 restores the default, 64. Call before lp_provider_prepare or
+ *  lp_provider_register. The Qt implementation dispatches on its own event
+ *  loop and returns LP_ERR_UNSUPPORTED. */
+LP_API int lp_provider_set_max_concurrent_calls(lp_provider* provider,
+                           unsigned max_calls);
 
 #ifdef __cplusplus
 }

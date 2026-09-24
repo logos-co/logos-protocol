@@ -3,13 +3,17 @@ project(LogosProtocol)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
+option(LOGOS_PROTOCOL_BUILD_QT
+    "Build the legacy Qt adapters and Qt-backed logos_protocol targets" ON)
 
 # Find Qt packages — Qt is an implementation detail of the qt_remote (QRO)
 # and qt_local transports plus the Qt value types used at the QRO boundary.
 # The PUBLIC C ABI (logos_protocol.h) is Qt-free.
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core RemoteObjects)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core RemoteObjects)
+if(LOGOS_PROTOCOL_BUILD_QT)
+    set(CMAKE_AUTOMOC ON)
+    find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core RemoteObjects)
+    find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core RemoteObjects)
+endif()
 
 # Plain-C++ transport dependencies (no Qt).
 #
@@ -30,7 +34,203 @@ endif()
 message(STATUS "Boost.System target: ${LOGOS_BOOST_SYSTEM} (Boost ${Boost_VERSION})")
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(Threads REQUIRED)
 
+if(WIN32)
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
+else()
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
+endif()
+
+set(LOGOS_PLAIN_NETWORK_SOURCES
+    implementations/plain/rpc_message.cpp
+    implementations/plain/json_mapping.cpp
+    implementations/plain/json_codec.cpp
+    implementations/plain/cbor_codec.cpp
+    implementations/plain/rpc_framing.cpp
+    implementations/plain/rpc_server.cpp
+    implementations/plain/io_context_pool.cpp
+)
+
+add_library(logos_socket_paths STATIC
+    logos_socket_paths.cpp
+    logos_socket_paths.h
+)
+target_compile_features(logos_socket_paths PUBLIC cxx_std_17)
+target_include_directories(logos_socket_paths PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
+set_target_properties(logos_socket_paths PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# The Qt Remote Objects 6.9.2 wire profile used by current Logos modules. This
+# target is intentionally self-contained and Qt-free: compatibility tests link
+# Qt on the reference side, while module processes can link only this archive.
+add_library(logos_qt_remote_plain_wire STATIC
+    implementations/qt_remote_plain/qtro_wire.cpp
+    implementations/qt_remote_plain/qtro_wire.h
+    implementations/plain/rpc_value.h
+)
+target_compile_features(logos_qt_remote_plain_wire PUBLIC cxx_std_17)
+target_link_libraries(logos_qt_remote_plain_wire PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(logos_qt_remote_plain_wire PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote_plain>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
+    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include/implementations/qt_remote_plain>
+    $<INSTALL_INTERFACE:include/implementations/plain>
+)
+set_target_properties(logos_qt_remote_plain_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(logos_qt_remote_plain_transport STATIC
+    implementations/qt_remote_plain/qtro_transport.cpp
+    implementations/qt_remote_plain/qtro_transport.h
+)
+target_compile_features(logos_qt_remote_plain_transport PUBLIC cxx_std_17)
+target_link_libraries(logos_qt_remote_plain_transport PUBLIC
+    logos_qt_remote_plain_wire
+    logos_socket_paths
+    Threads::Threads
+)
+target_include_directories(logos_qt_remote_plain_transport PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote_plain>
+    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include/implementations/qt_remote_plain>
+)
+set_target_properties(logos_qt_remote_plain_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Complete Qt-free implementation of the public lp_* C ABI.  New native
+# module images link this target; current Qt plugins keep linking
+# logos_protocol and reach the same wire through the adapter below.
+add_library(logos_protocol_plain STATIC
+    logos_protocol_plain.cpp
+    logos_protocol_plain_network.cpp
+    logos_protocol_plain_network.h
+    ${LOGOS_PLAIN_NETWORK_SOURCES}
+    logos_protocol.h
+    logos_transport_config_json.cpp
+    logos_transport_config_json.h
+    logos_transport_config.h
+)
+target_compile_features(logos_protocol_plain PUBLIC cxx_std_17)
+target_include_directories(logos_protocol_plain PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(logos_protocol_plain PUBLIC
+    logos_qt_remote_plain_transport
+    Boost::headers
+    ${LOGOS_BOOST_SYSTEM}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
+)
+set_target_properties(logos_protocol_plain PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# Shared form of the same Qt-free runtime. Hosts and liblogos must use one
+# process-wide token registry; linking the static archive into both a parent
+# executable and liblogos would create two independent registries. The shared
+# target also provides an explicit PE export surface for Windows consumers.
+add_library(logos_protocol_plain_shared SHARED
+    logos_protocol_plain.cpp
+    logos_protocol_plain_network.cpp
+    logos_protocol_plain_network.h
+    ${LOGOS_PLAIN_NETWORK_SOURCES}
+    logos_protocol.h
+    logos_transport_config_json.cpp
+    logos_transport_config_json.h
+    logos_transport_config.h
+)
+target_compile_features(logos_protocol_plain_shared PUBLIC cxx_std_17)
+target_include_directories(logos_protocol_plain_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(logos_protocol_plain_shared PUBLIC
+    logos_qt_remote_plain_transport
+    Boost::headers
+    ${LOGOS_BOOST_SYSTEM}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
+)
+target_compile_definitions(logos_protocol_plain_shared
+    PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
+set_target_properties(logos_protocol_plain_shared PROPERTIES
+    OUTPUT_NAME logos_protocol_plain
+    POSITION_INDEPENDENT_CODE ON
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# One process can load both shared protocol libraries (basecamp: liblogos_core
+# links the plain one, logos-qt-host the Qt one) and both export the lp_* C
+# ABI. On ELF a version node binds each consumer's references to the library
+# it linked, and -Bsymbolic-functions keeps each library's own calls inside it.
+# Data stays shared, so inline singletons remain one per process.
+function(logos_protocol_isolate_elf_exports target node)
+    if(UNIX AND NOT APPLE)
+        set(_script "${CMAKE_CURRENT_BINARY_DIR}/${target}.version")
+        file(WRITE "${_script}" "${node} { global: *; };\n")
+        target_link_options(${target} PRIVATE
+            "LINKER:--version-script=${_script}" "LINKER:-Bsymbolic-functions")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_script}")
+    endif()
+endfunction()
+
+logos_protocol_isolate_elf_exports(logos_protocol_plain_shared LOGOS_PROTOCOL_PLAIN)
+
+# Shipped by the Qt-free configuration only. Two builds of one shared library
+# under one name let a process load both, each with its own token registry.
+# The Qt configuration still defines it, for its own tests.
+if(LOGOS_PROTOCOL_BUILD_QT)
+    set_target_properties(logos_protocol_plain_shared PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
+# PE exports no C++ symbols unless they are named explicitly. Generate the
+# plain runtime's export table from its matching static archive so consumers can
+# call both the lp_* C ABI and the transport-config helpers without maintaining
+# a hand-written symbol list.
+if(WIN32)
+    set(_lpp_nm "${CMAKE_NM}")
+    if(NOT _lpp_nm)
+        find_program(_lpp_nm NAMES "${CMAKE_CXX_COMPILER_TARGET}-nm" x86_64-w64-mingw32-nm nm)
+    endif()
+    if(NOT _lpp_nm)
+        message(FATAL_ERROR
+            "nm not found, so liblogos_protocol_plain.dll cannot be given an export list")
+    endif()
+
+    set(_lpp_def "${CMAKE_CURRENT_BINARY_DIR}/logos_protocol_plain_shared_exports.def")
+    add_custom_command(
+        OUTPUT "${_lpp_def}"
+        COMMAND ${CMAKE_COMMAND} -E env sh
+                "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
+                "${_lpp_nm}" "${_lpp_def}"
+                "$<TARGET_FILE:logos_protocol_plain>" "ALL"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
+                logos_protocol_plain
+        COMMENT "Generating liblogos_protocol_plain export definition"
+        VERBATIM
+    )
+    add_custom_target(logos_protocol_plain_shared_exports DEPENDS "${_lpp_def}")
+    add_dependencies(logos_protocol_plain_shared logos_protocol_plain_shared_exports)
+    target_link_options(logos_protocol_plain_shared PRIVATE "${_lpp_def}")
+    set_property(TARGET logos_protocol_plain_shared APPEND PROPERTY
+                 LINK_DEPENDS "${_lpp_def}")
+endif()
+
+if(LOGOS_PROTOCOL_BUILD_QT)
 set(PROTOCOL_SOURCES
     logos_protocol.h
     logos_module_impl.h
@@ -56,7 +256,6 @@ set(PROTOCOL_SOURCES
     logos_mode.h
     logos_instance.h
     logos_socket_paths.h
-    logos_socket_paths.cpp
     plugin_registry.h
     logos_object.h
     # Internal and deliberately not installed: the consumer registry's hook into qt_remote's source loss.
@@ -82,6 +281,8 @@ set(PROTOCOL_SOURCES
     implementations/qt_remote/remote_transport.h
     implementations/qt_remote/qt_remote_registry.h
     implementations/qt_remote/qt_remote_registry.cpp
+    implementations/qt_remote_plain/qt_remote_plain_transport.cpp
+    implementations/qt_remote_plain/qt_remote_plain_transport.h
     implementations/mock/mock_store.cpp
     implementations/mock/mock_store.h
     implementations/mock/mock_transport.cpp
@@ -128,12 +329,6 @@ add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
 # "undefined reference to `AcceptEx'" out of
 # win_iocp_socket_service_base::start_accept_op. ws2_32 supplies core Winsock
 # and is listed explicitly rather than relied upon arriving via Qt::Network.
-if(WIN32)
-    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
-else()
-    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
-endif()
-
 target_link_libraries(logos_protocol PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
@@ -143,17 +338,21 @@ target_link_libraries(logos_protocol PUBLIC
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
     ${LOGOS_PROTOCOL_PLATFORM_LIBS}
+    logos_qt_remote_plain_wire
+    logos_qt_remote_plain_transport
 )
 
 target_include_directories(logos_protocol PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_local>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote_plain>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/mock>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
     $<INSTALL_INTERFACE:include>
     $<INSTALL_INTERFACE:include/implementations/qt_local>
     $<INSTALL_INTERFACE:include/implementations/qt_remote>
+    $<INSTALL_INTERFACE:include/implementations/qt_remote_plain>
     $<INSTALL_INTERFACE:include/implementations/mock>
     $<INSTALL_INTERFACE:include/implementations/plain>
 )
@@ -203,6 +402,8 @@ target_link_libraries(logos_protocol_shared PUBLIC
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
     ${LOGOS_PROTOCOL_PLATFORM_LIBS}
+    logos_qt_remote_plain_wire
+    logos_qt_remote_plain_transport
 )
 
 # Only the SHARED build marks the lp_* C ABI dllexport; the static archive
@@ -217,11 +418,13 @@ target_include_directories(logos_protocol_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_local>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote_plain>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/mock>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
     $<INSTALL_INTERFACE:include>
     $<INSTALL_INTERFACE:include/implementations/qt_local>
     $<INSTALL_INTERFACE:include/implementations/qt_remote>
+    $<INSTALL_INTERFACE:include/implementations/qt_remote_plain>
     $<INSTALL_INTERFACE:include/implementations/mock>
     $<INSTALL_INTERFACE:include/implementations/plain>
 )
@@ -232,6 +435,7 @@ set_target_properties(logos_protocol_shared PROPERTIES
     OUTPUT_NAME logos_protocol
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
+logos_protocol_isolate_elf_exports(logos_protocol_shared LOGOS_PROTOCOL)
 
 # ARCHIVE DESTINATION is NOT redundant here. On Windows a shared library's
 # import library (.dll.a) is the ARCHIVE artifact and the DLL itself is RUNTIME,
@@ -263,7 +467,7 @@ if(WIN32)
     endif()
 
     # Generated from the STATIC archive, which is built from the same sources.
-    # "*" means every member: ld chooses archive members for reasons unrelated to
+    # "ALL" means every member: ld chooses archive members for reasons unrelated to
     # our symbols, so a partial set is a downstream undefined reference.
     set(_lp_def "${CMAKE_CURRENT_BINARY_DIR}/logos_protocol_shared_exports.def")
     add_custom_command(
@@ -271,7 +475,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E env sh
                 "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh"
                 "${_lp_nm}" "${_lp_def}"
-                "$<TARGET_FILE:logos_protocol>" "*"
+                "$<TARGET_FILE:logos_protocol>" "ALL"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/gen-shared-exports.sh" logos_protocol
         COMMENT "Generating liblogos_protocol export definition"
         VERBATIM
@@ -289,6 +493,29 @@ install(TARGETS logos_protocol_shared
     RUNTIME DESTINATION bin
     INCLUDES DESTINATION include
 )
+endif()
+
+install(TARGETS logos_qt_remote_plain_wire
+    EXPORT logos-protocolTargets
+    ARCHIVE DESTINATION lib
+    INCLUDES DESTINATION include
+)
+
+install(TARGETS logos_socket_paths logos_qt_remote_plain_transport logos_protocol_plain
+    EXPORT logos-protocolTargets
+    ARCHIVE DESTINATION lib
+    INCLUDES DESTINATION include
+)
+
+if(NOT LOGOS_PROTOCOL_BUILD_QT)
+install(TARGETS logos_protocol_plain_shared
+    EXPORT logos-protocolTargets
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+    INCLUDES DESTINATION include
+)
+endif()
 
 install(EXPORT logos-protocolTargets
     FILE logos-protocolTargets.cmake
@@ -304,7 +531,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.1.0
+    VERSION 0.12.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES
@@ -363,6 +590,12 @@ install(FILES
     implementations/plain/json_codec.h
     implementations/plain/rpc_framing.h
     DESTINATION include/implementations/plain
+)
+
+install(FILES
+    implementations/qt_remote_plain/qtro_wire.h
+    implementations/qt_remote_plain/qtro_transport.h
+    DESTINATION include/implementations/qt_remote_plain
 )
 
 install(FILES

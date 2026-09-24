@@ -11,7 +11,9 @@
 
 include(CMakeFindDependencyMacro)
 
+if(@LOGOS_PROTOCOL_BUILD_QT@)
 find_dependency(Qt6 REQUIRED COMPONENTS Core RemoteObjects)
+endif()
 # `system` for boost::system::error_code (Boost.Asio) — see the
 # matching note in cpp/CMakeLists.txt next to target_link_libraries.
 # Boost.System is header-only, and Boost 1.89 removed the compiled
@@ -25,6 +27,7 @@ find_dependency(Boost REQUIRED)
 find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 find_dependency(OpenSSL REQUIRED)
 find_dependency(nlohmann_json REQUIRED)
+find_dependency(Threads REQUIRED)
 
 include("${CMAKE_CURRENT_LIST_DIR}/logos-protocolTargets.cmake")
 

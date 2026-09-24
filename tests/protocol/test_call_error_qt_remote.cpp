@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_consumer.h"
 #include "logos_async_dispatch.h"
 #include "logos_instance.h"
@@ -95,11 +96,11 @@ TEST_F(QtRemoteCallErrorTest, AsyncSuccessCarriesAnEmptyError)
 {
     const QString registryUrl = LogosInstance::id("qtro_ok_module");
 
-    RemoteTransportHost host(registryUrl);
+    auto host = makeLocalHost(registryUrl);
     StallProvider provider;
     ModuleProxy proxy(&provider);
     ASSERT_TRUE(proxy.saveToken(QStringLiteral("origin"), QStringLiteral("tok-1")));
-    ASSERT_TRUE(host.publishObject("qtro_ok_module", &proxy));
+    ASSERT_TRUE(host->publishObject("qtro_ok_module", &proxy));
 
     LogosAPIConsumer consumer(QStringLiteral("qtro_ok_module"),
                               QStringLiteral("origin"),
@@ -134,11 +135,11 @@ TEST_F(QtRemoteCallErrorTest, AsyncTimeoutCarriesTheCanonicalError)
 {
     const QString registryUrl = LogosInstance::id("qtro_stall_module");
 
-    RemoteTransportHost host(registryUrl);
+    auto host = makeLocalHost(registryUrl);
     StallProvider provider;
     ModuleProxy proxy(&provider);
     ASSERT_TRUE(proxy.saveToken(QStringLiteral("origin"), QStringLiteral("tok-1")));
-    ASSERT_TRUE(host.publishObject("qtro_stall_module", &proxy));
+    ASSERT_TRUE(host->publishObject("qtro_stall_module", &proxy));
 
     LogosAPIConsumer consumer(QStringLiteral("qtro_stall_module"),
                               QStringLiteral("origin"),

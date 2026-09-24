@@ -1,3 +1,4 @@
+if(LOGOS_PROTOCOL_BUILD_QT)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
 # ── which of these tests are detectors, and how that was checked ─────────────
@@ -113,6 +114,15 @@ add_executable(protocol_tests
     test_main.cpp
     # New protocol-level tests
     test_protocol_version.cpp
+    # Byte-for-byte reference checks against Qt 6.9.2 QDataStream and the
+    # current ModuleProxy meta-object. The production codec under test has no
+    # Qt dependency; Qt lives only on this reference side.
+    test_qt_remote_plain_compat.cpp
+    # Real local-socket interoperability in both directions: raw plain codec
+    # client against QRemoteObjectHost, then QRemoteObjectNode against a raw
+    # plain server.
+    test_qt_remote_plain_socket_compat.cpp
+    test_qt_remote_plain_adapter.cpp
     test_json_convert_bytes.cpp
     # The `result` half of the canonical converter pair: qvariantToNlohmann has
     # always owned LogosResult -> JSON; jsonToLogosResult is its inverse, and
@@ -278,8 +288,8 @@ add_executable(protocol_tests
     test_plain_uint64.cpp
     # Qt-free socket-access + stale-socket reaper helpers (multi-user local
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
-    # reapStaleSockets never touching live sockets or regular files.
-    test_socket_paths.cpp
+    # reapStaleSockets never touching live sockets or regular files. POSIX only.
+    $<$<NOT:$<PLATFORM_ID:Windows>>:test_socket_paths.cpp>
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
     # The token-only handshake surface published before a module's initializer.
@@ -305,6 +315,7 @@ add_executable(protocol_tests
     # thread. Also guards that arming the first accept on the strand (rather
     # than inline in start()) still serves a client that connects immediately.
     test_rpc_server_teardown.cpp
+    test_rpc_server_stop_drain.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
@@ -458,6 +469,133 @@ target_link_libraries(protocol_tests PRIVATE
 
 gtest_discover_tests(protocol_tests)
 
+# These cases regress lock cycles, so each runs in its own process with a CTest
+# deadline. A broken implementation fails as a timeout instead of wedging the
+# rest of protocol_tests and hiding which shutdown path deadlocked.
+add_executable(qt_remote_plain_regression_probe
+    qt_remote_plain_shutdown_probe.cpp
+)
+target_link_libraries(qt_remote_plain_regression_probe PRIVATE
+    logos_protocol
+    Qt${QT_VERSION_MAJOR}::Core
+)
+add_test(NAME QtRemotePlainRegression.adapter-shutdown
+         COMMAND qt_remote_plain_regression_probe)
+set_tests_properties(QtRemotePlainRegression.adapter-shutdown PROPERTIES TIMEOUT 8)
+
+# ELF only: one process loading both shared protocol libraries, each ahead of
+# the other's consumer. Mach-O and PE bind every import to a named library.
+if(UNIX AND NOT APPLE)
+add_library(plain_consumer_probe SHARED protocol_consumer_probe.cpp)
+target_compile_definitions(plain_consumer_probe PRIVATE PROBE_FUNCTION=plainConsumerResolvesTo)
+target_link_libraries(plain_consumer_probe PRIVATE logos_protocol_plain_shared ${CMAKE_DL_LIBS})
+add_library(qt_consumer_probe SHARED protocol_consumer_probe.cpp)
+target_compile_definitions(qt_consumer_probe PRIVATE PROBE_FUNCTION=qtConsumerResolvesTo)
+target_link_libraries(qt_consumer_probe PRIVATE logos_protocol_shared ${CMAKE_DL_LIBS})
+# basecamp's order: the Qt library ahead of a plain consumer.
+add_executable(protocol_symbol_isolation_plain_tests test_protocol_symbol_isolation.cpp)
+target_compile_definitions(protocol_symbol_isolation_plain_tests PRIVATE
+    PROBE_FUNCTION=plainConsumerResolvesTo EXPECTED_LIBRARY="liblogos_protocol_plain.")
+target_link_options(protocol_symbol_isolation_plain_tests PRIVATE "LINKER:--no-as-needed")
+target_link_libraries(protocol_symbol_isolation_plain_tests PRIVATE
+    logos_protocol_shared plain_consumer_probe GTest::gtest_main)
+gtest_discover_tests(protocol_symbol_isolation_plain_tests)
+# The reverse order: the plain library ahead of a Qt consumer.
+add_executable(protocol_symbol_isolation_qt_tests test_protocol_symbol_isolation.cpp)
+target_compile_definitions(protocol_symbol_isolation_qt_tests PRIVATE
+    PROBE_FUNCTION=qtConsumerResolvesTo EXPECTED_LIBRARY="liblogos_protocol.")
+target_link_options(protocol_symbol_isolation_qt_tests PRIVATE "LINKER:--no-as-needed")
+target_link_libraries(protocol_symbol_isolation_qt_tests PRIVATE
+    logos_protocol_plain_shared qt_consumer_probe GTest::gtest_main)
+gtest_discover_tests(protocol_symbol_isolation_qt_tests)
+endif()
+
+if(NOT WIN32)
+add_executable(qt_remote_plain_relative_path_probe
+    qt_remote_plain_relative_path_probe.cpp
+)
+target_link_libraries(qt_remote_plain_relative_path_probe PRIVATE
+    logos_qt_remote_plain_transport
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::Network
+)
+add_test(NAME QtRemotePlainRegression.relative-local-path
+         COMMAND qt_remote_plain_relative_path_probe)
+set_tests_properties(QtRemotePlainRegression.relative-local-path PROPERTIES TIMEOUT 5)
+endif()
+endif()
+
+# A genuinely Qt-free executable for the codec's bounds, frame and semantic
+# round trips. Keeping it separate prevents an accidental Qt include or link
+# dependency from being hidden by protocol_tests' reference-side Qt linkage.
+add_executable(qt_remote_plain_wire_tests
+    test_qt_remote_plain_wire.cpp
+    test_qt_remote_plain_transport.cpp
+)
+target_link_libraries(qt_remote_plain_wire_tests PRIVATE
+    logos_qt_remote_plain_transport
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_wire_tests)
+
+# Public C ABI linked to the production Qt-free runtime.  Keep this in its own
+# executable so any accidental Qt dependency is visible in the link closure.
+add_executable(qt_remote_plain_cabi_tests
+    # Run the version and allocator-ownership C ABI checks against the plain
+    # implementation too. This executable is the one available in native
+    # Windows builds where LOGOS_PROTOCOL_BUILD_QT is disabled.
+    test_protocol_version.cpp
+    test_qt_remote_plain_cabi.cpp
+    test_plain_network_cabi.cpp
+)
+target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_cabi_tests PROPERTIES TIMEOUT 8)
+
+# The same C ABI checks against the shared plain runtime: the form liblogos,
+# its hosts and logoscore share in one process.
+add_executable(qt_remote_plain_cabi_shared_tests
+    test_protocol_version.cpp
+    test_qt_remote_plain_cabi.cpp
+)
+target_link_libraries(qt_remote_plain_cabi_shared_tests PRIVATE
+    logos_protocol_plain_shared
+    GTest::gtest_main
+)
+gtest_discover_tests(qt_remote_plain_cabi_shared_tests PROPERTIES TIMEOUT 8)
+
+# A process that called over TLS through the shared runtime must exit: the
+# child makes one call and returns, and the test runs it many times.
+add_executable(plain_exit_child plain_exit_child.cpp)
+target_link_libraries(plain_exit_child PRIVATE logos_protocol_plain_shared)
+add_executable(qt_remote_plain_exit_tests test_plain_exit.cpp)
+target_link_libraries(qt_remote_plain_exit_tests PRIVATE
+    logos_protocol_plain_shared
+    GTest::gtest_main
+)
+target_compile_definitions(qt_remote_plain_exit_tests PRIVATE
+    PLAIN_EXIT_CHILD="$<TARGET_FILE:plain_exit_child>")
+add_dependencies(qt_remote_plain_exit_tests plain_exit_child)
+gtest_discover_tests(qt_remote_plain_exit_tests PROPERTIES TIMEOUT 600)
+
+# A real Qt Remote Objects host exercises callback-initiated teardown of the
+# Qt-free client across the legacy/plain interoperability boundary. Qt's local
+# socket path compatibility is required on Unix; Windows modules use plain.
+if(LOGOS_PROTOCOL_BUILD_QT AND UNIX)
+add_executable(qt_remote_plain_qro_callback_destroy_tests
+    test_qt_remote_plain_qro_callback_destroy.cpp
+)
+target_link_libraries(qt_remote_plain_qro_callback_destroy_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+)
+gtest_discover_tests(qt_remote_plain_qro_callback_destroy_tests PROPERTIES TIMEOUT 8)
+endif()
+
 # ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
 #
 # A SECOND executable, for one reason: QCoreApplication is a process-wide
@@ -470,6 +608,7 @@ gtest_discover_tests(protocol_tests)
 #
 # Everything here links the same library and exercises the same code paths; only
 # main() differs. See test_main_noqt.cpp.
+if(LOGOS_PROTOCOL_BUILD_QT)
 add_executable(protocol_noqt_tests
     test_main_noqt.cpp
     # The async delivery hop, in a process with no Qt event loop. It read
@@ -504,3 +643,17 @@ target_link_libraries(protocol_noqt_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_noqt_tests)
+endif()
+
+# Which implementation each transport resolves to. Also the Qt-configured test
+# Windows runs (nix/tests-windows-qt.nix), where local must mean plain.
+if(LOGOS_PROTOCOL_BUILD_QT)
+add_executable(transport_resolution_tests test_transport_resolution.cpp)
+target_link_libraries(transport_resolution_tests PRIVATE
+    logos_protocol
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+)
+gtest_discover_tests(transport_resolution_tests)
+endif()

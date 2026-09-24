@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include "local_host.h"
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_provider_interface.h"
@@ -133,8 +134,8 @@ protected:
 // and all N calls succeed.
 TEST_F(TokenCacheTest, SyncCallsToSameTargetHandshakeOnce)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -148,8 +149,8 @@ TEST_F(TokenCacheTest, SyncCallsToSameTargetHandshakeOnce)
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrapToken));
 
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -181,8 +182,8 @@ TEST_F(TokenCacheTest, SyncCallsToSameTargetHandshakeOnce)
 // drain, so the SECOND burst also short-circuits — exactly one mint total.
 TEST_F(TokenCacheTest, AsyncCallsToSameTargetHandshakeOnceAcrossBursts)
 {
-    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
@@ -196,8 +197,8 @@ TEST_F(TokenCacheTest, AsyncCallsToSameTargetHandshakeOnceAcrossBursts)
     TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
     ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrapToken));
 
-    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(capHost->publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
 
     LogosAPIClient client(QStringLiteral("target_module"),
                           QStringLiteral("test_origin"),
@@ -259,12 +260,12 @@ TEST_F(TokenCacheTest, AsyncCallsToSameTargetHandshakeOnceAcrossBursts)
 //     default. Pre-fix this side fails at ~20 s.
 TEST_F(TokenCacheTest, UnTokenedCallBoundsTheHandshakeByTheCallersBudget)
 {
-    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
 
     PingProvider targetProvider;
     ModuleProxy  targetProxy(&targetProvider);
     targetProvider.bindProxy(&targetProxy);
-    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+    ASSERT_TRUE(targetHost->publishObject("target_module", &targetProxy));
 
     // A capability token exists, so the client tries the handshake — but there
     // is no capability_module host and no published object to reach.

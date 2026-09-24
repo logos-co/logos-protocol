@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "logos_protocol.h"
+#include "logos_transport_config.h"
 
 #include <cstring>
 
@@ -37,4 +38,43 @@ TEST(ProtocolVersion, VersionStringIsStatic)
 TEST(ProtocolVersion, StringFreeAcceptsNull)
 {
     lp_string_free(nullptr);  // must be a no-op, not a crash
+}
+
+TEST(ProtocolVersion, StringCopyUsesProtocolOwnedStorage)
+{
+    char source[] = "allocator-boundary";
+    char* copy = lp_string_copy(source);
+    ASSERT_NE(copy, nullptr);
+    EXPECT_STREQ(copy, source);
+    EXPECT_NE(copy, source);
+    lp_string_free(copy);
+    EXPECT_EQ(lp_string_copy(nullptr), nullptr);
+}
+
+// Plugins built before qt_remote_plain existed carry these numbers in the
+// LogosTransportConfig objects they share with the host in-process.
+TEST(ProtocolVersion, TransportProtocolsKeepTheirNumbers)
+{
+    EXPECT_EQ(static_cast<int>(LogosProtocol::LocalSocket), 0);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::Tcp), 1);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::TcpSsl), 2);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::QtRemotePlain), 3);
+}
+
+// MINORs 10 and 11 were reused (see logos_protocol.h), so each addition of the
+// 0.12 wave has a feature macro, and arrives with it.
+TEST(ProtocolVersion, TheQtRemotePlainWaveHasFeatureMacros)
+{
+#if defined(LOGOS_PROTOCOL_HAS_QT_REMOTE_PLAIN) && defined(LOGOS_PROTOCOL_HAS_CURRENT_CALLER_JSON) \
+    && defined(LOGOS_PROTOCOL_HAS_PROVIDER_TOKEN_VALIDATOR) \
+    && defined(LOGOS_PROTOCOL_HAS_WILDCARD_SUBSCRIBE) \
+    && defined(LOGOS_PROTOCOL_HAS_STAGED_PUBLICATION) && defined(LOGOS_PROTOCOL_HAS_STRING_COPY)
+    const void* symbols[] = {reinterpret_cast<const void*>(&lp_current_caller_json),
+                             reinterpret_cast<const void*>(&lp_provider_set_token_validator),
+                             reinterpret_cast<const void*>(&lp_provider_prepare),
+                             reinterpret_cast<const void*>(&lp_string_copy)};
+    for (const void* symbol : symbols) EXPECT_NE(symbol, nullptr);
+#else
+    FAIL() << "an addition of the 0.12 wave has no feature macro";
+#endif
 }

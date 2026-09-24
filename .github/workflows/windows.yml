@@ -1,0 +1,28 @@
+name: Windows
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: tests tests-qt
+      # Every suite the targets declare, one case per process; see nix/tests-windows*.nix.
+      tests: true
+      tests-timeout-minutes: 60
+      # The native test leg runs these and more, so only wine keeps the smoke.
+      native-smoke: false
+      smoke: |
+        run tests/bin/qt_remote_plain_wire_tests.exe
+        run tests/bin/qt_remote_plain_cabi_tests.exe
+        run tests/bin/qt_remote_plain_cabi_shared_tests.exe
+        run tests-qt/bin/transport_resolution_tests.exe

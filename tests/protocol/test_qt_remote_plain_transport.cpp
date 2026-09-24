@@ -1,0 +1,675 @@
+#include "implementations/qt_remote_plain/qtro_transport.h"
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+
+using namespace logos::plain;
+using namespace logos::qt_remote_plain;
+
+namespace {
+
+#ifdef _WIN32
+// Wine's ntdll exports wine_get_version; Windows' does not.
+bool runningUnderWine()
+{
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    return ntdll && ::GetProcAddress(ntdll, "wine_get_version");
+}
+#endif
+
+std::string transportSocketPath()
+{
+    static std::atomic<unsigned> serial{0};
+#ifdef _WIN32
+    return "local:logos_qtro_transport_" + std::to_string(::_getpid())
+        + "_" + std::to_string(serial.fetch_add(1));
+#else
+    return "/tmp/logos_qtro_transport_" + std::to_string(::getpid())
+        + "_" + std::to_string(serial.fetch_add(1));
+#endif
+}
+
+TEST(QtRemotePlainTransportTest, PlainClientAndServerCallAndEmitWithoutQt)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture",
+        {{"eventResponse(QString,QVariantList)", {"eventName", "data"}}},
+        {{"echo(QString)", "QString", {"value"}}},
+        {},
+    };
+    object.invoke = [](std::int32_t method, const std::vector<Variant>& arguments) {
+        if (method != 0 || arguments.size() != 1)
+            throw std::runtime_error("unexpected invocation");
+        return Variant::fromRpc(RpcValue{"plain:" + arguments[0].value.asString()});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    const auto result = client.call("fixture", "echo(QString)",
+        {Variant::fromRpc(RpcValue{"hello"})}, std::chrono::seconds(2), &error);
+    ASSERT_TRUE(result.has_value()) << error;
+    EXPECT_EQ(result->value.asString(), "plain:hello");
+
+    std::mutex eventMutex;
+    std::condition_variable eventReady;
+    std::string eventValue;
+    client.setEventHandler([&](const std::string& name, std::int32_t index,
+                               std::vector<Variant> arguments) {
+        if (name != "fixture" || index != 0 || arguments.size() != 2) return;
+        std::lock_guard<std::mutex> lock(eventMutex);
+        eventValue = arguments[1].value.asList().items.at(0).asString();
+        eventReady.notify_all();
+    });
+    RpcList payload;
+    payload.items.emplace_back("payload");
+    ASSERT_TRUE(server.emitSignal("fixture", 0,
+        {Variant::fromRpc(RpcValue{"tick"}),
+         Variant::fromRpc(RpcValue{std::move(payload)})}, &error)) << error;
+    std::unique_lock<std::mutex> lock(eventMutex);
+    ASSERT_TRUE(eventReady.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !eventValue.empty();
+    }));
+    EXPECT_EQ(eventValue, "payload");
+    lock.unlock();
+
+    client.close();
+    server.stop();
+}
+
+Server::Object echoFixture()
+{
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {"Fixture", {}, {{"echo(QString)", "QString", {"value"}}}, {}};
+    object.invoke = [](std::int32_t, const std::vector<Variant>& arguments) {
+        return Variant::fromRpc(RpcValue{"plain:" + arguments.at(0).value.asString()});
+    };
+    return object;
+}
+
+// Detector: the client tried once, so a provider still starting (or
+// restarting) failed the call instantly where QtRO would have waited for it.
+TEST(QtRemotePlainTransportTest, AClientReachesAServerThatStartsWithinItsTimeout)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::thread starter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        std::string error;
+        EXPECT_TRUE(server.start(path, &error)) << error;
+    });
+
+    Client client;
+    std::string error;
+    const bool connected = client.connect(path, std::chrono::seconds(3), &error);
+    starter.join();
+    ASSERT_TRUE(connected) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    const auto result = client.call("fixture", "echo(QString)",
+        {Variant::fromRpc(RpcValue{"late"})}, std::chrono::seconds(2), &error);
+    ASSERT_TRUE(result.has_value()) << error;
+    EXPECT_EQ(result->value.asString(), "plain:late");
+    client.close();
+    server.stop();
+}
+
+TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
+{
+    const std::string path = transportSocketPath();
+    Client client;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect(path, std::chrono::milliseconds(400), &error));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(350));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(QtRemotePlainTransportTest, AListenerWaitBoundsTheRetriesOfAnAbsentServer)
+{
+    const std::string path = transportSocketPath();
+    Client client;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect(path, std::chrono::seconds(5), &error, nullptr,
+                                std::chrono::milliseconds(200)));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(150));
+    EXPECT_LT(elapsed, std::chrono::seconds(2)) << "the listener wait did not bound the retries";
+}
+
+// Detector (Windows): a second server on a live name started and shared it,
+// so a client could land on either.
+TEST(QtRemotePlainTransportTest, ASecondServerCannotTakeALiveEndpoint)
+{
+#ifdef _WIN32
+    // Windows refuses a second FILE_FLAG_FIRST_PIPE_INSTANCE server; Wine lets it start.
+    if (runningUnderWine()) GTEST_SKIP() << "Wine does not enforce FILE_FLAG_FIRST_PIPE_INSTANCE";
+#endif
+    const std::string path = transportSocketPath();
+    Server first;
+    ASSERT_TRUE(first.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(first.start(path, &error)) << error;
+
+    Server second;
+    EXPECT_FALSE(second.start(path, &error));
+    EXPECT_FALSE(error.empty());
+    for (int i = 0; i < 4; ++i) {
+        Client client;
+        ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+        EXPECT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+        client.close();
+    }
+    first.stop();
+}
+
+// Detector (Windows): start() succeeded before any pipe existed, so an
+// endpoint that could not be listened on still "started".
+TEST(QtRemotePlainTransportTest, StartFailsForAnEndpointThatCannotBeListenedOn)
+{
+#ifdef _WIN32
+    const std::string path = "local:" + std::string(300, 'x');
+#else
+    const std::string path = "/tmp/" + std::string(200, 'x');
+#endif
+    Server server;
+    std::string error;
+    EXPECT_FALSE(server.start(path, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_FALSE(server.isRunning());
+}
+
+// Detector (Windows): a stop() racing the accept thread's first pipe missed
+// it and then waited forever for a connect that never came.
+TEST(QtRemotePlainTransportTest, StopRightAfterStartReturns)
+{
+    for (int i = 0; i < 1000; ++i) {
+        auto server = std::make_shared<Server>();
+        std::string error;
+        ASSERT_TRUE(server->start(transportSocketPath(), &error)) << error;
+        std::promise<void> done;
+        auto stopped = done.get_future();
+        // Detached: a hung stop() must fail the test, not hang the binary.
+        std::thread([server, done = std::move(done)]() mutable {
+            server->stop();
+            done.set_value();
+        }).detach();
+        ASSERT_EQ(stopped.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+            << "stop() right after start() hung, iteration " << i;
+    }
+}
+
+#ifdef _WIN32
+// Detector: LOGOS_SOCKET_GROUP/MODE were ignored here, leaving the endpoint
+// more open than the operator asked for.
+TEST(QtRemotePlainTransportTest, SocketPermissionSettingsAreRefusedOnWindows)
+{
+    _putenv_s("LOGOS_SOCKET_MODE", "0660");
+    Server server;
+    std::string error;
+    const bool started = server.start(transportSocketPath(), &error);
+    _putenv_s("LOGOS_SOCKET_MODE", "");
+    EXPECT_FALSE(started);
+    EXPECT_NE(error.find("LOGOS_SOCKET"), std::string::npos) << error;
+}
+#endif
+
+// Detector: a call that looked its object up after a RemoveObject raced it
+// threw std::out_of_range, which the C ABI turned into a terminate.
+TEST(QtRemotePlainTransportTest, ACallRacingAnUnpublishFailsInsteadOfThrowing)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+
+    std::atomic<bool> churning{true};
+    std::thread churn([&] {
+        while (churning) {
+            server.unpublish("fixture");
+            (void)server.publish(echoFixture());
+        }
+    });
+    for (int i = 0; i < 500; ++i) {
+        std::string callError;
+        EXPECT_NO_THROW((void)client.call("fixture", "echo(QString)",
+            {Variant::fromRpc(RpcValue{"x"})}, std::chrono::milliseconds(200), &callError));
+    }
+    churning = false;
+    churn.join();
+    client.close();
+    server.stop();
+}
+
+#ifndef _WIN32
+// This process's sockets whose own address, or whose peer's, is `path`.
+std::vector<int> socketsOn(const std::string& path)
+{
+    std::vector<int> found;
+    for (int fd = 0; fd < 1024; ++fd) {
+        struct stat st {};
+        if (::fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+        sockaddr_un local {};
+        socklen_t length = sizeof(local);
+        sockaddr_un peer {};
+        socklen_t peerLength = sizeof(peer);
+        const bool bound = ::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &length) == 0
+            && local.sun_family == AF_UNIX && path == local.sun_path;
+        const bool connected = ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peerLength) == 0
+            && peer.sun_family == AF_UNIX && path == peer.sun_path;
+        if (bound || connected) found.push_back(fd);
+    }
+    return found;
+}
+
+// Detector: sockets were inheritable, so a child process could keep a peer's
+// end open after this process closed it, and the peer never saw end-of-file.
+TEST(QtRemotePlainTransportTest, EverySocketIsCloseOnExec)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    ASSERT_TRUE(server.publish(echoFixture()));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+
+    const auto sockets = socketsOn(path);
+    EXPECT_GE(sockets.size(), 2u);
+    for (int fd : sockets)
+        EXPECT_TRUE(::fcntl(fd, F_GETFD, 0) & FD_CLOEXEC) << "fd " << fd;
+    client.close();
+    server.stop();
+}
+
+// Detector: stop() removed the socket file only after its handlers finished,
+// by which time a successor could have bound the path.
+// Detector: a relative TMPDIR gave a relative socket path, so a server that
+// stopped after the working directory changed left the socket it bound.
+TEST(QtRemotePlainTransportTest, ARelativeTmpdirStillRemovesTheSocketItBound)
+{
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("qtro_rel_" + std::to_string(::getpid()));
+    fs::create_directories(root / "rel");
+    fs::create_directories(root / "elsewhere");
+    const fs::path previousDir = fs::current_path();
+    const char* savedTmp = std::getenv("TMPDIR");
+    const std::string previousTmp = savedTmp ? savedTmp : "";
+    fs::current_path(root);
+    ::setenv("TMPDIR", "rel", 1);
+
+    Server server;
+    std::string error;
+    const bool started = server.start("local:logos_relative_probe", &error);
+    fs::current_path(root / "elsewhere");
+    server.stop();
+    const bool left = fs::exists(root / "rel" / "logos_relative_probe");
+
+    fs::current_path(previousDir);
+    if (savedTmp) ::setenv("TMPDIR", previousTmp.c_str(), 1);
+    else ::unsetenv("TMPDIR");
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    ASSERT_TRUE(started) << error;
+    EXPECT_FALSE(left) << "the server left the socket it bound";
+}
+
+TEST(QtRemotePlainTransportTest, StoppingNeverRemovesASuccessorsSocket)
+{
+    const std::string path = transportSocketPath();
+    std::atomic<bool> inCall{false};
+    Server first;
+    Server::Object slow = echoFixture();
+    slow.invoke = [&inCall](std::int32_t, const std::vector<Variant>&) {
+        inCall = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        return Variant::fromRpc(RpcValue{"slow"});
+    };
+    ASSERT_TRUE(first.publish(std::move(slow)));
+    std::string error;
+    ASSERT_TRUE(first.start(path, &error)) << error;
+    Client caller;
+    ASSERT_TRUE(caller.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(caller.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    std::thread call([&] {
+        std::string callError;
+        (void)caller.call("fixture", "echo(QString)", {Variant::fromRpc(RpcValue{"x"})},
+                          std::chrono::seconds(3), &callError);
+    });
+    while (!inCall) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::thread stopper([&] { first.stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    Server second;
+    ASSERT_TRUE(second.publish(echoFixture()));
+    ASSERT_TRUE(second.start(path, &error)) << error;
+    stopper.join();
+    call.join();
+
+    Client probe;
+    EXPECT_TRUE(probe.connect(path, std::chrono::milliseconds(500), &error)) << error;
+    probe.close();
+    caller.close();
+    second.stop();
+}
+#endif
+
+TEST(QtRemotePlainTransportTest, RelativeNamesUseTheProcessTempDirectory)
+{
+#ifdef _WIN32
+    EXPECT_EQ(localSocketPath("local:logos_test"), R"(\\.\pipe\logos_test)");
+    EXPECT_EQ(localSocketPath(R"(local:\\.\pipe\logos_test)"),
+              R"(\\.\pipe\logos_test)");
+#else
+    const char* temp = std::getenv("TMPDIR");
+    std::string expected = temp && *temp ? temp : "";
+#ifdef __APPLE__
+    if (expected.empty()) {
+        const std::size_t required = ::confstr(_CS_DARWIN_USER_TEMP_DIR, nullptr, 0);
+        if (required > 1) {
+            std::string buffer(required, '\0');
+            if (::confstr(_CS_DARWIN_USER_TEMP_DIR, buffer.data(), required) > 0)
+                expected = buffer.c_str();
+        }
+    }
+#endif
+    if (expected.empty()) expected = "/tmp";
+    while (expected.size() > 1 && expected.back() == '/') expected.pop_back();
+    EXPECT_EQ(localSocketPath("local:logos_test"), expected + "/logos_test");
+    EXPECT_EQ(localSocketPath("local:/tmp/logos_test"), "/tmp/logos_test");
+#endif
+}
+
+TEST(QtRemotePlainTransportTest, StopWaitsForAnOutstandingHandler)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    std::mutex handlerMutex;
+    std::condition_variable handlerChanged;
+    bool entered = false;
+    bool release = false;
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture", {}, {{"block()", "QString", {}}}, {},
+    };
+    object.invoke = [&](std::int32_t, const std::vector<Variant>&) {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        entered = true;
+        handlerChanged.notify_all();
+        handlerChanged.wait(lock, [&] { return release; });
+        return Variant::fromRpc(RpcValue{"done"});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    std::thread call([&] {
+        std::string callError;
+        (void)client.call("fixture", "block()", {}, std::chrono::seconds(2), &callError);
+    });
+    {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        ASSERT_TRUE(handlerChanged.wait_for(lock, std::chrono::seconds(1), [&] {
+            return entered;
+        }));
+    }
+
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+        server.stop();
+        stopped = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(stopped.load());
+    {
+        std::lock_guard<std::mutex> lock(handlerMutex);
+        release = true;
+    }
+    handlerChanged.notify_all();
+    stopper.join();
+    EXPECT_TRUE(stopped.load());
+    call.join();
+    client.close();
+}
+
+// Detector: stop() closed every connection before the calls it was running
+// returned, so their replies were dropped; `logosctl daemon stop` lost its own.
+TEST(QtRemotePlainTransportTest, ACallRunningWhenStopBeginsStillGetsItsReply)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    std::mutex handlerMutex;
+    std::condition_variable handlerChanged;
+    bool entered = false;
+    bool release = false;
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture", {}, {{"block()", "QString", {}}}, {},
+    };
+    object.invoke = [&](std::int32_t, const std::vector<Variant>&) {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        entered = true;
+        handlerChanged.notify_all();
+        handlerChanged.wait(lock, [&] { return release; });
+        return Variant::fromRpc(RpcValue{"done"});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    std::optional<Variant> result;
+    std::string callError;
+    std::thread call([&] {
+        result = client.call("fixture", "block()", {}, std::chrono::seconds(5), &callError);
+    });
+    {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        ASSERT_TRUE(handlerChanged.wait_for(lock, std::chrono::seconds(1), [&] {
+            return entered;
+        }));
+    }
+
+    std::thread stopper([&] { server.stop(); });
+    // Released once stop() is under way.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+        std::lock_guard<std::mutex> lock(handlerMutex);
+        release = true;
+    }
+    handlerChanged.notify_all();
+    stopper.join();
+    call.join();
+    ASSERT_TRUE(result.has_value()) << callError;
+    EXPECT_EQ(result->value.asString(), "done");
+    client.close();
+}
+
+// Detector: stop() cleared the outbox and shut the socket while a reply was
+// still being written, so a peer that read slowly got a truncated frame.
+TEST(QtRemotePlainTransportTest, AReplyBeingWrittenWhenStopBeginsIsDelivered)
+{
+    const std::string path = transportSocketPath();
+    const std::string big(8u << 20, 'x');
+    Server server;
+    std::atomic<bool> replied{false};
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture",
+        {{"eventResponse(QString,QVariantList)", {"eventName", "data"}}},
+        {{"big()", "QString", {}}},
+        {},
+    };
+    object.invoke = [&](std::int32_t, const std::vector<Variant>&) {
+        replied = true;
+        return Variant::fromRpc(RpcValue{big});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+    // The client's reader blocks in this handler, so the reply fills the
+    // socket and stays in the server's writer until it is released.
+    std::mutex readerMutex;
+    std::condition_variable readerChanged;
+    bool reading = false;
+    bool resume = false;
+    client.setInternalEventHandler(
+        [&](const std::string&, std::int32_t, const std::vector<Variant>&) {
+            std::unique_lock<std::mutex> lock(readerMutex);
+            reading = true;
+            readerChanged.notify_all();
+            readerChanged.wait(lock, [&] { return resume; });
+            return true;
+        });
+    RpcList payload;
+    payload.items.emplace_back("hold");
+    ASSERT_TRUE(server.emitSignal("fixture", 0,
+        {Variant::fromRpc(RpcValue{"hold"}),
+         Variant::fromRpc(RpcValue{std::move(payload)})}, &error)) << error;
+    {
+        std::unique_lock<std::mutex> lock(readerMutex);
+        ASSERT_TRUE(readerChanged.wait_for(lock, std::chrono::seconds(2), [&] {
+            return reading;
+        }));
+    }
+
+    std::optional<Variant> result;
+    std::string callError;
+    std::thread call([&] {
+        result = client.call("fixture", "big()", {}, std::chrono::seconds(10), &callError);
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!replied && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_TRUE(replied.load());
+    // Long enough for the reply to fill the socket and stall the writer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::thread stopper([&] { server.stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard<std::mutex> lock(readerMutex);
+        resume = true;
+    }
+    readerChanged.notify_all();
+    stopper.join();
+    call.join();
+    ASSERT_TRUE(result.has_value()) << callError;
+    EXPECT_EQ(result->value.asString().size(), big.size());
+    client.close();
+}
+
+TEST(QtRemotePlainTransportTest, ConcurrentCallsOnOneClientCanOverlap)
+{
+    const std::string path = transportSocketPath();
+    Server server;
+    std::mutex handlerMutex;
+    std::condition_variable handlerChanged;
+    bool slowEntered = false;
+    bool releaseSlow = false;
+    Server::Object object;
+    object.name = "fixture";
+    object.definition = {
+        "Fixture", {},
+        {{"slow()", "QString", {}}, {"quick()", "QString", {}}}, {},
+    };
+    object.invoke = [&](std::int32_t index, const std::vector<Variant>&) {
+        if (index == 1) return Variant::fromRpc(RpcValue{"quick"});
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        slowEntered = true;
+        handlerChanged.notify_all();
+        handlerChanged.wait(lock, [&] { return releaseSlow; });
+        return Variant::fromRpc(RpcValue{"slow"});
+    };
+    ASSERT_TRUE(server.publish(std::move(object)));
+    std::string error;
+    ASSERT_TRUE(server.start(path, &error)) << error;
+    Client client;
+    ASSERT_TRUE(client.connect(path, std::chrono::seconds(2), &error)) << error;
+    ASSERT_TRUE(client.acquire("fixture", std::chrono::seconds(2), &error)) << error;
+
+    std::optional<Variant> slow;
+    std::thread slowCall([&] {
+        std::string slowError;
+        slow = client.call("fixture", "slow()", {}, std::chrono::seconds(2), &slowError);
+    });
+    {
+        std::unique_lock<std::mutex> lock(handlerMutex);
+        ASSERT_TRUE(handlerChanged.wait_for(lock, std::chrono::seconds(1), [&] {
+            return slowEntered;
+        }));
+    }
+    const auto quick = client.call(
+        "fixture", "quick()", {}, std::chrono::milliseconds(500), &error);
+    ASSERT_TRUE(quick.has_value()) << error;
+    EXPECT_EQ(quick->value.asString(), "quick");
+
+    {
+        std::lock_guard<std::mutex> lock(handlerMutex);
+        releaseSlow = true;
+    }
+    handlerChanged.notify_all();
+    slowCall.join();
+    ASSERT_TRUE(slow.has_value());
+    EXPECT_EQ(slow->value.asString(), "slow");
+    client.close();
+    server.stop();
+}
+
+} // namespace

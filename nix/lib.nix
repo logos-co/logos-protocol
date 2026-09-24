@@ -59,6 +59,11 @@ pkgs.stdenv.mkDerivation {
     # `find_package(logos-protocol)` work in consumers.
     cmake --install build-protocol
 
+    # Which source built this, for logos-abi-closure-check to pair the Qt and
+    # plain runtimes of one closure. The path as text, not a reference to it.
+    mkdir -p $out/share/logos-protocol
+    echo ${builtins.unsafeDiscardStringContext (toString src)} > $out/share/logos-protocol/source
+
     runHook postInstall
   '';
 }

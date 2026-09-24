@@ -70,14 +70,23 @@ TEST_F(TransportFactoryTest, NeedsQtEventLoopFollowsTheResolutionRule)
     localSocket.protocol = LogosProtocol::LocalSocket;
     LogosTransportConfig tcp;
     tcp.protocol = LogosProtocol::Tcp;
+    LogosTransportConfig qtRemotePlain;
+    qtRemotePlain.protocol = LogosProtocol::QtRemotePlain;
     LogosTransportConfig tcpSsl;
     tcpSsl.protocol = LogosProtocol::TcpSsl;
 
     LogosModeConfig::setMode(LogosMode::Remote);
+#ifdef _WIN32
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(localSocket))
+        << "local resolves to qt_remote_plain on Windows";
+#else
     EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(localSocket))
         << "qt_remote owns a QRemoteObjectNode + QLocalSocket";
+#endif
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcp))
         << "the plain transport is Qt-free by design";
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(qtRemotePlain))
+        << "qt_remote_plain owns no Qt socket or QtRO object";
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcpSsl));
 
     // Mode wins over cfg.protocol, exactly as in createConnection.

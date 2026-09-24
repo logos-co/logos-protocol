@@ -4,6 +4,7 @@
 #include "logos_transport_config.h"
 #include "implementations/qt_local/local_transport.h"
 #include "implementations/qt_remote/remote_transport.h"
+#include "implementations/qt_remote_plain/qt_remote_plain_transport.h"
 #include "implementations/mock/mock_transport.h"
 #include "implementations/plain/plain_transport_connection.h"
 #include "implementations/plain/plain_transport_host.h"
@@ -12,10 +13,27 @@
 
 namespace LogosTransportFactory {
 
+namespace {
+
+// Windows runs QtRO only in its plain implementation, so the plain core never
+// pairs with Qt's own there: anything but TCP resolves to it, with no path
+// back to the qt_remote backend.
+LogosProtocol resolve(LogosProtocol protocol)
+{
+#ifdef _WIN32
+    if (protocol != LogosProtocol::Tcp && protocol != LogosProtocol::TcpSsl)
+        return LogosProtocol::QtRemotePlain;
+#endif
+    return protocol;
+}
+
+} // namespace
+
 // Single resolution rule for both `createHost` overloads:
 //   LogosMode::Mock                 → MockTransportHost   (cfg ignored)
 //   LogosMode::Local                → LocalTransportHost  (cfg ignored)
-//   LogosMode::Remote + LocalSocket → RemoteTransportHost (QRO)
+//   LogosMode::Remote + LocalSocket → RemoteTransportHost (QRO); on Windows
+//                                     QtRemotePlainTransportHost, see resolve()
 //   LogosMode::Remote + Tcp/TcpSsl  → PlainTransportHost(cfg)
 //
 // Mode is consulted *first* so test fixtures setting Mock/Local always
@@ -32,7 +50,9 @@ createHost(const LogosTransportConfig& cfg, const QString& registryUrl)
     if (LogosModeConfig::isMock()) {
         return std::make_unique<MockTransportHost>();
     }
-    switch (cfg.protocol) {
+    switch (resolve(cfg.protocol)) {
+    case LogosProtocol::QtRemotePlain:
+        return std::make_unique<logos::qt_remote_plain::QtRemotePlainTransportHost>(registryUrl);
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl: {
         auto host = std::make_unique<logos::plain::PlainTransportHost>(cfg);
@@ -63,7 +83,9 @@ createConnection(const LogosTransportConfig& cfg, const QString& registryUrl)
     if (LogosModeConfig::isMock()) {
         return std::make_unique<MockTransportConnection>();
     }
-    switch (cfg.protocol) {
+    switch (resolve(cfg.protocol)) {
+    case LogosProtocol::QtRemotePlain:
+        return std::make_unique<logos::qt_remote_plain::QtRemotePlainTransportConnection>(registryUrl);
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl:
         return std::make_unique<logos::plain::PlainTransportConnection>(cfg);
@@ -90,7 +112,9 @@ bool needsQtEventLoop(const LogosTransportConfig& cfg)
 {
     if (LogosModeConfig::isLocal()) return true;
     if (LogosModeConfig::isMock()) return false;
-    switch (cfg.protocol) {
+    switch (resolve(cfg.protocol)) {
+    case LogosProtocol::QtRemotePlain:
+        return false;
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl:
         return false;
