@@ -4,7 +4,6 @@
   reasons = {
     socketpair = "builds on socketpair(), which Windows lacks";
     unixRule = "asserts the Unix resolution rule; Windows resolves local to plain";
-    noDeferredAcquire = "plain has no deferred acquire: a subscribe or first call to an absent module waits out the connect timeout";
     qtHost = "builds a Qt RemoteTransportHost while Windows resolves the consumer to plain, a pairing Windows never runs; these cases fail the same way on macOS with the consumer forced to plain";
   };
   socketpair = [
@@ -20,10 +19,6 @@
   ];
   unixRule = [
     "TransportFactoryTest.NeedsQtEventLoopFollowsTheResolutionRule"
-  ];
-  noDeferredAcquire = [
-    "EventDeliveryNonBlocking.SubscribingToAnAbsentModuleReturnsImmediately"
-    "ReadinessGatedExchangeTest.AFirstCallToAnAbsentTargetPaysTheAcquireBudgetOnlyOnce"
   ];
   qtHost = [
     "AllTransportsAndProviders/EventDeliveryMatrix.LpSubscribe_PublishThenSubscribe_Control/qt_remote_QtProvider"

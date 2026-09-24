@@ -365,7 +365,8 @@ private:
     // It is confined to AcquireKind::Unsupported on purpose. Those transports'
     // requestObject() is a registry hash lookup (qt_local), an in-memory
     // construction (plain; a dropped connection starts a background redial it
-    // waits on for at most 20 ms) or an unconditional success (mock). qt_remote's
+    // waits on for at most 20 ms), one dial attempt (qt_remote_plain, local on
+    // Windows) or an unconditional success (mock). qt_remote's
     // enters QRemoteObjectReplica::waitForSource()'s nested event loop even at
     // timeout 0, so calling it from here — or from tick() — would smuggle a GUI
     // thread block in through the retry. Routing on the transport's OWN answer
