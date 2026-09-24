@@ -385,6 +385,12 @@ struct ClientState {
     std::size_t asyncWorkers = 0;
     std::size_t asyncIdle = 0;
     bool asyncStop = false;
+    // Their requests go out in the order the calls were made: each takes a
+    // ticket and writes when it is the next one (asyncNextToSend).
+    std::uint64_t asyncTickets = 0;
+    std::uint64_t asyncNextToSend = 0;
+    std::set<std::uint64_t> asyncSent;
+    std::condition_variable asyncTurn;
 };
 
 constexpr std::size_t kMaxAsyncWorkers = 16;
@@ -413,6 +419,35 @@ void asyncWorkerLoop(const std::shared_ptr<ClientState>& state)
     }
     --state->asyncWorkers;
 }
+
+// Waits until `ticket` is the next async request to go out.
+bool awaitSendTurn(const std::shared_ptr<ClientState>& state, std::uint64_t ticket,
+                   std::chrono::steady_clock::time_point deadline)
+{
+    std::unique_lock<std::mutex> lock(state->asyncMutex);
+    return state->asyncTurn.wait_until(lock, deadline, [&] {
+        return state->asyncStop || state->asyncNextToSend == ticket;
+    }) && !state->asyncStop;
+}
+
+// Its request written, or the call abandoned before writing: the next ticket may go.
+struct SendTurn {
+    std::shared_ptr<ClientState> state;
+    std::uint64_t ticket = 0;
+    bool finished = false;
+    void finish()
+    {
+        if (finished) return;
+        finished = true;
+        {
+            std::lock_guard<std::mutex> lock(state->asyncMutex);
+            state->asyncSent.insert(ticket);
+            while (state->asyncSent.erase(state->asyncNextToSend)) ++state->asyncNextToSend;
+        }
+        state->asyncTurn.notify_all();
+    }
+    ~SendTurn() { finish(); }
+};
 
 // Destruction from a user callback cannot join workers that might be waiting
 // to acquire callbackMutex. The workers retain ClientState until they exit.
@@ -704,7 +739,8 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
                                     const std::string& object,
                                     const std::string& method,
                                     const json& args, const std::string& token,
-                                    int timeout, std::string& error, std::string& code)
+                                    int timeout, std::string& error, std::string& code,
+                                    const std::function<void()>* sent = nullptr)
 {
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
@@ -740,6 +776,7 @@ std::optional<RpcValue> networkCall(const std::shared_ptr<ClientState>& state,
     for (const auto& arg : args) request.args.push_back(jsonToRpc(arg));
     const auto id = request.id;
     auto future = wire->sendCall(std::move(request));
+    if (sent && *sent) (*sent)();
     if (future.wait_until(deadline) != std::future_status::ready) {
         wire->cancelPending(id);
         error = "invocation timed out";
@@ -809,7 +846,8 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
                                   const std::string& object,
                                   const std::string& signature,
                                   std::vector<Variant> arguments,
-                                  int timeout, std::string& error, std::string& code)
+                                  int timeout, std::string& error, std::string& code,
+                                  const std::function<void()>* sent = nullptr)
 {
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
@@ -834,7 +872,8 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
     }
     if (!ensureConnected(state, remaining(), error, &code)) return std::nullopt;
     auto result = state->wire->call(object, signature, std::move(arguments),
-                                    std::chrono::milliseconds(remaining()), &error, &failure);
+                                    std::chrono::milliseconds(remaining()), &error, &failure,
+                                    sent ? *sent : std::function<void()>{});
     return result ? result : failed();
 }
 
@@ -941,9 +980,12 @@ std::string tokenFor(const std::shared_ptr<ClientState>& state, int timeout,
 }
 
 // On failure `code` is the protocol's call-error code for it (logos_call_error.h).
+// `sent`, if given, runs once the first request is written; a retry after a
+// refused token is sent later, out of that order.
 std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                               const std::string& method, const json& args,
-                              int timeout, std::string& error, std::string& code)
+                              int timeout, std::string& error, std::string& code,
+                              const std::function<void()>* sent = nullptr)
 {
     code = "transport_error";
     if (!args.is_array()) {
@@ -962,7 +1004,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     if (state->targetConfig.protocol == LogosProtocol::Tcp
         || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
         auto result = networkCall(state, state->target, method, args, token,
-                                  remaining(), error, code);
+                                  remaining(), error, code, sent);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
             if (!value || !value->isMap()) return false;
             const RpcValue* status = value->asMap().find(kStatusKey);
@@ -1006,7 +1048,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
     auto result = directCall(state, state->target,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
-         std::move(arguments)}, remaining(), error, code);
+         std::move(arguments)}, remaining(), error, code, sent);
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
         token = tokenFor(state, remaining(), error, token);
         if (!token.empty()) {
@@ -1494,6 +1536,7 @@ void lp_client_destroy(lp_client* client)
         // Calls that have not started never will; running ones finish unseen.
         std::lock_guard<std::mutex> lock(client->state->asyncMutex);
         client->state->asyncStop = true;
+        client->state->asyncTurn.notify_all();
         client->state->asyncCalls.clear();
     }
     client->state->asyncChanged.notify_all();
@@ -1560,10 +1603,26 @@ try {
     if (args.is_discarded() || !args.is_array()) return LP_ERR_INVALID_ARG;
     auto state = client->state;
     const std::string methodName = method;
-    std::function<void()> call = [state, methodName, args, timeout, callback, userData] {
+    std::lock_guard<std::mutex> queueLock(state->asyncMutex);
+    if (state->asyncStop) return LP_ERR_INVALID_ARG;
+    const std::uint64_t ticket = state->asyncTickets++;
+    std::function<void()> call = [state, ticket, methodName, args, timeout, callback, userData] {
+        SendTurn turn{state, ticket};
         std::string error;
-        std::string code;
-        auto result = invoke(state, methodName, args, timeoutMs(timeout), error, code);
+        std::string code = "timeout";
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(timeoutMs(timeout));
+        std::optional<Variant> result;
+        if (awaitSendTurn(state, ticket, deadline)) {
+            const int left = std::max(0, static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count()));
+            const std::function<void()> sent = [&turn] { turn.finish(); };
+            result = invoke(state, methodName, args, left, error, code, &sent);
+        } else {
+            error = "invocation timed out behind earlier calls";
+        }
+        turn.finish();
         std::lock_guard<std::recursive_mutex> lock(state->callbackMutex);
         if (!state->alive) return;
         const std::string text = result
@@ -1572,20 +1631,19 @@ try {
         CallbackScope scope(state.get());
         callback(result ? 1 : 0, text.c_str(), userData);
     };
-    {
-        std::lock_guard<std::mutex> lock(state->asyncMutex);
-        if (state->asyncStop) return LP_ERR_INVALID_ARG;
-        state->asyncCalls.push_back(std::move(call));
-        if (state->asyncIdle < state->asyncCalls.size()
-            && state->asyncWorkers < kMaxAsyncWorkers) {
-            try {
-                std::thread([state] { asyncWorkerLoop(state); }).detach();
-                ++state->asyncWorkers;
-            } catch (...) {
-                if (state->asyncWorkers == 0) {
-                    state->asyncCalls.pop_back();
-                    return LP_ERR_INTERNAL;
-                }
+    // The ticket is taken and queued under one lock, so tickets are dequeued in
+    // order and the next one to go out always has a worker.
+    state->asyncCalls.push_back(std::move(call));
+    if (state->asyncIdle < state->asyncCalls.size()
+        && state->asyncWorkers < kMaxAsyncWorkers) {
+        try {
+            std::thread([state] { asyncWorkerLoop(state); }).detach();
+            ++state->asyncWorkers;
+        } catch (...) {
+            if (state->asyncWorkers == 0) {
+                state->asyncCalls.pop_back();
+                --state->asyncTickets;
+                return LP_ERR_INTERNAL;
             }
         }
     }

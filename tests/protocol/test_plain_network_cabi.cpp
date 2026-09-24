@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -437,6 +438,71 @@ TEST(PlainNetworkCAbi, TcpAsyncResultCanDestroyClientWithQueuedEvent)
 TEST(PlainNetworkCAbi, TlsAsyncResultCanDestroyClientWithQueuedEvent)
 {
     runAsyncResultDestroyWithQueuedNetworkEvent(true);
+}
+
+struct TcpArrivals {
+    std::mutex mutex;
+    std::vector<long long> seen;
+    std::atomic<int> done{0};
+    std::atomic<int> succeeded{0};
+};
+
+char* recordTcpArrival(const char*, const char* argsJson, void* user)
+{
+    auto& arrivals = *static_cast<TcpArrivals*>(user);
+    const auto args = nlohmann::json::parse(argsJson ? argsJson : "[]", nullptr, false);
+    std::lock_guard<std::mutex> lock(arrivals.mutex);
+    if (args.is_array() && !args.empty() && args[0].is_number_integer())
+        arrivals.seen.push_back(args[0].get<long long>());
+    return copy("true");
+}
+
+void onTcpArrivalResult(int ok, const char*, void* user)
+{
+    auto& arrivals = *static_cast<TcpArrivals*>(user);
+    if (ok) ++arrivals.succeeded;
+    ++arrivals.done;
+}
+
+// Detector: over TCP as well, each async call wrote its request whenever its worker got there.
+TEST(PlainNetworkCAbi, TcpAsyncCallsReachTheProviderInTheOrderMade)
+{
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::acceptor reservation(io,
+        {boost::asio::ip::address_v4::loopback(), 0});
+    const auto port = reservation.local_endpoint().port();
+    reservation.close();
+    const std::string config = std::string(R"({"protocol":"tcp","host":"127.0.0.1","port":)")
+        + std::to_string(port) + "}";
+    TcpArrivals arrivals;
+    lp_provider* provider = lp_provider_create("plain_async_order", ("[" + config + "]").c_str());
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_save_token(provider, "network_test", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, recordTcpArrival, methods, token, &arrivals), LP_OK);
+    ASSERT_EQ(lp_token_save("plain_async_order", "secret"), LP_OK);
+    lp_client* client = lp_client_create("plain_async_order", "network_test",
+                                         config.c_str(), config.c_str());
+    ASSERT_NE(client, nullptr);
+
+    constexpr int kCalls = 300;
+    for (int i = 0; i < kCalls; ++i) {
+        const std::string args = "[" + std::to_string(i) + "]";
+        ASSERT_EQ(lp_invoke_async(client, "answer", args.c_str(), 10000,
+                                  onTcpArrivalResult, &arrivals), LP_OK);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (arrivals.done.load() < kCalls && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+
+    EXPECT_EQ(arrivals.succeeded.load(), kCalls);
+    std::lock_guard<std::mutex> lock(arrivals.mutex);
+    ASSERT_EQ(arrivals.seen.size(), static_cast<std::size_t>(kCalls));
+    int inversions = 0;
+    for (std::size_t i = 1; i < arrivals.seen.size(); ++i)
+        if (arrivals.seen[i] < arrivals.seen[i - 1]) ++inversions;
+    EXPECT_EQ(inversions, 0) << "requests reached the provider out of the order they were made";
 }
 
 std::uint16_t freePort()
