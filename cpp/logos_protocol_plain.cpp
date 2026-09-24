@@ -877,6 +877,10 @@ std::optional<Variant> directCall(const std::shared_ptr<ClientState>& state,
     return result ? result : failed();
 }
 
+// capability_module listens before anything asks it for a token, so when nothing
+// listens there, none is coming: the exchange gives up after this, not at the deadline.
+constexpr std::chrono::milliseconds kCapabilityListenerWait{250};
+
 std::string mintToken(const std::shared_ptr<ClientState>& state,
                       int timeout, std::string& error)
 {
@@ -914,8 +918,8 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
         return token;
     }
     Client capability;
-    if (!capability.connect(endpoint("capability_module"),
-                            std::chrono::milliseconds(timeout), &error)) return {};
+    if (!capability.connect(endpoint("capability_module"), std::chrono::milliseconds(timeout),
+                            &error, nullptr, kCapabilityListenerWait)) return {};
     Variant requestArgs = Variant::fromRpc(RpcValue{RpcList{{RpcValue{state->origin},
                                                              RpcValue{state->target}}}});
     auto result = capability.call("capability_module",

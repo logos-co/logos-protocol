@@ -845,6 +845,35 @@ TEST(QtRemotePlainCabiTest, ConcurrentFirstCallsShareOneTokenRequest)
     EXPECT_EQ(capability.requests.load(), 1);
 }
 
+// Detector: with nothing listening at capability_module, the token exchange
+// retried until the call's deadline, so a refused call took its whole timeout.
+TEST(QtRemotePlainCabiTest, ARefusedCallFailsSoonWhenCapabilityModuleIsAbsent)
+{
+    setInstanceId("qtro_cabi_no_capability_");
+    // A token the provider refuses, then no token at all.
+    for (const std::string target : {"uncapped_stale", "uncapped_fresh"}) {
+        Fixture fixture;
+        lp_provider* provider = lp_provider_create(target.c_str(), nullptr);
+        ASSERT_NE(provider, nullptr);
+        ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+        ASSERT_EQ(lp_provider_register(provider, dispatch, methods, token, &fixture), LP_OK);
+        if (target == "uncapped_stale") ASSERT_EQ(lp_token_save(target.c_str(), "stale"), LP_OK);
+        lp_client* client = lp_client_create(target.c_str(), "caller", nullptr, nullptr);
+        ASSERT_NE(client, nullptr);
+        char* result = nullptr;
+        char* error = nullptr;
+        const auto started = std::chrono::steady_clock::now();
+        EXPECT_NE(lp_invoke(client, "echo", R"(["x"])", 5000, &result, &error), LP_OK);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        EXPECT_EQ(errorCode(error), "unauthorized") << target << ": " << (error ? error : "");
+        EXPECT_LT(elapsed, std::chrono::seconds(2)) << target << " waited for capability_module";
+        lp_string_free(result);
+        lp_string_free(error);
+        lp_client_destroy(client);
+        lp_provider_destroy(provider);
+    }
+}
+
 // Detector: a client aimed at another module delivered this consumer-half
 // token to that module, which is lp_inform_module_token_to's job, behind the
 // token_delivery grant.

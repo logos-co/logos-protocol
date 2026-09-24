@@ -468,9 +468,12 @@ void closeHandle(std::atomic<NativeHandle>& handle)
 #ifdef _WIN32
 NativeHandle connectSocket(const std::string& path,
                            std::chrono::milliseconds timeout,
+                           std::chrono::milliseconds listenerWait,
                            std::string* error)
 {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + timeout;
+    const auto listenerDeadline = listenerWait >= timeout ? deadline : started + listenerWait;
     for (;;) {
         HANDLE pipe = ::CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                     0, nullptr, OPEN_EXISTING,
@@ -483,13 +486,14 @@ NativeHandle connectSocket(const std::string& path,
             setError(error, windowsError("CreateFile"));
             return kInvalidHandle;
         }
+        const auto until = code == ERROR_PIPE_BUSY ? deadline : listenerDeadline;
         const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
+        if (now >= until) {
             setError(error, "named pipe connection timed out: " + path);
             return kInvalidHandle;
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - now);
+            until - now);
         const DWORD wait = static_cast<DWORD>(std::min<std::int64_t>(
             std::max<std::int64_t>(1, remaining.count()), 50));
         if (code == ERROR_PIPE_BUSY) (void)::WaitNamedPipeA(path.c_str(), wait);
@@ -505,16 +509,19 @@ void setCloseOnExec(int fd)
     if (flags >= 0) (void)::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-// Nothing listening at the path yet, as opposed to a failure retrying cannot fix.
-bool notListeningYet(int code)
+// A failure retrying can fix: nothing listening at the path yet, or a full backlog.
+enum class Retry { No, NotListening, Busy };
+
+Retry retryFor(int code)
 {
-    return code == ENOENT || code == ECONNREFUSED || code == EAGAIN;
+    if (code == EAGAIN) return Retry::Busy;
+    return code == ENOENT || code == ECONNREFUSED ? Retry::NotListening : Retry::No;
 }
 
 NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
-                         std::string* error, bool* retry)
+                         std::string* error, Retry* retry)
 {
-    *retry = false;
+    *retry = Retry::No;
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         setError(error, "socket() failed: " + std::string(std::strerror(errno)));
@@ -545,7 +552,7 @@ NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
                                                            "local socket connection")) {
             if (connectError != EINPROGRESS) {
                 setError(error, "connect(" + path + ") failed: " + std::string(std::strerror(connectError)));
-                *retry = notListeningYet(connectError);
+                *retry = retryFor(connectError);
             }
             ::close(fd);
             return kInvalidHandle;
@@ -555,7 +562,7 @@ NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &result, &length) < 0 || result != 0) {
             setError(error, "connect(" + path + ") failed: "
                 + std::string(std::strerror(result == 0 ? errno : result)));
-            *retry = notListeningYet(result);
+            *retry = retryFor(result);
             ::close(fd);
             return kInvalidHandle;
         }
@@ -566,21 +573,25 @@ NativeHandle connectOnce(const std::string& path, const Deadline& deadline,
     return fd;
 }
 
-// Retries a provider that is not listening yet until the deadline, as QtRO
-// does, so one that is still starting or restarting is reached.
+// Retries a provider that is not listening yet, as QtRO does, so one that is
+// still starting or restarting is reached; `listenerWait` bounds only that case.
 NativeHandle connectSocket(const std::string& path,
                            std::chrono::milliseconds timeout,
+                           std::chrono::milliseconds listenerWait,
                            std::string* error)
 {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + timeout;
+    const auto listenerDeadline = listenerWait >= timeout ? deadline : started + listenerWait;
     auto pause = std::chrono::milliseconds(50);
     for (;;) {
-        bool retry = false;
+        Retry retry = Retry::No;
         const NativeHandle fd = connectOnce(path, deadline, error, &retry);
         const auto now = std::chrono::steady_clock::now();
-        if (fd != kInvalidHandle || !retry || now >= deadline) return fd;
+        const auto until = retry == Retry::NotListening ? listenerDeadline : deadline;
+        if (fd != kInvalidHandle || retry == Retry::No || now >= until) return fd;
         std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
-            pause, deadline - now));
+            pause, until - now));
         pause = std::min(pause * 2, std::chrono::milliseconds(250));
     }
 }
@@ -986,7 +997,8 @@ Client::~Client() { close(); }
 bool Client::connect(const std::string& localUrlOrPath,
                      std::chrono::milliseconds timeout,
                      std::string* error,
-                     Failure* failure)
+                     Failure* failure,
+                     std::chrono::milliseconds listenerWait)
 {
     const auto fail = [failure](Failure kind) {
         if (failure) *failure = kind;
@@ -995,7 +1007,7 @@ bool Client::connect(const std::string& localUrlOrPath,
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     closeConnection(false);
     const std::string path = localSocketPath(localUrlOrPath);
-    const NativeHandle socket = connectSocket(path, timeout, error);
+    const NativeHandle socket = connectSocket(path, timeout, listenerWait, error);
     if (socket == kInvalidHandle) return fail(Failure::Unavailable);
     {
         std::lock_guard<std::mutex> lock(m_impl->mu);
