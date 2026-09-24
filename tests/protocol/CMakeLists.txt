@@ -315,6 +315,7 @@ add_executable(protocol_tests
     # thread. Also guards that arming the first accept on the strand (rather
     # than inline in start()) still serves a client that connects immediately.
     test_rpc_server_teardown.cpp
+    test_rpc_server_stop_drain.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
