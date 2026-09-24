@@ -164,6 +164,19 @@ TEST(QtRemotePlainTransportTest, AClientGivesUpOnAnAbsentServerAtItsDeadline)
     EXPECT_FALSE(error.empty());
 }
 
+TEST(QtRemotePlainTransportTest, AListenerWaitBoundsTheRetriesOfAnAbsentServer)
+{
+    const std::string path = transportSocketPath();
+    Client client;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect(path, std::chrono::seconds(5), &error, nullptr,
+                                std::chrono::milliseconds(200)));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(150));
+    EXPECT_LT(elapsed, std::chrono::seconds(2)) << "the listener wait did not bound the retries";
+}
+
 // Detector (Windows): a second server on a live name started and shared it,
 // so a client could land on either.
 TEST(QtRemotePlainTransportTest, ASecondServerCannotTakeALiveEndpoint)

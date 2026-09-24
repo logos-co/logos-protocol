@@ -44,10 +44,13 @@ public:
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
+    // An endpoint nothing listens on is retried for `listenerWait` at most, a
+    // busy one until the timeout.
     bool connect(const std::string& localUrlOrPath,
                  std::chrono::milliseconds timeout,
                  std::string* error = nullptr,
-                 Failure* failure = nullptr);
+                 Failure* failure = nullptr,
+                 std::chrono::milliseconds listenerWait = std::chrono::milliseconds::max());
     void close();
     // Stop I/O without waiting for public event callbacks. Use when the caller
     // itself holds a callback lock; the executor is drained on final teardown.
