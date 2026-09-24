@@ -12,8 +12,7 @@ concurrency:
 
 jobs:
   windows:
-    # The preview branch until logos-co/logos-windows-ci#8 lands and v1 moves.
-    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@feat/windows-tests-preview
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
     secrets: inherit
     with:
       targets: tests tests-qt
