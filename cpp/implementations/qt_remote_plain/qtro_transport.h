@@ -60,13 +60,15 @@ public:
                  Failure* failure = nullptr);
     std::optional<ClassDefinition> definition(const std::string& object) const;
 
+    // `sent` runs once the request is written, before the wait for its reply.
     std::optional<Variant> call(
         const std::string& object,
         const std::string& methodSignature,
         std::vector<Variant> arguments,
         std::chrono::milliseconds timeout,
         std::string* error = nullptr,
-        Failure* failure = nullptr);
+        Failure* failure = nullptr,
+        const std::function<void()>& sent = {});
 
     void setEventHandler(EventHandler handler);
     // Runs on the reader before public callback dispatch. Returning true

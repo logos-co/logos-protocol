@@ -1082,6 +1082,58 @@ TEST(QtRemotePlainCabiTest, AStatusReplayCanDestroyTheClient)
     lp_provider_destroy(provider);
 }
 
+struct ArrivalOrder {
+    std::mutex mutex;
+    std::vector<long long> seen;
+};
+
+char* recordArrival(const char*, const char* argsJson, void* userData)
+{
+    auto& order = *static_cast<ArrivalOrder*>(userData);
+    const auto args = nlohmann::json::parse(argsJson ? argsJson : "[]", nullptr, false);
+    std::lock_guard<std::mutex> lock(order.mutex);
+    if (args.is_array() && !args.empty() && args[0].is_number_integer())
+        order.seen.push_back(args[0].get<long long>());
+    return copyString("true");
+}
+
+// Detector: each async call ran whole on its own worker, so with several in
+// flight their requests reached the provider in whatever order the workers wrote them.
+TEST(QtRemotePlainCabiTest, AsyncCallsReachTheProviderInTheOrderMade)
+{
+    setInstanceId("qtro_cabi_async_order_");
+    ArrivalOrder order;
+    lp_provider* provider = lp_provider_create("async_order_fixture", nullptr);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 1), LP_OK);
+    ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
+    ASSERT_EQ(lp_provider_register(provider, recordArrival, methods, token, &order), LP_OK);
+    ASSERT_EQ(lp_token_save("async_order_fixture", "secret"), LP_OK);
+    lp_client* client = lp_client_create("async_order_fixture", "caller", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    AsyncThreads threads;
+    constexpr int kCalls = 300;
+    for (int i = 0; i < kCalls; ++i) {
+        const std::string args = "[" + std::to_string(i) + "]";
+        ASSERT_EQ(lp_invoke_async(client, "work", args.c_str(), 10000, onCountedResult, &threads),
+                  LP_OK);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (threads.done.load() < kCalls && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    lp_client_destroy(client);
+    lp_provider_destroy(provider);
+
+    EXPECT_EQ(threads.succeeded.load(), kCalls);
+    std::lock_guard<std::mutex> lock(order.mutex);
+    ASSERT_EQ(order.seen.size(), static_cast<std::size_t>(kCalls));
+    int inversions = 0;
+    for (std::size_t i = 1; i < order.seen.size(); ++i)
+        if (order.seen[i] < order.seen[i - 1]) ++inversions;
+    EXPECT_EQ(inversions, 0) << "requests reached the provider out of the order they were made";
+}
+
 TEST(QtRemotePlainCabiTest, EventCallbackCanSynchronouslyCallTheSameProvider)
 {
     setInstanceId("qtro_cabi_reentrant_event_");

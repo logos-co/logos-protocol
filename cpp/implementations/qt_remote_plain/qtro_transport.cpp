@@ -1136,7 +1136,8 @@ std::optional<Variant> Client::call(
     std::vector<Variant> arguments,
     std::chrono::milliseconds timeout,
     std::string* error,
-    Failure* failure)
+    Failure* failure,
+    const std::function<void()>& sent)
 {
     const auto fail = [failure](Failure kind) -> std::optional<Variant> {
         if (failure) *failure = kind;
@@ -1193,6 +1194,7 @@ std::optional<Variant> Client::call(
         setError(error, writeError);
         return fail(Failure::Transport);
     }
+    if (sent) sent();
 
     std::unique_lock<std::mutex> lock(m_impl->mu);
     if (!pending->cv.wait_until(lock, deadline, [&] { return pending->done; })) {
