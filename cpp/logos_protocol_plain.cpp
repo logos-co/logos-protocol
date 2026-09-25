@@ -1112,7 +1112,52 @@ struct lp_subscription {
     std::shared_ptr<SubscriptionState> state;
 };
 
+namespace {
+
+// Business calls from every transport pass one gate per provider, entering in
+// arrival order, so a module limited to one call runs one at a time however many
+// listeners it has. Token delivery and metadata never pass it.
+struct DispatchGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t capacity = 64;
+    std::size_t running = 0;
+    std::uint64_t nextTicket = 0;
+    std::deque<std::uint64_t> waiting;
+};
+
+class GateEntry {
+public:
+    explicit GateEntry(DispatchGate& gate) : m_gate(gate)
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        const std::uint64_t ticket = gate.nextTicket++;
+        gate.waiting.push_back(ticket);
+        gate.changed.wait(lock, [&] {
+            return gate.waiting.front() == ticket && gate.running < gate.capacity;
+        });
+        gate.waiting.pop_front();
+        ++gate.running;
+        // Under the lock: mingw was seen to lose a notify made after unlocking.
+        gate.changed.notify_all();
+    }
+    ~GateEntry()
+    {
+        std::lock_guard<std::mutex> lock(m_gate.mutex);
+        --m_gate.running;
+        m_gate.changed.notify_all();
+    }
+    GateEntry(const GateEntry&) = delete;
+    GateEntry& operator=(const GateEntry&) = delete;
+
+private:
+    DispatchGate& m_gate;
+};
+
+} // namespace
+
 struct lp_provider {
+    DispatchGate gate;
     std::string moduleName;
     std::string transportSetJson;
     Server server;
@@ -1301,10 +1346,14 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         return Variant::fromRpc(jsonToRpc(json{{kStatusKey, "unauthorized"}}));
     if (!provider->dispatch) return {};
     const std::string argsText = dumpJson(args);
-    const std::string previousCaller = std::move(gCurrentCaller);
-    gCurrentCaller = caller;
-    char* text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
-    gCurrentCaller = previousCaller;
+    char* text = nullptr;
+    {
+        GateEntry entry(provider->gate);
+        const std::string previousCaller = std::move(gCurrentCaller);
+        gCurrentCaller = caller;
+        text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
+        gCurrentCaller = previousCaller;
+    }
     if (!text) return {};
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
@@ -1360,11 +1409,15 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     json args = json::array();
     for (const auto& value : request.args) args.push_back(rpcToJson(value));
     const std::string argsText = dumpJson(args);
-    const std::string previousCaller = std::move(gCurrentCaller);
-    gCurrentCaller = caller;
-    char* text = provider->dispatch(request.method.c_str(), argsText.c_str(),
-                                    provider->userData);
-    gCurrentCaller = previousCaller;
+    char* text = nullptr;
+    {
+        GateEntry entry(provider->gate);
+        const std::string previousCaller = std::move(gCurrentCaller);
+        gCurrentCaller = caller;
+        text = provider->dispatch(request.method.c_str(), argsText.c_str(),
+                                  provider->userData);
+        gCurrentCaller = previousCaller;
+    }
     if (!text) {
         reply.err = "method failed";
         reply.errCode = "METHOD_FAILED";
@@ -2080,7 +2133,8 @@ try {
                     logos::qt_remote_plain::moduleHandshakeProxyDefinition(),
                     [provider](std::int32_t index, const std::vector<Variant>& args) {
                         return providerInvoke(provider, true, index, args);
-                    }}, &error)) {
+                    },
+                    [](std::int32_t) { return true; }}, &error)) {
                 provider->server.stop();
                 return LP_ERR_INTERNAL;
             }
@@ -2135,7 +2189,9 @@ try {
                 logos::qt_remote_plain::moduleProxyDefinition(),
                 [provider](std::int32_t index, const std::vector<Variant>& args) {
                     return providerInvoke(provider, false, index, args);
-                }}, &error)) {
+                },
+                // informModuleToken and the three metadata methods.
+                [](std::int32_t index) { return index >= 3; }}, &error)) {
             return LP_ERR_INTERNAL;
         }
     }
@@ -2204,6 +2260,11 @@ int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned maxCall
 {
     if (!provider) return LP_ERR_INVALID_ARG;
     provider->server.setMaxConcurrentCalls(maxCalls);
+    {
+        std::lock_guard<std::mutex> lock(provider->gate.mutex);
+        provider->gate.capacity = maxCalls > 0 ? maxCalls : 64;
+        provider->gate.changed.notify_all();
+    }
     return LP_OK;
 }
 
