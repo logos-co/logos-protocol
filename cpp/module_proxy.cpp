@@ -1,5 +1,6 @@
 #include "module_proxy.h"
 #include "logos_caller_scope.h"
+#include <QCryptographicHash>
 #include "logos_provider_interface.h"
 #include "token_manager.h"
 #include "logos_rpc_status.h"
@@ -465,6 +466,29 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     return true;
 }
 
+bool ModuleProxy::revokeModuleToken(const QString& authToken, const QString& moduleName,
+                                    const QString& tokenDigest)
+{
+    const QString credential = m_store->credential();
+    if (authToken.isEmpty() || credential.isEmpty() || !constantTimeEquals(authToken, credential)) {
+        qWarning() << "ModuleProxy: rejecting revokeModuleToken for" << moduleName
+                   << "- caller is not the trusted core/capability_module channel";
+        return false;
+    }
+    if (moduleName.isEmpty() || tokenDigest.isEmpty()) return false;
+    // Both inbound records, each only while it still holds the named token.
+    bool removed = m_store->removeInboundToken(moduleName, tokenDigest);
+    const auto found = m_tokens.find(moduleName);
+    if (found != m_tokens.end()
+        && QString::fromLatin1(QCryptographicHash::hash(found.value().toUtf8(),
+                                                        QCryptographicHash::Sha256).toHex())
+            == tokenDigest.toLower()) {
+        m_tokens.erase(found);
+        removed = true;
+    }
+    return removed;
+}
+
 bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transportProtocol) const
 {
     return authorize(authToken, transportProtocol, /*callerJson=*/nullptr);
@@ -668,4 +692,12 @@ bool ModuleHandshakeProxy::informModuleToken(const QString& authToken,
     // Same authorization and same store as the business object — this is only a
     // different door onto it, reachable earlier.
     return m_proxy->informModuleToken(authToken, moduleName, token);
+}
+
+bool ModuleHandshakeProxy::revokeModuleToken(const QString& authToken,
+                                             const QString& moduleName,
+                                             const QString& tokenDigest)
+{
+    if (!m_proxy) return false;
+    return m_proxy->revokeModuleToken(authToken, moduleName, tokenDigest);
 }

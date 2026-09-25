@@ -1,4 +1,5 @@
 #include "logos_protocol.h"
+#include "logos_runtime_delegate.h"
 
 #include "logos_api_client.h"
 #include "logos_call_error.h"
@@ -1023,6 +1024,33 @@ int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned max_cal
 {
     (void)max_calls;
     if (!provider) return LP_ERR_INVALID_ARG;
+    return LP_ERR_UNSUPPORTED;
+}
+
+int lp_revoke_module_token_to(lp_client*, const char*, const char*, const char*, const char*, int)
+{
+    return LP_ERR_UNSUPPORTED;
+}
+
+// Delegates, resolvers and inproc belong to the plain runtime.
+int lp_provider_set_caller_resolver(lp_provider* provider, lp_caller_resolver_cb resolve,
+                                    void* user_data)
+{
+    (void)resolve;
+    (void)user_data;
+    if (!provider) return LP_ERR_INVALID_ARG;
+    return LP_ERR_UNSUPPORTED;
+}
+
+const lp_runtime_delegate_v1* lp_runtime_delegate_create(const char*, const char*)
+{
+    return nullptr;
+}
+
+void lp_runtime_delegate_release(const lp_runtime_delegate_v1*) {}
+
+int lp_runtime_install_delegate(const lp_runtime_delegate_v1*)
+{
     return LP_ERR_UNSUPPORTED;
 }
 

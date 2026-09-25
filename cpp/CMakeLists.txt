@@ -539,7 +539,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.12.0
+    VERSION 0.13.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES
@@ -553,6 +553,8 @@ install(FILES
 # (etc.) keep resolving unchanged through propagated include dirs.
 install(FILES
     logos_protocol.h
+    # Included by generated module glue and by hosts that load modules in-process.
+    logos_runtime_delegate.h
     logos_module_impl.h
     # The canonical LIDL <-> JSON codec. Generated module glue includes it, so it
     # has to ship with the library's headers, not just in the source export.

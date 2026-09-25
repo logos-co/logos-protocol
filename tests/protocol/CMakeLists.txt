@@ -549,12 +549,48 @@ add_executable(qt_remote_plain_cabi_tests
     test_plain_network_cabi.cpp
     test_plain_dispatch_gate.cpp
     test_plain_local_inproc.cpp
+    test_plain_caller_resolver.cpp
+    test_plain_token_revocation.cpp
 )
 target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
     logos_protocol_plain
     GTest::gtest_main
 )
 gtest_discover_tests(qt_remote_plain_cabi_tests PROPERTIES TIMEOUT 8)
+
+# A runtime delegate is installed once per image, so its test has a process of its own.
+add_executable(plain_runtime_delegate_tests test_plain_runtime_delegate.cpp)
+target_link_libraries(plain_runtime_delegate_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest_main
+)
+gtest_discover_tests(plain_runtime_delegate_tests PROPERTIES TIMEOUT 20)
+
+# A host on the shared runtime and a module image with its own hidden static runtime.
+add_library(plain_delegate_image MODULE plain_delegate_image.cpp)
+target_link_libraries(plain_delegate_image PRIVATE logos_protocol_plain)
+set_target_properties(plain_delegate_image PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+if(APPLE)
+    target_link_options(plain_delegate_image PRIVATE
+        "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/plain_delegate_image.exports")
+elseif(UNIX)
+    target_link_options(plain_delegate_image PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plain_delegate_image.map")
+endif()
+add_executable(plain_runtime_delegate_image_tests test_plain_runtime_delegate_image.cpp)
+target_link_libraries(plain_runtime_delegate_image_tests PRIVATE
+    logos_protocol_plain_shared
+    GTest::gtest_main
+    ${CMAKE_DL_LIBS}
+)
+target_compile_definitions(plain_runtime_delegate_image_tests PRIVATE
+    DELEGATE_IMAGE_PATH="$<TARGET_FILE:plain_delegate_image>"
+    DELEGATE_IMAGE_NAME="$<TARGET_FILE_NAME:plain_delegate_image>")
+add_dependencies(plain_runtime_delegate_image_tests plain_delegate_image)
+gtest_discover_tests(plain_runtime_delegate_image_tests PROPERTIES TIMEOUT 20)
 
 # The same C ABI checks against the shared plain runtime: the form liblogos,
 # its hosts and logoscore share in one process.

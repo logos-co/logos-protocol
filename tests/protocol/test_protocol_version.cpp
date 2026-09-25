@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "logos_protocol.h"
+#include "logos_runtime_delegate.h"
 #include "logos_transport_config.h"
 
 #include <cstring>
@@ -59,6 +60,7 @@ TEST(ProtocolVersion, TransportProtocolsKeepTheirNumbers)
     EXPECT_EQ(static_cast<int>(LogosProtocol::Tcp), 1);
     EXPECT_EQ(static_cast<int>(LogosProtocol::TcpSsl), 2);
     EXPECT_EQ(static_cast<int>(LogosProtocol::QtRemotePlain), 3);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::Inproc), 4);
 }
 
 // MINORs 10 and 11 were reused (see logos_protocol.h), so each addition of the
@@ -76,5 +78,19 @@ TEST(ProtocolVersion, TheQtRemotePlainWaveHasFeatureMacros)
     for (const void* symbol : symbols) EXPECT_NE(symbol, nullptr);
 #else
     FAIL() << "an addition of the 0.12 wave has no feature macro";
+#endif
+}
+
+// Every addition of 0.13 arrives with a feature macro, in both runtimes.
+TEST(ProtocolVersion, TheInProcessWaveHasFeatureMacros)
+{
+#if defined(LOGOS_PROTOCOL_HAS_INPROC) && defined(LOGOS_PROTOCOL_HAS_CALLER_RESOLVER) \
+    && defined(LOGOS_PROTOCOL_HAS_RUNTIME_DELEGATE)
+    const void* symbols[] = {reinterpret_cast<const void*>(&lp_provider_set_caller_resolver),
+                             reinterpret_cast<const void*>(&lp_runtime_delegate_create),
+                             reinterpret_cast<const void*>(&lp_runtime_delegate_release)};
+    for (const void* symbol : symbols) EXPECT_NE(symbol, nullptr);
+#else
+    FAIL() << "an addition of the 0.13 wave has no feature macro";
 #endif
 }
