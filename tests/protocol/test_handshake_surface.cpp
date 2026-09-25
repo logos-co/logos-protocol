@@ -14,6 +14,7 @@
 // waits at acquire exactly as it always has.
 
 #include <gtest/gtest.h>
+#include "logos_protocol.h"
 #include <QCryptographicHash>
 
 #include "logos_provider_interface.h"
@@ -214,6 +215,16 @@ TEST_F(HandshakeSurfaceTest, HandshakeSurfaceStillAuthorizes)
 
 // A revocation withdraws the token from both inbound records, only while it is
 // the one its digest names, and only over the channel a push takes.
+// The Qt runtime names tokens the way the plain one does.
+TEST_F(HandshakeSurfaceTest, TheTokenDigestIsTheHexSha256)
+{
+    char* digest = lp_token_digest("abc");
+    ASSERT_NE(digest, nullptr);
+    EXPECT_STREQ(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    lp_string_free(digest);
+    EXPECT_EQ(lp_token_digest(nullptr), nullptr);
+}
+
 TEST_F(HandshakeSurfaceTest, ARevokedTokenStopsAuthorizingAndAStaleRevokeSparesANewOne)
 {
     CountingProvider provider;

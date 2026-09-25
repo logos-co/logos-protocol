@@ -2707,6 +2707,11 @@ int lp_inform_module_token_to(lp_client* client, const char* authToken, const ch
                                authToken, originModule, moduleName, token, timeout);
 }
 
+char* lp_token_digest(const char* token)
+{
+    return token ? duplicate(tokenDigest(token)) : nullptr;
+}
+
 int lp_revoke_module_token_to(lp_client* client, const char* authToken, const char* originModule,
                               const char* moduleName, const char* tokenDigest, int timeout)
 {

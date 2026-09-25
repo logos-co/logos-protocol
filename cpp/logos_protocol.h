@@ -914,8 +914,12 @@ LP_API int lp_inform_module_token_to(lp_client* client,
                               const char* token,
                               int timeout_ms);
 
+/** The digest lp_revoke_module_token_to names a token by: lowercase hex SHA-256.
+ *  Free with lp_string_free; NULL for a NULL token. */
+LP_API char* lp_token_digest(const char* token);
+
 /** Withdraw `module_name`'s token at `origin_module`, only while that target still
- *  holds the token `token_digest` (hex SHA-256) names: a late revocation spares
+ *  holds the token `token_digest` (lp_token_digest) names: a late revocation spares
  *  a token issued since. Same grant and channel as lp_inform_module_token_to. */
 LP_API int lp_revoke_module_token_to(lp_client* client,
                               const char* auth_token,
