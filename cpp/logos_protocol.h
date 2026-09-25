@@ -283,6 +283,9 @@
 // 0.13: in-process hosting, all additive: the "inproc" transport, one dispatch
 // gate per provider, lp_provider_set_caller_resolver, runtime delegates
 // (logos_runtime_delegate.h) and token revocation.
+//       It also retires the token registry: "token_registry" is still accepted
+//       by lp_grant_host_services and grants nothing, and lp_token_keys always
+//       refuses. capability_module is the token authority and needs neither.
 #define LOGOS_PROTOCOL_VERSION_MINOR 13
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.13.0"
@@ -763,34 +766,14 @@ LP_API int lp_token_save(const char* module_name, const char* token);
  *  when it calls THIS image. The mirror of lp_token_save, and the ONE function
  *  in this family that is not outbound.
  *
- *  Writes the inbound key namespace, which lp_token_get and lp_token_keys
- *  cannot read and no outbound presentation can reach. Refuses an empty name or
+ *  Writes the inbound key namespace, which lp_token_get cannot read and no
+ *  outbound presentation can reach. Refuses an empty name or
  *  token, and refuses a name carrying the reserved namespace character --
  *  `caller` arrives over RPC, named by capability_module, so it must not be able
  *  to address any key but its own.
  *
- *  THE TOKEN-REGISTRY CARVE-OUT, and it is the whole reason this is not simply
- *  "the inbound half of lp_token_save". The same wire message means opposite
- *  things depending on WHO RECEIVES IT. To an ordinary provider,
- *  informModuleToken(caller, token) is "caller may present this to you" --
- *  inbound. To the module holding the token registry it is "here is module X's
- *  token; present it when you call X" -- outbound, and the same map is also the
- *  roster that answers "is this caller a module I know". capability_module reads
- *  exactly that: lp_token_keys() for the known-caller gate, lp_token_get() for
- *  the credential it presents when pushing to the target.
- *
- *  So when, and only when, this image holds the "token_registry" grant, this
- *  ALSO writes the outbound half. Without the carve-out, routing the glue's
- *  second write here empties capability_module's roster and every cross-module
- *  call in the fleet is refused with "rejecting request from unknown module
- *  identity" -- fail-closed, but a fleet-wide lockout at the first call.
- *
- *  The grant is the right discriminator rather than a codegen flag: it IS the
- *  declaration of the registry role (metadata.json host_services), it is off by
- *  default and fail-closed, it is already what gates lp_token_keys, and it lives
- *  in the image whose store is being written. A per-module codegen flag would
- *  add a second place for the two to disagree -- and the glue generator is
- *  handed a LIDL contract, not metadata, so it cannot see host_services at all.
+ *  Inbound only, whoever receives it. Until 0.13 an image granted
+ *  "token_registry" also wrote the outbound half here; that role is retired.
  *
  *  Returns 0 on acceptance. */
 LP_API int lp_token_save_inbound(const char* caller, const char* token);
@@ -872,16 +855,8 @@ LP_API int lp_token_reset_identity(const char* identity);
  *  as your own is the elevation this whole surface exists to prevent). */
 LP_API int lp_token_adopt_credential(const char* identity, const char* credential);
 
-/** The module names this image's OUTBOUND token store holds, as a JSON array.
- *  Caller frees via lp_string_free.
- *
- *  Requires the "token_registry" host service (lp_grant_host_services): an
- *  ungranted image gets NULL. NULL is therefore "refused", never "empty" — a
- *  granted call with nothing stored returns "[]". Order is unspecified.
- *
- *  This is the known-caller gate a trust-root module needs: it answers "have I
- *  ever been handed a token for this module?" without exposing any token
- *  value. */
+/** Retired in 0.13 with the token registry: always NULL ("refused"). Still
+ *  exported so no image that imports it fails to load. */
 LP_API char* lp_token_keys(void);
 
 /** Deliver a module token to the client's target (the consumer-side
@@ -932,24 +907,26 @@ LP_API int lp_revoke_module_token_to(lp_client* client,
  * Host services — the privileged surface a trust-root module is granted
  *
  * Two functions above are closed by default and opened only by an explicit
- * grant: lp_token_keys ("token_registry") and lp_inform_module_token_to
- * ("token_delivery"). They are what a capability/trust-root module needs and
- * what an ordinary module must not have.
+ * "token_delivery" grant: lp_inform_module_token_to and lp_revoke_module_token_to.
+ * They are what a capability/trust-root module needs and what an ordinary
+ * module must not have. ("token_registry", which gated lp_token_keys, is
+ * retired: see 0.13.)
  *
  * The grant is per-IMAGE, and that is the whole point rather than an
  * implementation detail. A host binary and a module cdylib each link their own
  * copy of this library, so each has its own process-global state — a grant
- * recorded in the host is invisible to a cdylib calling lp_token_keys. The
+ * recorded in the host is invisible to a cdylib pushing a token. The
  * grant therefore has to cross the module-impl C ABI exactly as the auth token
  * already does (logos_module_grant_host_services in logos_module_impl.h), and
  * a gate "simplified" into the host would silently never fire.
  * ------------------------------------------------------------------------- */
 
 /** Grant this image the named host services. `services_json` is a JSON array
- *  drawn from the closed set {"token_registry", "token_delivery"}.
+ *  drawn from the closed set {"token_delivery"}. "token_registry" is still
+ *  accepted and grants nothing, so an older host naming it keeps its grant.
  *
  *  REPLACES the current grant rather than adding to it. NULL, the empty string
- *  or `[]` clears it, closing both gates again — clearing is the fail-closed
+ *  or `[]` clears it, closing the gate again — clearing is the fail-closed
  *  direction, so the lenient input handling costs nothing.
  *
  *  Returns LP_ERR_INVALID_ARG for malformed JSON, a non-array, a non-string

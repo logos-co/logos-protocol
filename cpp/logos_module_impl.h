@@ -111,18 +111,6 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
  * one can read the other -- which is the property that makes a grant one way
  * stop being a grant the other way.
  *
- * WHAT A TOKEN REGISTRY GETS INSTEAD, said here because it is the one thing
- * about this door that surprises. To an ordinary provider `informModuleToken`
- * means "this caller may call you". To the module holding the token registry
- * (capability_module) the SAME wire message means "here is module X's token,
- * present it when you call X" -- outbound. So lp_token_save_inbound, which this
- * forwards to, ALSO writes the outbound half when, and only when, the image has
- * been granted the "token_registry" host service. Without that carve-out
- * capability_module's roster (lp_token_keys) empties and every requestModule in
- * the fleet is refused with "rejecting request from unknown module identity".
- * The grant is the declaration of the role, so the role decides -- see
- * lp_token_save_inbound in logos_protocol.h.
- *
  * CONDITIONAL on protocol >= 0.8, with the same teeth as every other entry
  * here: the glue emits a DIRECT call, so a module generated for >= 0.8 whose
  * backend omits this definition links cleanly and then fails at dlopen() on
