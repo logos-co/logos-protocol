@@ -1,16 +1,11 @@
 #ifndef LOGOS_PLAIN_LOCAL_INPROC_TRANSPORT_H
 #define LOGOS_PLAIN_LOCAL_INPROC_TRANSPORT_H
 
-// plain_local: the Qt-free in-process transport (protocol "inproc").
-//
-// A provider registers an endpoint under (instance, module); a client in the
-// same image connects to it without a socket. Calls, events, token delivery and
-// metadata keep the socket transports' semantics: calls run on the endpoint's
-// workers in arrival order and results reach the caller through its own
-// delivery path, never inline on the thread that asked.
-//
-// Every connection is bound to the principal that opened it, and the provider
-// half receives that principal with each call and token.
+// plain_local: the Qt-free in-process transport ("inproc"). A provider registers
+// an endpoint under (instance, module) and a client in the same image connects
+// without a socket, keeping the socket transports' semantics: calls run on the
+// endpoint's workers in arrival order, results arrive through the caller's own
+// delivery path, and every connection is bound to the principal that opened it.
 
 #include "implementations/plain/rpc_connection.h"
 

@@ -14,6 +14,7 @@
 // waits at acquire exactly as it always has.
 
 #include <gtest/gtest.h>
+#include <QCryptographicHash>
 
 #include "logos_provider_interface.h"
 #include "module_proxy.h"
@@ -174,8 +175,8 @@ TEST_F(HandshakeSurfaceTest, PushIsRefusedWhileTheTrustAnchorIsUnseeded)
     EXPECT_EQ(provider.tokenPushes, 1);
 }
 
-// The surface is published early, so it must expose token delivery and nothing
-// else: no business dispatch, no introspection of the module's methods.
+// The surface is published early, so it must expose token delivery (and its
+// revocation) and nothing else: no business dispatch, no introspection.
 TEST_F(HandshakeSurfaceTest, HandshakeSurfaceExposesOnlyTokenDelivery)
 {
     CountingProvider provider;
@@ -189,7 +190,8 @@ TEST_F(HandshakeSurfaceTest, HandshakeSurfaceExposesOnlyTokenDelivery)
         if (m.methodType() == QMetaMethod::Method)
             invokables << QString::fromUtf8(m.name());
     }
-    EXPECT_EQ(invokables, QStringList{ QStringLiteral("informModuleToken") })
+    EXPECT_EQ(invokables, (QStringList{ QStringLiteral("informModuleToken"),
+                                        QStringLiteral("revokeModuleToken") }))
         << "the early-published surface must not grow beyond token delivery";
 
     // And nothing reached the implementation as a business call.
@@ -208,4 +210,36 @@ TEST_F(HandshakeSurfaceTest, HandshakeSurfaceStillAuthorizes)
                                              QStringLiteral("peer"),
                                              QStringLiteral("peertok")));
     EXPECT_EQ(provider.tokenPushes, 0);
+}
+
+// A revocation withdraws the token from both inbound records, only while it is
+// the one its digest names, and only over the channel a push takes.
+TEST_F(HandshakeSurfaceTest, ARevokedTokenStopsAuthorizingAndAStaleRevokeSparesANewOne)
+{
+    CountingProvider provider;
+    ModuleProxy proxy(&provider);
+    ModuleHandshakeProxy handshake(&proxy);
+    ScopedToken coreToken(QStringLiteral("core"), QStringLiteral("coretok"));
+    ScopedToken peerToken(QStringLiteral("peer"));
+    const auto digestOf = [](const QString& token) {
+        return QString::fromLatin1(
+            QCryptographicHash::hash(token.toUtf8(), QCryptographicHash::Sha256).toHex());
+    };
+
+    ASSERT_TRUE(handshake.informModuleToken(QStringLiteral("coretok"), QStringLiteral("peer"),
+                                            QStringLiteral("peertok")));
+    EXPECT_FALSE(handshake.revokeModuleToken(QStringLiteral("not-the-anchor"),
+                                             QStringLiteral("peer"), digestOf("peertok")));
+    EXPECT_FALSE(handshake.revokeModuleToken(QStringLiteral("coretok"), QStringLiteral("peer"),
+                                             digestOf("an-older-token")));
+    EXPECT_EQ(proxy.callRemoteMethod(QStringLiteral("peertok"), QStringLiteral("doWork"),
+                                     QVariantList{}).toString(),
+              QStringLiteral("ran:doWork"));
+
+    EXPECT_TRUE(handshake.revokeModuleToken(QStringLiteral("coretok"), QStringLiteral("peer"),
+                                            digestOf("peertok")));
+    EXPECT_NE(proxy.callRemoteMethod(QStringLiteral("peertok"), QStringLiteral("doWork"),
+                                     QVariantList{}).toString(),
+              QStringLiteral("ran:doWork"));
+    EXPECT_EQ(provider.dispatches, 1);
 }

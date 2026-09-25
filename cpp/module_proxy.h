@@ -125,6 +125,10 @@ public:
     Q_INVOKABLE QJsonArray getPluginMethods();
     Q_INVOKABLE QJsonArray getPluginEvents();
     Q_INVOKABLE QJsonArray getPluginInterface();
+    // Withdraws `moduleName`'s token if it is still the one `tokenDigest` (hex
+    // SHA-256) names, from both stores; the same trusted channel as informModuleToken.
+    Q_INVOKABLE bool revokeModuleToken(const QString& authToken, const QString& moduleName,
+                                       const QString& tokenDigest);
 
 signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
@@ -196,7 +200,7 @@ private:
 /**
  * @brief The token-delivery-only surface described by logos::handshakeObjectName.
  *
- * Deliberately tiny: it exposes informModuleToken and nothing else, so
+ * Deliberately tiny: it exposes token delivery and revocation and nothing else, so
  * publishing it early cannot expose business methods on a module that has not
  * finished initializing. It forwards to the ModuleProxy that owns it, so a
  * token delivered here lands in exactly the same store the business object
@@ -212,6 +216,9 @@ public:
     Q_INVOKABLE bool informModuleToken(const QString& authToken,
                                        const QString& moduleName,
                                        const QString& token);
+    Q_INVOKABLE bool revokeModuleToken(const QString& authToken,
+                                       const QString& moduleName,
+                                       const QString& tokenDigest);
 
 private:
     QPointer<ModuleProxy> m_proxy;
