@@ -419,8 +419,7 @@ public:
     /**
      * @brief Every OUTBOUND key: the modules this store can call.
      *
-     * The roster lp_token_keys() publishes (gated on the "token_registry" host
-     * service). Inbound callers are NOT here — see inbound().keys().
+     * Inbound callers are NOT here — see inbound().keys().
      *
      * @return QList<QString> List of all outbound token keys
      */
@@ -430,9 +429,8 @@ public:
      * @brief Get all token keys (std::string flavour)
      *
      * Named rather than overloaded because C++ cannot overload on return type
-     * alone. Exists for the Qt-free callers — lp_token_keys() and, through it,
-     * any language SDK — so the conversion lives here next to the store rather
-     * than being retyped at each boundary.
+     * alone. Kept for the Qt-free callers, so the conversion lives here next to
+     * the store rather than being retyped at each boundary.
      */
     std::vector<std::string> getTokenKeysStd() const;
 
@@ -523,12 +521,6 @@ public:
      *     logos_module_accept_inbound_token (protocol 0.8). A Qt plugin links
      *     its own copy of this library, so the host's store and the plugin's
      *     are different objects and both have to be told.
-     *
-     * lp_token_save_inbound ALSO writes the outbound half when its image holds
-     * the "token_registry" grant -- see the note on that function in
-     * logos_protocol.h. That is not a leak between the halves: it is the one
-     * receiver for whom the same wire message genuinely means the other
-     * direction.
      *
      * Refuses an empty caller or an empty token, for the same reason
      * ModuleProxy::saveToken does: an empty value reads as PRESENT to

@@ -1,13 +1,11 @@
-// The trust-root grant (lp_grant_host_services) and the two host services it
-// gates: "token_registry" (lp_token_keys) and "token_delivery"
-// (lp_inform_module_token_to).
+// The trust-root grant (lp_grant_host_services) and the host service it gates:
+// "token_delivery" (lp_inform_module_token_to, lp_revoke_module_token_to), which
+// lets capability_module push a token AT another module rather than back at core.
 //
-// Both exist so capability_module can become an ordinary Qt-free module instead
-// of a privileged passenger inside the host. Living in the host is what gave it
-// the two things an ordinary module has no C entry point for: reading the key
-// set of its own token store (the known-caller gate — it used to reach through
-// logosAPI->getTokenManager()->getTokenKeys()), and pushing a token AT another
-// module rather than back at core.
+// "token_registry" (lp_token_keys) is retired since 0.13: capability_module is
+// the token authority and keeps no registry. The name is still accepted and
+// grants nothing, because an older host names it and a refused name costs the
+// whole grant.
 //
 // What these cases pin above all is WHERE the gate is read. The grant is
 // per-IMAGE: a host binary and a module cdylib each link their own copy of
@@ -38,10 +36,8 @@
 #include <QString>
 #include <QVariantList>
 
-#include <algorithm>
 #include <string>
 
-#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -76,19 +72,6 @@ public:
     QString lastModule;
 };
 
-nlohmann::json parsed(const char* json)
-{
-    return nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
-}
-
-bool containsKey(const nlohmann::json& array, const std::string& key)
-{
-    return std::any_of(array.begin(), array.end(),
-                       [&](const nlohmann::json& e) {
-                           return e.is_string() && e.get<std::string>() == key;
-                       });
-}
-
 } // namespace
 
 class HostServicesGrantTest : public ::testing::Test {
@@ -110,44 +93,39 @@ protected:
     }
 };
 
-// ── token_registry ──────────────────────────────────────────────────────────
+// ── token_registry, retired ─────────────────────────────────────────────────
 
-TEST_F(HostServicesGrantTest, TokenRegistryIsClosedUntilGranted)
+TEST_F(HostServicesGrantTest, TokenRegistryIsAcceptedAndGrantsNothing)
 {
     TokenManager::instance().saveToken(QStringLiteral("alpha"), QStringLiteral("alpha-tok"));
-    TokenManager::instance().saveToken(QStringLiteral("beta"), QStringLiteral("beta-tok"));
-
-    EXPECT_EQ(lp_token_keys(), nullptr)
-        << "the key set must be unreadable until the image is granted";
 
     ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-    char* keys = lp_token_keys();
-    ASSERT_NE(keys, nullptr);
-    const std::string dump = keys;
-    lp_string_free(keys);
-
-    const nlohmann::json j = parsed(dump.c_str());
-    ASSERT_TRUE(j.is_array());
-    EXPECT_EQ(j.size(), 2u);
-    EXPECT_TRUE(containsKey(j, "alpha"));
-    EXPECT_TRUE(containsKey(j, "beta"));
-
-    // Keys only. The gate answers "whom have I been told about", never "what is
-    // their token" — a known-caller check must not become a token oracle.
-    EXPECT_EQ(dump.find("alpha-tok"), std::string::npos);
-    EXPECT_EQ(dump.find("beta-tok"), std::string::npos);
+    EXPECT_EQ(lp_token_keys(), nullptr) << "the key set is never readable any more";
+    EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
+              LP_ERR_UNSUPPORTED)
+        << "the retired name must not confer anything else either";
 }
 
-TEST_F(HostServicesGrantTest, GrantedRegistryAnswersEmptyRatherThanRefusing)
+TEST_F(HostServicesGrantTest, TokenRegistryBesideDeliveryKeepsDelivery)
 {
-    // NULL is the refusal, so an empty store must NOT return it — otherwise a
-    // granted trust root cannot tell "I know nobody" from "I am not allowed to
-    // ask", and its known-caller gate would fail in the wrong direction.
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-    char* keys = lp_token_keys();
-    ASSERT_NE(keys, nullptr);
-    EXPECT_STREQ(keys, "[]");
-    lp_string_free(keys);
+    // What an older host grants capability_module. Refusing the retired name
+    // would refuse token_delivery with it, and no pair token could be pushed.
+    ASSERT_EQ(lp_grant_host_services(R"(["token_registry","token_delivery"])"), LP_OK);
+    EXPECT_EQ(lp_token_keys(), nullptr);
+    EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
+              LP_ERR_INVALID_ARG);   // past the gate, refused on arguments
+}
+
+TEST_F(HostServicesGrantTest, AnInboundPushNeverWritesTheOutboundStore)
+{
+    // The registry carve-out made a push to a granted image outbound as well.
+    ASSERT_EQ(lp_grant_host_services(R"(["token_registry","token_delivery"])"), LP_OK);
+    ASSERT_EQ(lp_token_save_inbound("peer", "peer-tok"), LP_OK);
+    char* outbound = lp_token_get("peer");
+    EXPECT_EQ(outbound, nullptr) << "a pushed token became one this image presents";
+    lp_string_free(outbound);
+    EXPECT_EQ(TokenManager::instance().inbound().token(QStringLiteral("peer")),
+              QStringLiteral("peer-tok"));
 }
 
 // ── token_delivery ──────────────────────────────────────────────────────────
@@ -160,7 +138,7 @@ TEST_F(HostServicesGrantTest, TokenDeliveryIsClosedUntilGranted)
     EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
               LP_ERR_UNSUPPORTED);
 
-    // The two services are independent: holding one must not confer the other.
+    // The retired name confers nothing.
     ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
     EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
               LP_ERR_UNSUPPORTED);
@@ -217,53 +195,48 @@ TEST_F(HostServicesGrantTest, GrantedDeliveryReachesAModuleThatIsNotCapabilityMo
 
 // ── the grant itself ────────────────────────────────────────────────────────
 
-TEST_F(HostServicesGrantTest, ClearingTheGrantReclosesBothGates)
+TEST_F(HostServicesGrantTest, ClearingTheGrantReclosesTheGate)
 {
-    TokenManager::instance().saveToken(QStringLiteral("alpha"), QStringLiteral("alpha-tok"));
-
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry","token_delivery"])"), LP_OK);
-    char* keys = lp_token_keys();
-    ASSERT_NE(keys, nullptr);
-    lp_string_free(keys);
+    ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
     EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
               LP_ERR_INVALID_ARG);   // past the gate, refused on arguments
 
     ASSERT_EQ(lp_grant_host_services(nullptr), LP_OK);
-    EXPECT_EQ(lp_token_keys(), nullptr);
     EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
               LP_ERR_UNSUPPORTED);
 
     // An empty array is the same revoke, spelled in JSON.
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
+    ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
     ASSERT_EQ(lp_grant_host_services("[]"), LP_OK);
-    EXPECT_EQ(lp_token_keys(), nullptr);
+    EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
+              LP_ERR_UNSUPPORTED);
 
     // A grant REPLACES the previous one rather than accumulating, so a caller
     // cannot widen its own privilege one service at a time.
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
     ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
-    EXPECT_EQ(lp_token_keys(), nullptr);
+    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
+    EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
+              LP_ERR_UNSUPPORTED);
 }
 
 TEST_F(HostServicesGrantTest, UnknownServiceIsRejectedAndLeavesTheGrantIntact)
 {
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-
-    // Silently ignoring the unknown name would leave the caller running with a
+    // Silently ignoring an unknown name would leave the caller running with a
     // mistaken idea of what it may do, and the mistake would surface much later
     // as an unexplained LP_ERR_UNSUPPORTED from an unrelated call.
-    EXPECT_EQ(lp_grant_host_services(R"(["token_registry","token_bureau"])"),
+    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
+    EXPECT_EQ(lp_grant_host_services(R"(["token_delivery","token_bureau"])"),
               LP_ERR_INVALID_ARG);
-    EXPECT_EQ(lp_grant_host_services(R"(["token_delivery",7])"), LP_ERR_INVALID_ARG);
-    EXPECT_EQ(lp_grant_host_services(R"({"token_registry":true})"), LP_ERR_INVALID_ARG);
-    EXPECT_EQ(lp_grant_host_services("not json"), LP_ERR_INVALID_ARG);
-
-    // Every rejection above is wholesale: the grant that was already in place is
-    // neither widened by the valid entries nor cleared by the invalid ones.
-    char* keys = lp_token_keys();
-    EXPECT_NE(keys, nullptr) << "a rejected grant must not revoke the existing one";
-    lp_string_free(keys);
     EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
               LP_ERR_UNSUPPORTED)
         << "a rejected grant must not confer the services it named";
+
+    ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
+    EXPECT_EQ(lp_grant_host_services(R"(["token_delivery",7])"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_grant_host_services(R"({"token_delivery":true})"), LP_ERR_INVALID_ARG);
+    EXPECT_EQ(lp_grant_host_services("not json"), LP_ERR_INVALID_ARG);
+    // Every rejection is wholesale: the grant already in place survives.
+    EXPECT_EQ(lp_inform_module_token_to(nullptr, "coretok", "target", "peer", "peertok", 100),
+              LP_ERR_INVALID_ARG)
+        << "a rejected grant must not revoke the existing one";
 }

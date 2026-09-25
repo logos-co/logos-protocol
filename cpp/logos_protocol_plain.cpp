@@ -1158,7 +1158,6 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
 }
 
 std::atomic<unsigned> gHostServices{0};
-constexpr unsigned kTokenRegistry = 1;
 constexpr unsigned kTokenDelivery = 2;
 thread_local std::string gCurrentCaller = R"({"kind":"unknown"})";
 
@@ -1180,7 +1179,8 @@ char* adoptHostString(const lp_runtime_delegate_v1* delegate, char* value)
     return copy;
 }
 
-// The closed set lp_grant_host_services takes.
+// The closed set lp_grant_host_services takes. "token_registry" is retired: an
+// older host still names it, and refusing it would cost the grant token_delivery.
 bool parseHostServices(const char* servicesJson, unsigned& services)
 {
     services = 0;
@@ -1189,9 +1189,8 @@ bool parseHostServices(const char* servicesJson, unsigned& services)
     if (value.is_discarded() || !value.is_array()) return false;
     for (const auto& entry : value) {
         if (!entry.is_string()) return false;
-        if (entry == "token_registry") services |= kTokenRegistry;
-        else if (entry == "token_delivery") services |= kTokenDelivery;
-        else return false;
+        if (entry == "token_delivery") services |= kTokenDelivery;
+        else if (entry != "token_registry") return false;
     }
     return true;
 }
@@ -2148,7 +2147,6 @@ int lp_token_save_inbound(const char* caller, const char* token)
         || std::strchr(caller, '\x1f')) return LP_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(gSharedTokens->mutex);
     gSharedTokens->inbound[caller] = token;
-    if (gHostServices.load() & kTokenRegistry) gSharedTokens->outbound[caller] = token;
     return LP_OK;
 }
 
@@ -2215,14 +2213,9 @@ int lp_token_adopt_credential(const char* identity, const char* credential)
     return LP_OK;
 }
 
+// Retired with the token registry: always refused.
 char* lp_token_keys(void)
-try {
-    if (!(gHostServices.load() & kTokenRegistry)) return nullptr;
-    json keys = json::array();
-    std::lock_guard<std::mutex> lock(gSharedTokens->mutex);
-    for (const auto& entry : gSharedTokens->outbound) keys.push_back(entry.first);
-    return duplicate(dumpJson(keys));
-} catch (...) {
+{
     return nullptr;
 }
 

@@ -101,7 +101,6 @@ Timeout lpTimeout(int timeout_ms)
 //
 // Fail-closed: zero until someone grants, and cleared back to zero on revoke.
 enum HostService : unsigned {
-    ServiceTokenRegistry = 1u << 0,  // "token_registry" — lp_token_keys
     ServiceTokenDelivery = 1u << 1,  // "token_delivery" — lp_inform_module_token_to
 };
 
@@ -110,7 +109,9 @@ unsigned g_hostServices = 0;
 
 bool hostServiceBit(const std::string& name, unsigned& bit)
 {
-    if (name == "token_registry") { bit = ServiceTokenRegistry; return true; }
+    // Retired, and still accepted: an older host names it, and refusing it would
+    // cost the whole grant, token_delivery included.
+    if (name == "token_registry") { bit = 0; return true; }
     if (name == "token_delivery") { bit = ServiceTokenDelivery; return true; }
     return false;
 }
@@ -767,49 +768,19 @@ int lp_token_save_inbound(const char* caller, const char* token)
     const QString callerName = QString::fromUtf8(caller);
     const QString value      = QString::fromUtf8(token);
 
-    // The inbound half, always. saveInboundToken refuses an empty name, an
-    // empty token, and a name carrying the reserved direction namespace --
-    // `caller` is named by capability_module over RPC, so it must not be able to
-    // address any key but its own.
+    // Inbound only. saveInboundToken refuses an empty name, an empty token, and
+    // a name carrying the reserved direction namespace -- `caller` is named by
+    // capability_module over RPC, so it must not be able to address any key but
+    // its own.
     if (!TokenManager::instance().saveInboundToken(callerName, value))
         return LP_ERR_INVALID_ARG;
-
-    // THE TOKEN-REGISTRY CARVE-OUT. See the declaration for the argument; the
-    // short version is that informModuleToken means opposite things depending on
-    // WHO RECEIVES IT. To an ordinary provider it is "this caller may call you"
-    // and stops at the line above. To the module holding the registry it is
-    // "here is module X's token, present it when you call X", and that is
-    // outbound: capability_module reads lp_token_keys() for its known-caller
-    // gate and lp_token_get() for the credential it presents when pushing to the
-    // target. Both read the OUTBOUND half.
-    //
-    // The grant is the declaration of that role, so the grant decides. It is off
-    // by default, fail-closed, already the gate on lp_token_keys, and it lives
-    // in the image whose store is being written -- unlike a codegen flag, which
-    // would be a second place for the two to disagree and which the glue
-    // generator could not compute anyway (it is handed a LIDL contract, not
-    // metadata.json).
-    //
-    // MEASURED CONSEQUENCE OF OMITTING THIS, so nobody "simplifies" it away:
-    // capability_module's roster empties, every requestModule is refused with
-    // "rejecting request from unknown module identity", and the fleet locks out
-    // at the first cross-module call. Fail-closed, and total.
-    if (hostServiceGranted(ServiceTokenRegistry))
-        TokenManager::instance().saveToken(callerName, value);
-
     return LP_OK;
 }
 
+// Retired with the token registry: always refused.
 char* lp_token_keys(void)
 {
-    // Gate first, before any argument would be looked at: an image without the
-    // grant gets one answer regardless of what it asks.
-    if (!hostServiceGranted(ServiceTokenRegistry)) return nullptr;
-
-    nlohmann::json out = nlohmann::json::array();
-    for (const std::string& key : TokenManager::instance().getTokenKeysStd())
-        out.push_back(key);
-    return lpStrdup(out.dump());
+    return nullptr;
 }
 
 /* ------------------------------------------- per-identity token stores */

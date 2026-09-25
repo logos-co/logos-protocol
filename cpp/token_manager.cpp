@@ -331,9 +331,8 @@ void TokenManager::clearAllTokens()
 QList<QString> TokenManager::getTokenKeys() const
 {
     QMutexLocker locker(&m_mutex);
-    // OUTBOUND ONLY. This is the roster lp_token_keys() publishes to a granted
-    // token registry, and leaking the inbound namespace into it would publish
-    // the names of everyone who may call US as if they were modules we can call.
+    // OUTBOUND ONLY: leaking the inbound namespace would list everyone who may
+    // call US as if they were modules we can call.
     QList<QString> keys;
     keys.reserve(m_tokens.size());
     for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it)
