@@ -239,10 +239,9 @@ TEST_F(TokenManagerAbi, TheOutboundRosterNeverPublishesInboundKeys)
     store.saveToken(QStringLiteral("callee"), QStringLiteral("out-tok"));
     ASSERT_TRUE(store.saveInboundToken(QStringLiteral("caller"), QStringLiteral("in-tok")));
 
-    // getTokenKeys() is the roster lp_token_keys() publishes to a granted token
-    // registry, and capability_module treats every entry as "a module I may
-    // call". Leaking the inbound half into it would publish everyone who may
-    // call US as if we held their credential.
+    // getTokenKeys() lists the modules this store can call. Leaking the inbound
+    // half into it would list everyone who may call US as if we held their
+    // credential.
     EXPECT_EQ(store.getTokenKeys(), QList<QString>{ QStringLiteral("callee") });
     EXPECT_EQ(store.tokenCount(), 1);
     EXPECT_EQ(store.getTokenKeysStd().size(), 1u);

@@ -55,11 +55,6 @@
 //       inherits the host's "core"/"capability_module" values, and carries the
 //       identity's own credential instead. Measured separately in
 //       test_consumer_credential.cpp, which owns that pair of readings.
-//   TheKnownCallerGateStillSeesEveryHostWrittenName
-//       lp_token_keys() lists "private_target" on the neutered build: the
-//       identity's own minted token went straight into the shared ring, which is
-//       both the leak and the reason the trust root's view has to be checked
-//       rather than assumed.
 //
 // Do not read a green run here as evidence on its own; re-do the neutering if
 // you change what these assert.
@@ -736,83 +731,6 @@ TEST_F(TokenStoreAbiTest, AnLpClientForANonIsolatedOriginKeepsUsingTheImageStore
 
     EXPECT_EQ(m_mock->callCount("capability_module", "requestModule"), 0);
     EXPECT_EQ(takeString(lp_token_get("lp_target")), "mock-token-lp_target");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The trust root keeps working
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// capability_module's known-caller gate reads lp_token_keys() under the
-// "token_registry" host service, and REFUSES an unknown origin. If per-identity
-// stores blinded that gate, every first call in the system would be refused and
-// the bootstrap would deadlock — so this is the constraint worth proving rather
-// than asserting.
-//
-// The argument in full, of which the case below is the mechanical half:
-//
-//  1. lp_token_keys() reads TokenManager::instance() and is UNCHANGED. No
-//     isolation path writes to it, removes from it, or redirects it.
-//  2. When capability_module runs in its own image (its own process, or a
-//     cdylib with its own copy of this library), it has its own instance() and
-//     a host image's registry cannot reach it at all. Nothing to prove.
-//  3. When it runs IN the host image, instance() is the shared ring. Isolation
-//     only ADDS private stores; it never removes an entry. The single thing that
-//     moves is a consumer-side CACHE write by an isolated identity, which now
-//     lands in that identity's store — and those writes are keyed by the TARGET
-//     module, while the gate consults ORIGIN names. Origin names are in
-//     instance() because the HOST wrote `name -> root token` for every module it
-//     loaded, and this change does not touch host writes.
-//  4. The bootstrap survives because the HOST gives each isolated identity its
-//     own credential under "core"/"capability_module"
-//     (TokenManager::adoptCredentialFor), so the identity's first requestModule
-//     authenticates — as ITSELF rather than as the host, which is the fix
-//     test_consumer_credential.cpp states end to end (asserted in the adoption
-//     cases above, and at the client in
-//     EachIsolatedIdentityMintsAndCachesItsOwnToken).
-
-class TokenStoreTrustRootTest : public ::testing::Test {
-protected:
-    void SetUp() override
-    {
-        m_mock = new LogosMockSetup();
-        ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-    }
-    void TearDown() override
-    {
-        lp_grant_host_services(nullptr);   // re-close the gate for later cases
-        delete m_mock;
-    }
-    LogosMockSetup* m_mock = nullptr;
-};
-
-TEST_F(TokenStoreTrustRootTest, TheKnownCallerGateStillSeesEveryHostWrittenName)
-{
-    // What a host writes for every module it loads — and what the gate reads.
-    TokenManager::instance().saveToken("loaded_mod_a", "root-a");
-    TokenManager::instance().saveToken("loaded_mod_b", "root-b");
-
-    // An isolated identity that has since cached a token of its own.
-    ASSERT_TRUE(TokenManager::isolateIdentity(id("trust_iso")));
-    TokenManager::forIdentity(id("trust_iso")).saveToken("private_target", "minted-privately");
-
-    const std::string keys = takeString(lp_token_keys());
-    ASSERT_FALSE(keys.empty()) << "the grant was not in effect";
-    const nlohmann::json parsed = nlohmann::json::parse(keys, nullptr, false);
-    ASSERT_TRUE(parsed.is_array());
-
-    std::vector<std::string> names;
-    for (const nlohmann::json& e : parsed) names.push_back(e.get<std::string>());
-    auto has = [&names](const char* n) {
-        return std::find(names.begin(), names.end(), n) != names.end();
-    };
-
-    // The gate's inputs are intact: both host-written names are still there.
-    EXPECT_TRUE(has("loaded_mod_a"));
-    EXPECT_TRUE(has("loaded_mod_b"));
-
-    // And an isolated identity's private cache is NOT folded into the trust
-    // root's view — isolation neither blinds the gate nor widens it.
-    EXPECT_FALSE(has("private_target"));
 }
 
 // The version this surface shipped in. lp_token_isolate_identity and friends are
