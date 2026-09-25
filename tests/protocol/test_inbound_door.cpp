@@ -18,9 +18,9 @@
 // pair paid a rejection plus a full extra round trip, permanently, and the
 // caller saw only success.
 //
-// HOW THESE ARE DETECTORS. Three neutered builds of lp_token_save_inbound were
-// run against this file; the counts below are measured, not predicted, and the
-// restored control is 7/7 green.
+// HOW THESE ARE DETECTORS. Neutered builds of lp_token_save_inbound were run
+// against this file, before the token registry was retired; the counts below
+// are measured, not predicted.
 //
 //   A. point it at TokenManager::saveToken — i.e. spell it the way the glue
 //      used to. 6 of 7 RED. This is the bug, exactly:
@@ -29,24 +29,11 @@
 //        AnInboundPushDoesNotClobberAnExistingOutboundCache
 //            "T-peer-presents-to-me" vs "T-i-present-to-peer" — the cache was
 //            overwritten by the inbound push, which is the direction collision
-//        (and the four carve-out / argument cases, which lose the inbound half
-//         entirely)
+//        (and the argument cases, which lose the inbound half entirely)
 //
-//   B. delete the hostServiceGranted(ServiceTokenRegistry) carve-out. 2 RED:
-//        ATokenRegistryStillGetsItsOutboundRoster   (roster empty, token "")
-//        RevokingTheGrantStopsTheCarveOut
-//      This is the OPPOSITE failure and it is fleet-fatal: capability_module
-//      reads lp_token_keys() for its known-caller gate and lp_token_get() for
-//      the credential it presents when pushing, so an inbound-only door empties
-//      its roster and every requestModule is refused with "rejecting request
-//      from unknown module identity" — fail-closed, and total, at the first
-//      cross-module call.
-//
-//   C. make the carve-out unconditional. 4 RED, including
-//        AnInboundPushIsNotAnOutboundCredential
-//        AnUngrantedImageGetsNoOutboundEntry
-//      Together B and C pin the carve-out to the GRANT rather than to nothing
-//      or to everyone.
+// The token-registry carve-out (an image granted "token_registry" also filed a
+// push OUTBOUND) is retired in 0.13: a push is only ever inbound, granted or not,
+// and ARetiredRegistryGrantWritesOnlyInbound pins that.
 
 #include <gtest/gtest.h>
 
@@ -56,10 +43,8 @@
 #include <QCoreApplication>
 #include <QString>
 
-#include <algorithm>
 #include <string>
 
-#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -78,15 +63,6 @@ std::string takeString(char* owned)
     const std::string out = owned;
     lp_string_free(owned);
     return out;
-}
-
-bool rosterContains(const std::string& dump, const std::string& key)
-{
-    const nlohmann::json j = nlohmann::json::parse(dump, nullptr, /*allow_exceptions=*/false);
-    if (!j.is_array()) return false;
-    return std::any_of(j.begin(), j.end(), [&](const nlohmann::json& e) {
-        return e.is_string() && e.get<std::string>() == key;
-    });
 }
 
 class InboundDoor : public ::testing::Test {
@@ -153,30 +129,18 @@ TEST_F(InboundDoor, TheOutboundDoorIsStillTheAnchorSeedingDoor)
     EXPECT_EQ(takeString(lp_token_get("capability_module")), std::string("my-anchor"));
 }
 
-// ── the carve-out, in both directions ───────────────────────────────────────
+// ── no image files a push outbound ──────────────────────────────────────────
 
-TEST_F(InboundDoor, ATokenRegistryStillGetsItsOutboundRoster)
+TEST_F(InboundDoor, ARetiredRegistryGrantWritesOnlyInbound)
 {
+    // What an older host still grants capability_module. The role it named is
+    // gone: the push stays a caller's token, never a credential to present.
     ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-
-    // This is the shape of what capability_module receives: core telling it
-    // "module_x is loaded, here is its token". To the registry that message is
-    // OUTBOUND — the credential it will present when it pushes to module_x —
-    // and it is also the roster entry its known-caller gate reads.
     ASSERT_EQ(lp_token_save_inbound("module_x", "T-x"), LP_OK);
 
-    const std::string roster = takeString(lp_token_keys());
-    ASSERT_FALSE(roster.empty()) << "the granted roster must be readable";
-    EXPECT_TRUE(rosterContains(roster, "module_x"))
-        << "capability_module's known-caller gate reads exactly this; empty here "
-           "means every requestModule in the fleet is refused with 'rejecting "
-           "request from unknown module identity'";
-
-    EXPECT_EQ(takeString(lp_token_get("module_x")), std::string("T-x"))
-        << "capability_module authenticates its push to module_x with this value";
-
-    // The inbound half is written too: the registry is also a provider, and a
-    // module presenting its own anchor to capability_module is an inbound call.
+    EXPECT_EQ(lp_token_get("module_x"), nullptr)
+        << "a pushed token became one this image presents";
+    EXPECT_EQ(lp_token_keys(), nullptr) << "and there is no roster to read";
     EXPECT_EQ(TokenManager::instance().inbound().token(QStringLiteral("module_x")),
               QStringLiteral("T-x"));
 }
@@ -188,24 +152,10 @@ TEST_F(InboundDoor, AnUngrantedImageGetsNoOutboundEntry)
     ASSERT_EQ(lp_token_save_inbound("module_x", "T-x"), LP_OK);
 
     EXPECT_EQ(lp_token_get("module_x"), nullptr)
-        << "the carve-out fired for an image that was never granted the registry "
-           "role — that is the original bug with an extra step";
-    EXPECT_EQ(lp_token_keys(), nullptr) << "and the roster stays closed";
+        << "a pushed token became one this image presents — the original bug";
+    EXPECT_EQ(lp_token_keys(), nullptr) << "and there is no roster to read";
     EXPECT_EQ(TokenManager::instance().inbound().token(QStringLiteral("module_x")),
               QStringLiteral("T-x"));
-}
-
-TEST_F(InboundDoor, RevokingTheGrantStopsTheCarveOut)
-{
-    ASSERT_EQ(lp_grant_host_services(R"(["token_registry"])"), LP_OK);
-    ASSERT_EQ(lp_token_save_inbound("early", "T-early"), LP_OK);
-    ASSERT_EQ(lp_grant_host_services(nullptr), LP_OK);
-    ASSERT_EQ(lp_token_save_inbound("late", "T-late"), LP_OK);
-
-    // The grant is read at the moment of the write, not cached at load: an image
-    // that loses the role stops filing new pushes outbound.
-    EXPECT_EQ(takeString(lp_token_get("early")), std::string("T-early"));
-    EXPECT_EQ(lp_token_get("late"), nullptr);
 }
 
 // ── argument handling ───────────────────────────────────────────────────────
