@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1030,6 +1031,14 @@ int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned max_cal
 int lp_revoke_module_token_to(lp_client*, const char*, const char*, const char*, const char*, int)
 {
     return LP_ERR_UNSUPPORTED;
+}
+
+char* lp_token_digest(const char* token)
+{
+    if (!token) return nullptr;
+    const QByteArray digest =
+        QCryptographicHash::hash(QByteArray(token), QCryptographicHash::Sha256).toHex();
+    return lp_string_copy(digest.constData());
 }
 
 // Delegates, resolvers and inproc belong to the plain runtime.

@@ -105,6 +105,16 @@ TEST_P(PlainTokenRevocation, ARevokedTokenStopsAuthorizingAndAStaleOneIsSpared)
     lp_provider_destroy(provider);
 }
 
+TEST(PlainTokenDigest, IsTheHexSha256RevocationNames)
+{
+    char* digest = lp_token_digest("abc");
+    ASSERT_NE(digest, nullptr);
+    EXPECT_STREQ(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(std::string(digest), digestOf("abc"));
+    lp_string_free(digest);
+    EXPECT_EQ(lp_token_digest(nullptr), nullptr);
+}
+
 INSTANTIATE_TEST_SUITE_P(OverEachLocalTransport, PlainTokenRevocation,
                          ::testing::Values("qt_remote_plain", "inproc"));
 
