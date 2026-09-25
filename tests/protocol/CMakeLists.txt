@@ -444,11 +444,9 @@ add_executable(protocol_tests
     # is now a KEY NAMESPACE inside the original single QHash; these tests are
     # what keep it that way, and they are RED on e514c53.
     test_token_manager_abi.cpp
-    # THE INBOUND DOOR across the C ABI (lp_token_save_inbound, protocol 0.8),
-    # and the token-registry carve-out that keeps capability_module's roster
-    # alive. Every case names the one-line neutering that turns it red; two of
-    # them detect the original bug (a caller's token filed as an outbound
-    # credential) and two detect its fleet-fatal overcorrection.
+    # THE INBOUND DOOR across the C ABI (lp_token_save_inbound, protocol 0.8):
+    # a caller's token is never filed as an outbound credential, granted or
+    # not. The file names the one-line neutering that turns each case red.
     test_inbound_door.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
