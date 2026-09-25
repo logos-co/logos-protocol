@@ -280,9 +280,12 @@
 // MINORs 10 and 11 only ever named revisions of this wave on its branches, and
 // the unmerged feat/optional-dependencies uses 10 for lp_target_presence. A
 // MINOR guard cannot tell those apart; guard on the feature macros below.
-#define LOGOS_PROTOCOL_VERSION_MINOR 12
+// 0.13: in-process hosting, all additive: the "inproc" transport, one dispatch
+// gate per provider, lp_provider_set_caller_resolver, runtime delegates
+// (logos_runtime_delegate.h) and token revocation.
+#define LOGOS_PROTOCOL_VERSION_MINOR 13
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.12.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.13.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -317,6 +320,12 @@
 #define LOGOS_PROTOCOL_HAS_WILDCARD_SUBSCRIBE 1       /* lp_subscribe with "" */
 #define LOGOS_PROTOCOL_HAS_STAGED_PUBLICATION 1       /* lp_provider_prepare */
 #define LOGOS_PROTOCOL_HAS_STRING_COPY 1              /* lp_string_copy */
+
+// FEATURE MACROS for 0.13 (see the version above).
+#define LOGOS_PROTOCOL_HAS_INPROC 1            /* LogosProtocol::Inproc; plain runtime only */
+#define LOGOS_PROTOCOL_HAS_CALLER_RESOLVER 1   /* lp_provider_set_caller_resolver */
+#define LOGOS_PROTOCOL_HAS_RUNTIME_DELEGATE 1  /* logos_runtime_delegate.h */
+#define LOGOS_PROTOCOL_HAS_TOKEN_REVOCATION 1  /* lp_revoke_module_token_to, revokeModuleToken */
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -905,6 +914,20 @@ LP_API int lp_inform_module_token_to(lp_client* client,
                               const char* token,
                               int timeout_ms);
 
+/** The digest lp_revoke_module_token_to names a token by: lowercase hex SHA-256.
+ *  Free with lp_string_free; NULL for a NULL token. */
+LP_API char* lp_token_digest(const char* token);
+
+/** Withdraw `module_name`'s token at `origin_module`, only while that target still
+ *  holds the token `token_digest` (lp_token_digest) names: a late revocation spares
+ *  a token issued since. Same grant and channel as lp_inform_module_token_to. */
+LP_API int lp_revoke_module_token_to(lp_client* client,
+                              const char* auth_token,
+                              const char* origin_module,
+                              const char* module_name,
+                              const char* token_digest,
+                              int timeout_ms);
+
 /* ---------------------------------------------------------------------------
  * Host services — the privileged surface a trust-root module is granted
  *
@@ -965,6 +988,14 @@ typedef int (*lp_validate_token_cb)(const char* token,
                                     const char* transport_protocol,
                                     void* user_data);
 
+/** Name a credential the provider's own table does not: return a heap caller
+ *  document ({"kind":"module"|"operator","name":...} or {"kind":"unknown"}),
+ *  freed by the library with lp_string_free, or NULL to refuse it. Never the
+ *  host. Replaces the validator when both are set. */
+typedef char* (*lp_caller_resolver_cb)(const char* token,
+                                       const char* transport_protocol,
+                                       void* user_data);
+
 /** Identity authenticated for the provider dispatch currently running on this
  *  thread, as the canonical caller JSON document. The pointer is borrowed and
  *  remains valid only until the dispatch callback returns. Outside a provider
@@ -1000,6 +1031,9 @@ LP_API int lp_provider_save_token(lp_provider* provider,
                            const char* token);
 LP_API int lp_provider_set_token_validator(lp_provider* provider,
                            lp_validate_token_cb validate,
+                           void* user_data);
+LP_API int lp_provider_set_caller_resolver(lp_provider* provider,
+                           lp_caller_resolver_cb resolve,
                            void* user_data);
 /** Calls start in the order they arrive and at most `max_calls` run at once,
  *  each on one of that many long-lived threads; 1 runs every call on the same

@@ -275,10 +275,13 @@ TEST(QtRemotePlainCompatTest, DynamicDefinitionBytesMatchQt692QDataStream)
     stream << QString::fromStdString(definition.typeName);
     stream << quint32(0) << quint32(0) << quint32(0);
     stream << quint32(0);
-    stream << quint32(1);
+    stream << quint32(2);
     stream << QByteArray("informModuleToken(QString,QString,QString)")
            << QByteArray("bool")
            << names({"authToken", "moduleName", "token"});
+    stream << QByteArray("revokeModuleToken(QString,QString,QString)")
+           << QByteArray("bool")
+           << names({"authToken", "moduleName", "tokenDigest"});
     stream << quint32(0);
 
     EXPECT_EQ(plain.data(), stdBytes(qt));

@@ -556,6 +556,11 @@ public:
     /** @brief saveInboundToken — std::string overload. */
     bool saveInboundToken(const std::string& caller, const std::string& token);
 
+    /** Removes `caller`'s inbound token if it is still the one `tokenDigest`
+     *  (hex SHA-256) names, so a stale revocation spares a newer token.
+     *  Non-virtual and data-free: the frozen layout is unchanged. */
+    bool removeInboundToken(const QString& caller, const QString& tokenDigest);
+
     /**
      * @brief THIS store's own host-issued credential — the trust anchor.
      *

@@ -114,3 +114,17 @@ TEST_F(TransportFactoryTest, ModeSwitchChangesTransportType)
     // They should be different transport implementations
     EXPECT_NE(mockConn.get(), localConn.get());
 }
+
+// inproc is served by the plain runtime only: the Qt factory refuses it rather
+// than falling back to Qt Remote Objects.
+TEST_F(TransportFactoryTest, TheQtRuntimeRefusesInproc)
+{
+    LogosModeConfig::setMode(LogosMode::Remote);
+    LogosTransportConfig inproc;
+    inproc.protocol = LogosProtocol::Inproc;
+    EXPECT_EQ(LogosTransportFactory::createHost(inproc, "local:inproc_refused"), nullptr);
+    auto conn = LogosTransportFactory::createConnection(inproc, "local:inproc_refused");
+    ASSERT_NE(conn, nullptr);
+    EXPECT_FALSE(conn->connectToHost());
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(inproc));
+}

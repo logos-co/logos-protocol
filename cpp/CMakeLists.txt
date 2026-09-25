@@ -52,6 +52,12 @@ set(LOGOS_PLAIN_NETWORK_SOURCES
     implementations/plain/io_context_pool.cpp
 )
 
+# plain_local: the in-process transport, part of the Qt-free runtime only.
+set(LOGOS_PLAIN_LOCAL_SOURCES
+    implementations/plain_local/inproc_transport.cpp
+    implementations/plain_local/inproc_transport.h
+)
+
 add_library(logos_socket_paths STATIC
     logos_socket_paths.cpp
     logos_socket_paths.h
@@ -109,6 +115,7 @@ add_library(logos_protocol_plain STATIC
     logos_protocol_plain_network.cpp
     logos_protocol_plain_network.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
+    ${LOGOS_PLAIN_LOCAL_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
@@ -143,6 +150,7 @@ add_library(logos_protocol_plain_shared SHARED
     logos_protocol_plain_network.cpp
     logos_protocol_plain_network.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
+    ${LOGOS_PLAIN_LOCAL_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
@@ -531,7 +539,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.12.0
+    VERSION 0.13.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES
@@ -545,6 +553,8 @@ install(FILES
 # (etc.) keep resolving unchanged through propagated include dirs.
 install(FILES
     logos_protocol.h
+    # Included by generated module glue and by hosts that load modules in-process.
+    logos_runtime_delegate.h
     logos_module_impl.h
     # The canonical LIDL <-> JSON codec. Generated module glue includes it, so it
     # has to ship with the library's headers, not just in the source export.

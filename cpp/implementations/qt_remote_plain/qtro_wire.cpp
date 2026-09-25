@@ -1323,6 +1323,7 @@ ClassDefinition moduleProxyDefinition()
             {"getPluginMethods()", "QJsonArray", {}},
             {"getPluginEvents()", "QJsonArray", {}},
             {"getPluginInterface()", "QJsonArray", {}},
+            {"revokeModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "tokenDigest"}},
         },
         {},
     };
@@ -1333,7 +1334,8 @@ ClassDefinition moduleHandshakeProxyDefinition()
     return {
         "ModuleHandshakeProxy",
         {},
-        {{"informModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "token"}}},
+        {{"informModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "token"}},
+         {"revokeModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "tokenDigest"}}},
         {},
     };
 }

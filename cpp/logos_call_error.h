@@ -91,6 +91,8 @@ inline CallError callErrorFromWire(const std::string& origin,
         return callErrorObjectUnavailable(origin, detail);
     if (wireCode == "TRANSPORT_CLOSED" || wireCode == "TRANSPORT_ERROR")
         return callErrorTransport(origin, detail);
+    // A bound in-process connection presented another caller's token.
+    if (wireCode == "BINDING_MISMATCH") return {"unauthorized", detail, origin};
     return callErrorCallFailed(origin, detail);
 }
 

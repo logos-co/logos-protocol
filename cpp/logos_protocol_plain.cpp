@@ -1,5 +1,7 @@
 #include "logos_protocol.h"
+#include "logos_runtime_delegate.h"
 
+#include "implementations/plain_local/inproc_transport.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_network.h"
 #include "logos_protocol_plain_tokens.h"
@@ -8,8 +10,10 @@
 #include "logos_transport_config_json.h"
 
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -235,6 +239,30 @@ std::string endpoint(const std::string& module)
     return "local:logos_" + module + "_" + instanceId();
 }
 
+// The engine's own identity on a bound connection; "core" is its older name.
+// Neither can be a module name.
+constexpr const char* kRuntimePrincipal = "@runtime";
+
+bool isRuntimePrincipal(const std::string& principal)
+{
+    return principal == kRuntimePrincipal || principal == "core";
+}
+
+bool isNetworkProtocol(LogosProtocol protocol)
+{
+    return protocol == LogosProtocol::Tcp || protocol == LogosProtocol::TcpSsl;
+}
+
+// A target meant for the local socket, or named inproc, is reached in-process
+// when its provider serves inproc here; the socket stays the fallback for the former.
+bool reachesInproc(const LogosTransportConfig& config, const std::string& module)
+{
+    if (config.protocol == LogosProtocol::Inproc) return true;
+    return (config.protocol == LogosProtocol::QtRemotePlain
+            || config.protocol == LogosProtocol::LocalSocket)
+        && logos::plain::inproc::isPublished(instanceId(), module);
+}
+
 std::mutex gDefaultMutex;
 std::string gDefaultTransport = R"({"protocol":"qt_remote_plain"})";
 
@@ -359,6 +387,9 @@ struct ClientState {
     std::deque<std::optional<EventMessage>> events;
     std::shared_ptr<Client> wire = std::make_shared<Client>();
     std::shared_ptr<RpcConnectionBase> networkWire;
+    // networkWire carries the calls (tcp, tls or inproc), not the qtro wire.
+    // Guarded by connectionMutex.
+    bool rpcRoute = false;
     LogosTransportConfig targetConfig;
     LogosTransportConfig capabilityConfig;
     std::string target;
@@ -623,13 +654,24 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         error = "connection timed out";
         return fail("timeout");
     }
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
-        if (state->networkWire && state->networkWire->isOpen()) return true;
+    if (state->rpcRoute && state->networkWire && state->networkWire->isOpen()) return true;
+    if (!state->rpcRoute && !isNetworkProtocol(state->targetConfig.protocol)
+        && state->targetConfig.protocol != LogosProtocol::Inproc
+        && state->wire->isConnected())
+        return true;
+    // Not connected: the route is chosen again, so a provider that moved into or
+    // out of this process is followed.
+    std::shared_ptr<RpcConnectionBase> wire;
+    if (isNetworkProtocol(state->targetConfig.protocol)) {
         if (state->networkWire) state->networkWire->stop("reconnecting");
-        auto wire = logos::plain::abi::connect(
-            state->targetConfig, remaining, error, &state->alive);
+        wire = logos::plain::abi::connect(state->targetConfig, remaining, error, &state->alive);
         if (!wire) return fail("object_unavailable");
+    } else if (reachesInproc(state->targetConfig, state->target)) {
+        if (state->networkWire) state->networkWire->stop("reconnecting");
+        wire = logos::plain::inproc::connect(instanceId(), state->target, state->origin, error);
+        if (!wire) return fail("object_unavailable");
+    }
+    if (wire) {
         if (!state->alive) {
             wire->stop("client destroyed");
             error = "client destroyed";
@@ -649,12 +691,22 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
                 if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
             });
         state->networkWire = std::move(wire);
+        state->rpcRoute = true;
+        if (!state->eventWorker.joinable())
+            state->eventWorker = std::thread([state] { networkEventLoop(state); });
         return true;
     }
+    state->rpcRoute = false;
     if (state->wire->isConnected()) return true;
     Client::Failure failure = Client::Failure::Transport;
     if (state->wire->connect(endpoint(state->target), remaining, &error, &failure)) return true;
     return fail(callErrorCode(failure));
+}
+
+bool onRpcRoute(const std::shared_ptr<ClientState>& state)
+{
+    std::lock_guard<std::timed_mutex> lock(state->connectionMutex);
+    return state->rpcRoute;
 }
 
 void subscriptionLoop(const std::shared_ptr<ClientState>& state)
@@ -684,13 +736,13 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         std::string error;
         // QtRO's local retry tick; a network dial (DNS, TCP, TLS) gets the
         // 5 s the Qt-side network client gave it.
-        const bool network = state->targetConfig.protocol == LogosProtocol::Tcp
-            || state->targetConfig.protocol == LogosProtocol::TcpSsl;
+        const bool network = isNetworkProtocol(state->targetConfig.protocol);
         bool acquired = ensureConnected(state, network ? 5000 : 250, error);
-        if (acquired && state->targetConfig.protocol == LogosProtocol::QtRemotePlain) {
+        if (acquired) {
             std::lock_guard<std::timed_mutex> connectionLock(state->connectionMutex);
-            acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
-                                             &error);
+            if (!state->rpcRoute)
+                acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
+                                                 &error);
         }
 
         if (!acquired) {
@@ -887,11 +939,13 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
     const std::string credential = tokenGet(state->tokens, "capability_module");
-    if (state->capabilityConfig.protocol == LogosProtocol::Tcp
-        || state->capabilityConfig.protocol == LogosProtocol::TcpSsl) {
-        auto wire = logos::plain::abi::connect(
-            state->capabilityConfig, std::chrono::milliseconds(timeout), error,
-            &state->alive);
+    const bool network = isNetworkProtocol(state->capabilityConfig.protocol);
+    if (network || reachesInproc(state->capabilityConfig, "capability_module")) {
+        auto wire = network
+            ? logos::plain::abi::connect(state->capabilityConfig,
+                                         std::chrono::milliseconds(timeout), error, &state->alive)
+            : logos::plain::inproc::connect(instanceId(), "capability_module", state->origin,
+                                            error);
         if (!wire) return {};
         CallMessage request;
         request.id = wire->nextId();
@@ -1004,9 +1058,13 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count()));
     };
-    std::string token = tokenFor(state, remaining(), error);
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+    // The engine's in-process connection is its identity: it needs no token.
+    std::string token;
+    if (!(isRuntimePrincipal(state->origin) && reachesInproc(state->targetConfig, state->target)))
+        token = tokenFor(state, remaining(), error);
+    // Connecting decides the route the call takes.
+    if (!ensureConnected(state, remaining(), error, &code)) return std::nullopt;
+    if (onRpcRoute(state)) {
         auto result = networkCall(state, state->target, method, args, token,
                                   remaining(), error, code, sent);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
@@ -1104,6 +1162,40 @@ constexpr unsigned kTokenRegistry = 1;
 constexpr unsigned kTokenDelivery = 2;
 thread_local std::string gCurrentCaller = R"({"kind":"unknown"})";
 
+// Set in a module image loaded in-process: its client surface runs in the host.
+std::atomic<const lp_runtime_delegate_v1*> gDelegate{nullptr};
+std::atomic<unsigned long long> gLocalClients{0};
+
+const lp_runtime_delegate_v1* activeDelegate()
+{
+    return gDelegate.load(std::memory_order_acquire);
+}
+
+// A host-allocated string, copied into this image's allocator.
+char* adoptHostString(const lp_runtime_delegate_v1* delegate, char* value)
+{
+    if (!value) return nullptr;
+    char* copy = duplicate(value);
+    delegate->string_free(delegate->context, value);
+    return copy;
+}
+
+// The closed set lp_grant_host_services takes.
+bool parseHostServices(const char* servicesJson, unsigned& services)
+{
+    services = 0;
+    if (!servicesJson || !*servicesJson) return true;
+    const json value = json::parse(servicesJson, nullptr, false);
+    if (value.is_discarded() || !value.is_array()) return false;
+    for (const auto& entry : value) {
+        if (!entry.is_string()) return false;
+        if (entry == "token_registry") services |= kTokenRegistry;
+        else if (entry == "token_delivery") services |= kTokenDelivery;
+        else return false;
+    }
+    return true;
+}
+
 } // namespace
 
 struct lp_client { std::shared_ptr<ClientState> state; };
@@ -1112,17 +1204,65 @@ struct lp_subscription {
     std::shared_ptr<SubscriptionState> state;
 };
 
+namespace {
+
+// Business calls from every transport pass one gate per provider, entering in
+// arrival order, so a module limited to one call runs one at a time however many
+// listeners it has. Token delivery and metadata never pass it.
+struct DispatchGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t capacity = 64;
+    std::size_t running = 0;
+    std::uint64_t nextTicket = 0;
+    std::deque<std::uint64_t> waiting;
+};
+
+class GateEntry {
+public:
+    explicit GateEntry(DispatchGate& gate) : m_gate(gate)
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        const std::uint64_t ticket = gate.nextTicket++;
+        gate.waiting.push_back(ticket);
+        gate.changed.wait(lock, [&] {
+            return gate.waiting.front() == ticket && gate.running < gate.capacity;
+        });
+        gate.waiting.pop_front();
+        ++gate.running;
+        // Under the lock: mingw was seen to lose a notify made after unlocking.
+        gate.changed.notify_all();
+    }
+    ~GateEntry()
+    {
+        std::lock_guard<std::mutex> lock(m_gate.mutex);
+        --m_gate.running;
+        m_gate.changed.notify_all();
+    }
+    GateEntry(const GateEntry&) = delete;
+    GateEntry& operator=(const GateEntry&) = delete;
+
+private:
+    DispatchGate& m_gate;
+};
+
+} // namespace
+
 struct lp_provider {
+    DispatchGate gate;
     std::string moduleName;
     std::string transportSetJson;
     Server server;
     bool qtroStarted = false;
     std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networkEndpoints;
+    std::shared_ptr<logos::plain::inproc::Endpoint> inproc;
     lp_dispatch_cb dispatch = nullptr;
     lp_getmethods_cb getMethods = nullptr;
     lp_token_cb onToken = nullptr;
     lp_validate_token_cb validateToken = nullptr;
     void* validatorUserData = nullptr;
+    lp_caller_resolver_cb resolveCaller = nullptr;
+    void* resolverUserData = nullptr;
     void* userData = nullptr;
     std::mutex mutex;
     std::map<std::string, std::string> inbound;
@@ -1158,16 +1298,35 @@ bool isAnchorKey(const std::string& key)
     return key == "core" || key == "capability_module";
 }
 
+constexpr const char* kOperatorPrefix = "@op:";
+
+// What a resolver may name: never the host, and always with a non-empty name
+// for a module or an operator. Anything else is refused.
+std::string resolvedCaller(const json& document)
+{
+    if (!document.is_object()) return {};
+    const std::string kind = stringField(document, "kind");
+    const std::string name = stringField(document, "name");
+    if ((kind == "module" || kind == "operator") && !name.empty())
+        return dumpJson(json{{"kind", kind}, {"name", name}});
+    if (kind == "unknown") return R"({"kind":"unknown"})";
+    return {};
+}
+
 // The caller document for `token`, empty when unauthorized. As on the Qt path
 // (module_proxy.cpp), every entry is compared, an anchor key authorizes but
 // never names, and a value two callers share names neither; a token the host's
 // validator accepts is authorized too, and named by no one.
 std::string providerCaller(lp_provider* provider, const std::string& token,
-                           const char* protocol = "local")
+                           const char* protocol = "local",
+                           const std::string* principal = nullptr)
 {
+    if (principal && isRuntimePrincipal(*principal)) return R"({"kind":"host"})";
     if (token.empty()) return {};
     lp_validate_token_cb validate = nullptr;
     void* validatorData = nullptr;
+    lp_caller_resolver_cb resolve = nullptr;
+    void* resolverData = nullptr;
     {
         std::lock_guard<std::mutex> lock(provider->mutex);
         const bool host = !provider->credential.empty()
@@ -1185,10 +1344,24 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
             }
         }
         if (host) return R"({"kind":"host"})";
-        if (named == 1 && !anchor) return dumpJson(json{{"kind", "module"}, {"name", name}});
+        if (named == 1 && !anchor) {
+            // "@op:<name>" can never be a module name: an operator's pair token.
+            if (name.rfind(kOperatorPrefix, 0) == 0 && name.size() > std::strlen(kOperatorPrefix))
+                return dumpJson(json{{"kind", "operator"},
+                                     {"name", name.substr(std::strlen(kOperatorPrefix))}});
+            return dumpJson(json{{"kind", "module"}, {"name", name}});
+        }
         if (named > 0 || anchor) return R"({"kind":"unknown"})";
         validate = provider->validateToken;
         validatorData = provider->validatorUserData;
+        resolve = provider->resolveCaller;
+        resolverData = provider->resolverUserData;
+    }
+    if (resolve) {
+        char* text = resolve(token.c_str(), protocol, resolverData);
+        const json document = text ? json::parse(text, nullptr, false) : json();
+        lp_string_free(text);
+        return resolvedCaller(document);
     }
     if (validate && validate(token.c_str(), protocol, validatorData) == LP_OK)
         return R"({"kind":"unknown"})";
@@ -1237,10 +1410,12 @@ std::string providerReturnType(lp_provider* provider, const std::string& method)
 // Recorded only once the module took it: a refused push must not later
 // authorize, or name, whoever presents that token.
 bool providerAcceptToken(lp_provider* provider, const std::string& auth,
-                         const std::string& module, const std::string& token)
+                         const std::string& module, const std::string& token,
+                         const std::string* principal = nullptr)
 {
-    bool trusted = false;
-    {
+    bool trusted = principal
+        && (isRuntimePrincipal(*principal) || *principal == "capability_module");
+    if (!trusted) {
         std::lock_guard<std::mutex> lock(provider->mutex);
         trusted = !provider->credential.empty() && constantTimeEquals(provider->credential, auth);
     }
@@ -1252,6 +1427,44 @@ bool providerAcceptToken(lp_provider* provider, const std::string& auth,
         provider->inbound[module] = token;
     }
     return accepted;
+}
+
+// Hex SHA-256: how a revocation names the token it withdraws.
+std::string tokenDigest(const std::string& token)
+{
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    if (EVP_Digest(token.data(), token.size(), hash, &length, EVP_sha256(), nullptr) != 1)
+        return {};
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned int i = 0; i < length; ++i) {
+        out.push_back(hex[hash[i] >> 4]);
+        out.push_back(hex[hash[i] & 15]);
+    }
+    return out;
+}
+
+// Withdraws `module`'s token only while it is the one `digest` names, so a late
+// revocation spares a token issued since. The same trusted channel as a push.
+bool providerRevokeToken(lp_provider* provider, const std::string& auth,
+                         const std::string& module, const std::string& digest,
+                         const std::string* principal = nullptr)
+{
+    bool trusted = principal
+        && (isRuntimePrincipal(*principal) || *principal == "capability_module");
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    if (!trusted)
+        trusted = !provider->credential.empty() && constantTimeEquals(provider->credential, auth);
+    if (!trusted || module.empty() || digest.empty() || isAnchorKey(module)) return false;
+    const auto found = provider->inbound.find(module);
+    if (found == provider->inbound.end()) return false;
+    std::string wanted = digest;
+    std::transform(wanted.begin(), wanted.end(), wanted.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (tokenDigest(found->second) != wanted) return false;
+    provider->inbound.erase(found);
+    return true;
 }
 
 // A deferred LogosResult method answers with the pending sentinel; the
@@ -1268,6 +1481,14 @@ void rememberPendingResult(lp_provider* provider, const json& result, const std:
 Variant providerInvoke(lp_provider* provider, bool handshake,
                        std::int32_t index, const std::vector<Variant>& arguments)
 {
+    if ((handshake && index == 1) || (!handshake && index == 7)) {
+        if (arguments.size() != 3 || !arguments[0].value.isString()
+            || !arguments[1].value.isString() || !arguments[2].value.isString())
+            return Variant::fromRpc(RpcValue{false});
+        return Variant::fromRpc(RpcValue{providerRevokeToken(provider,
+            arguments[0].value.asString(), arguments[1].value.asString(),
+            arguments[2].value.asString())});
+    }
     if (handshake || index == 3) {
         if (arguments.size() != 3 || !arguments[0].value.isString()
             || !arguments[1].value.isString() || !arguments[2].value.isString())
@@ -1301,10 +1522,14 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         return Variant::fromRpc(jsonToRpc(json{{kStatusKey, "unauthorized"}}));
     if (!provider->dispatch) return {};
     const std::string argsText = dumpJson(args);
-    const std::string previousCaller = std::move(gCurrentCaller);
-    gCurrentCaller = caller;
-    char* text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
-    gCurrentCaller = previousCaller;
+    char* text = nullptr;
+    {
+        GateEntry entry(provider->gate);
+        const std::string previousCaller = std::move(gCurrentCaller);
+        gCurrentCaller = caller;
+        text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
+        gCurrentCaller = previousCaller;
+    }
     if (!text) return {};
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
@@ -1315,15 +1540,38 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
 }
 
 
+// On a bound connection a token may authorize only the principal it names.
+bool bindingMismatch(const std::string& caller, const std::string& principal)
+{
+    const json document = json::parse(caller, nullptr, false);
+    if (!document.is_object()) return false;
+    const std::string kind = stringField(document, "kind");
+    if (kind == "host") return !isRuntimePrincipal(principal);
+    return kind == "module" && stringField(document, "name") != principal;
+}
+
 ResultMessage providerNetworkCall(lp_provider* provider,
                                   const CallMessage& request,
-                                  const char* protocol)
+                                  const char* protocol,
+                                  const std::string* principal = nullptr)
 {
     ResultMessage reply;
     reply.id = request.id;
     if (request.object != provider->moduleName) {
         reply.err = "object not published: " + request.object;
         reply.errCode = "MODULE_NOT_LOADED";
+        return reply;
+    }
+    if (request.method == "revokeModuleToken") {
+        if (request.args.size() != 2 || !request.args[0].isString()
+            || !request.args[1].isString()) {
+            reply.err = "invalid revocation arguments";
+            reply.errCode = "INVALID_ARGUMENT";
+            return reply;
+        }
+        reply.ok = true;
+        reply.value = RpcValue{providerRevokeToken(provider, request.authToken,
+            request.args[0].asString(), request.args[1].asString(), principal)};
         return reply;
     }
     if (request.method == "informModuleToken") {
@@ -1335,7 +1583,7 @@ ResultMessage providerNetworkCall(lp_provider* provider,
         }
         reply.ok = true;
         reply.value = RpcValue{providerAcceptToken(provider, request.authToken,
-            request.args[0].asString(), request.args[1].asString())};
+            request.args[0].asString(), request.args[1].asString(), principal)};
         return reply;
     }
     if (!provider->registered) {
@@ -1351,21 +1599,37 @@ ResultMessage providerNetworkCall(lp_provider* provider,
             : request.method == "getPluginEvents" ? "events" : "interface"));
         return reply;
     }
-    const std::string caller = providerCaller(provider, request.authToken, protocol);
+    const std::string caller = providerCaller(provider, request.authToken, protocol, principal);
     if (caller.empty()) {
         reply.ok = true;
         reply.value = jsonToRpc(json{{kStatusKey, "unauthorized"}});
         return reply;
     }
+    if (principal && bindingMismatch(caller, *principal)) {
+        // Not the unauthorized sentinel: a new token would not make it match.
+        reply.err = "the token names another caller than this connection's";
+        reply.errCode = "BINDING_MISMATCH";
+        return reply;
+    }
     json args = json::array();
     for (const auto& value : request.args) args.push_back(rpcToJson(value));
     const std::string argsText = dumpJson(args);
-    const std::string previousCaller = std::move(gCurrentCaller);
-    gCurrentCaller = caller;
-    char* text = provider->dispatch(request.method.c_str(), argsText.c_str(),
-                                    provider->userData);
-    gCurrentCaller = previousCaller;
+    char* text = nullptr;
+    {
+        GateEntry entry(provider->gate);
+        const std::string previousCaller = std::move(gCurrentCaller);
+        gCurrentCaller = caller;
+        text = provider->dispatch(request.method.c_str(), argsText.c_str(),
+                                  provider->userData);
+        gCurrentCaller = previousCaller;
+    }
+    // In-process, a method the module does not answer reads as it does over
+    // qt_remote_plain: a null value, not a failure (only inproc passes a principal).
     if (!text) {
+        if (principal) {
+            reply.ok = true;
+            return reply;
+        }
         reply.err = "method failed";
         reply.errCode = "METHOD_FAILED";
         return reply;
@@ -1373,6 +1637,10 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
     if (result.is_discarded()) {
+        if (principal) {
+            reply.ok = true;
+            return reply;
+        }
         reply.err = "invalid method result";
         reply.errCode = "METHOD_FAILED";
         return reply;
@@ -1406,6 +1674,35 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
     }
     reply.ok = true;
     return reply;
+}
+
+} // namespace
+
+namespace {
+
+// informModuleToken or revokeModuleToken over an in-process connection bound
+// to `principal`.
+int pushTokenInproc(const std::string& target, const std::string& principal,
+                    const std::string& authToken, const std::string& moduleName,
+                    const std::string& token, int timeout,
+                    const char* method = "informModuleToken")
+{
+    std::string error;
+    auto wire = logos::plain::inproc::connect(instanceId(), target, principal, error);
+    if (!wire) return LP_ERR_INTERNAL;
+    CallMessage request;
+    request.id = wire->nextId();
+    request.authToken = authToken;
+    request.object = target;
+    request.method = method;
+    request.args = {RpcValue{moduleName}, RpcValue{token}};
+    auto future = wire->sendCall(std::move(request));
+    const bool answered = future.wait_for(std::chrono::milliseconds(timeoutMs(timeout)))
+        == std::future_status::ready;
+    wire->stop("token delivered");
+    if (!answered) return LP_ERR_INTERNAL;
+    const ResultMessage result = future.get();
+    return result.ok && result.value.isBool() && result.value.asBool() ? LP_OK : LP_ERR_INTERNAL;
 }
 
 } // namespace
@@ -1445,7 +1742,7 @@ try {
     return LP_ERR_INTERNAL;
 }
 
-lp_client* lp_client_create(const char* targetModule, const char* originModule,
+static lp_client* clientCreateLocal(const char* targetModule, const char* originModule,
                             const char* targetTransportJson,
                             const char* capabilityTransportJson)
 try {
@@ -1524,7 +1821,7 @@ try {
     return nullptr;
 }
 
-void lp_client_destroy(lp_client* client)
+static void clientDestroyLocal(lp_client* client)
 {
     if (!client) return;
     const bool fromCallback = activeCallbackState == client->state.get();
@@ -1574,7 +1871,7 @@ void lp_client_destroy(lp_client* client)
     delete client;
 }
 
-int lp_invoke(lp_client* client, const char* method, const char* argsJson,
+static int invokeLocal(lp_client* client, const char* method, const char* argsJson,
               int timeout, char** outResultJson, char** outErrorJson)
 try {
     if (outResultJson) *outResultJson = nullptr;
@@ -1599,7 +1896,7 @@ try {
     return LP_ERR_INTERNAL;
 }
 
-int lp_invoke_async(lp_client* client, const char* method, const char* argsJson,
+static int invokeAsyncLocal(lp_client* client, const char* method, const char* argsJson,
                     int timeout, lp_result_cb callback, void* userData)
 try {
     if (!client || !method || !*method || !callback) return LP_ERR_INVALID_ARG;
@@ -1657,7 +1954,7 @@ try {
     return LP_ERR_INTERNAL;
 }
 
-lp_subscription* lp_subscribe(lp_client* client, const char* eventName,
+static lp_subscription* subscribeLocal(lp_client* client, const char* eventName,
                               lp_event_cb callback, void* userData)
 try {
     if (!client || !eventName || !callback
@@ -1676,7 +1973,7 @@ try {
     return nullptr;
 }
 
-int lp_client_set_subscription_status_cb(lp_client* client,
+static int setSubscriptionStatusCbLocal(lp_client* client,
                                          lp_subscription_status_cb callback,
                                          void* userData)
 {
@@ -1703,12 +2000,12 @@ int lp_client_set_subscription_status_cb(lp_client* client,
     return 1;
 }
 
-unsigned long long lp_client_subscription_generation(lp_client* client)
+static unsigned long long subscriptionGenerationLocal(lp_client* client)
 {
     return client ? client->state->generation.load() : 0;
 }
 
-int lp_client_set_subscription_options(lp_client* client, const char* optionsJson)
+static int setSubscriptionOptionsLocal(lp_client* client, const char* optionsJson)
 try {
     if (!client) return 0;
     // As the Qt C ABI: anything but a "manual" restart means automatic, and
@@ -1728,7 +2025,7 @@ try {
     return 0;
 }
 
-int lp_client_rearm_subscriptions(lp_client* client)
+static int rearmSubscriptionsLocal(lp_client* client)
 {
     if (!client) return 0;
     bool revived = false;
@@ -1752,7 +2049,7 @@ int lp_client_rearm_subscriptions(lp_client* client)
     return revived ? 1 : 0;
 }
 
-void lp_unsubscribe(lp_subscription* subscription)
+static void unsubscribeLocal(lp_subscription* subscription)
 {
     if (!subscription) return;
     {
@@ -1763,7 +2060,7 @@ void lp_unsubscribe(lp_subscription* subscription)
     delete subscription;
 }
 
-char* lp_pending_subscriptions(lp_client* client)
+static char* pendingSubscriptionsLocal(lp_client* client)
 try {
     if (!client) return nullptr;
     json pending = json::array();
@@ -1784,13 +2081,13 @@ try {
     return nullptr;
 }
 
-char* lp_get_methods(lp_client* client)
+static char* getMethodsLocal(lp_client* client)
 try {
     if (!client) return nullptr;
     const auto& state = client->state;
     std::string error;
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+    if (!ensureConnected(state, kDefaultTimeoutMs, error)) return nullptr;
+    if (onRpcRoute(state)) {
         std::string code;
         auto result = networkCall(state, state->target, "getPluginInterface", json::array(), {},
                                   kDefaultTimeoutMs, error, code);
@@ -1806,7 +2103,6 @@ try {
         const auto legacy = legacyInterface(part("getPluginMethods"), part("getPluginEvents"));
         return legacy ? duplicate(dumpJson(*legacy)) : nullptr;
     }
-    if (!ensureConnected(state, kDefaultTimeoutMs, error)) return nullptr;
     Client& wire = *state->wire;
     const auto timeout = std::chrono::milliseconds(kDefaultTimeoutMs);
     if (!wire.acquire(state->target, timeout, &error)) return nullptr;
@@ -1933,7 +2229,7 @@ try {
 // Always capability_module, as documented: through the client's own connection
 // when that is its target, otherwise over the capability transport. Pushing a
 // token at any other module is lp_inform_module_token_to's, behind its grant.
-int lp_inform_module_token(lp_client* client, const char* authToken,
+static int informModuleTokenLocal(lp_client* client, const char* authToken,
                            const char* moduleName, const char* token)
 try {
     if (!client || !authToken || !moduleName || !token) return LP_ERR_INVALID_ARG;
@@ -1944,6 +2240,9 @@ try {
                             Variant::fromRpc(RpcValue{moduleName}),
                             Variant::fromRpc(RpcValue{token})};
     std::string error;
+    if (!isNetworkProtocol(config.protocol) && reachesInproc(config, "capability_module"))
+        return pushTokenInproc("capability_module", state->origin, authToken, moduleName, token,
+                               kDefaultTimeoutMs);
     if (config.protocol == LogosProtocol::Tcp || config.protocol == LogosProtocol::TcpSsl) {
         if (own) {
             if (!ensureConnected(state, kDefaultTimeoutMs, error)) return LP_ERR_INTERNAL;
@@ -1985,13 +2284,44 @@ try {
     return LP_ERR_INTERNAL;
 }
 
-int lp_inform_module_token_to(lp_client*, const char* authToken,
-                              const char* originModule, const char* moduleName,
-                              const char* token, int timeout)
+// `principal` names the revoker on an in-process connection.
+static int revokeModuleTokenTo(const std::string& principal, const char* authToken,
+                               const char* originModule, const char* moduleName,
+                               const char* digest, int timeout)
 try {
-    if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    if (!authToken || !originModule || !*originModule || !moduleName || !digest || !*digest)
+        return LP_ERR_INVALID_ARG;
+    if (logos::plain::inproc::isPublished(instanceId(), originModule))
+        return pushTokenInproc(originModule, principal, authToken, moduleName, digest, timeout,
+                               "revokeModuleToken");
+    std::string error;
+    Client target;
+    const int wait = timeoutMs(timeout);
+    if (!target.connect(endpoint(originModule), std::chrono::milliseconds(wait), &error))
+        return LP_ERR_INTERNAL;
+    const std::vector<Variant> arguments{Variant::fromRpc(RpcValue{authToken}),
+                                         Variant::fromRpc(RpcValue{moduleName}),
+                                         Variant::fromRpc(RpcValue{digest})};
+    auto result = target.call(std::string(originModule) + "__handshake",
+        "revokeModuleToken(QString,QString,QString)", arguments, std::chrono::milliseconds(wait),
+        &error);
+    if (!result)
+        result = target.call(originModule, "revokeModuleToken(QString,QString,QString)",
+                             arguments, std::chrono::milliseconds(wait), &error);
+    return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+// `principal` names the pusher on an in-process connection.
+static int informModuleTokenTo(const std::string& principal, const char* authToken,
+                               const char* originModule, const char* moduleName,
+                               const char* token, int timeout)
+try {
     if (!authToken || !originModule || !*originModule || !moduleName || !token)
         return LP_ERR_INVALID_ARG;
+    if (logos::plain::inproc::isPublished(instanceId(), originModule))
+        return pushTokenInproc(originModule, principal, authToken, moduleName, token, timeout);
     std::string error;
     Client target;
     const int wait = timeoutMs(timeout);
@@ -2014,16 +2344,7 @@ try {
 int lp_grant_host_services(const char* servicesJson)
 try {
     unsigned services = 0;
-    if (servicesJson && *servicesJson) {
-        const json value = json::parse(servicesJson, nullptr, false);
-        if (value.is_discarded() || !value.is_array()) return LP_ERR_INVALID_ARG;
-        for (const auto& entry : value) {
-            if (!entry.is_string()) return LP_ERR_INVALID_ARG;
-            if (entry == "token_registry") services |= kTokenRegistry;
-            else if (entry == "token_delivery") services |= kTokenDelivery;
-            else return LP_ERR_INVALID_ARG;
-        }
-    }
+    if (!parseHostServices(servicesJson, services)) return LP_ERR_INVALID_ARG;
     gHostServices = services;
     return LP_OK;
 } catch (...) {
@@ -2048,6 +2369,7 @@ void lp_provider_destroy(lp_provider* provider)
     if (!provider) return;
     // Stop waits for every outstanding connection handler before the callback
     // pointers and module-owned user data in `provider` can be destroyed.
+    logos::plain::inproc::withdraw(provider->inproc);
     for (auto& endpoint : provider->networkEndpoints) endpoint->stop();
     provider->networkEndpoints.clear();
     provider->server.stop();
@@ -2071,7 +2393,42 @@ try {
         local.protocol = LogosProtocol::QtRemotePlain;
         transports.push_back(local);
     }
+    const auto unwind = [provider] {
+        logos::plain::inproc::withdraw(provider->inproc);
+        provider->inproc.reset();
+        for (auto& active : provider->networkEndpoints) active->stop();
+        provider->networkEndpoints.clear();
+        provider->server.stop();
+    };
     for (const auto& config : transports) {
+        if (config.protocol == LogosProtocol::Inproc) {
+            if (provider->inproc) continue;
+            logos::plain::inproc::Handlers handlers;
+            handlers.call = [provider](const CallMessage& request, const std::string& principal) {
+                return providerNetworkCall(provider, request, "local", &principal);
+            };
+            handlers.control = handlers.call;
+            handlers.methods = [provider](const logos::plain::MethodsMessage& request) {
+                return providerNetworkMethods(provider, request);
+            };
+            handlers.token = [provider](const logos::plain::TokenMessage& request,
+                                        const std::string& principal) {
+                return providerAcceptToken(provider, request.authToken, request.moduleName,
+                                           request.token, &principal);
+            };
+            std::size_t workers = 0;
+            {
+                std::lock_guard<std::mutex> lock(provider->gate.mutex);
+                workers = provider->gate.capacity;
+            }
+            provider->inproc = logos::plain::inproc::publish(
+                instanceId(), provider->moduleName, std::move(handlers), workers);
+            if (!provider->inproc) {
+                unwind();
+                return LP_ERR_INTERNAL;
+            }
+            continue;
+        }
         if (config.protocol == LogosProtocol::QtRemotePlain
             || config.protocol == LogosProtocol::LocalSocket) {
             if (provider->qtroStarted) continue;
@@ -2080,15 +2437,18 @@ try {
                     logos::qt_remote_plain::moduleHandshakeProxyDefinition(),
                     [provider](std::int32_t index, const std::vector<Variant>& args) {
                         return providerInvoke(provider, true, index, args);
-                    }}, &error)) {
-                provider->server.stop();
+                    },
+                    [](std::int32_t) { return true; }}, &error)) {
+                unwind();
                 return LP_ERR_INTERNAL;
             }
             provider->qtroStarted = true;
             continue;
         }
-        if (config.protocol != LogosProtocol::Tcp
-            && config.protocol != LogosProtocol::TcpSsl) return LP_ERR_UNSUPPORTED;
+        if (!isNetworkProtocol(config.protocol)) {
+            unwind();
+            return LP_ERR_UNSUPPORTED;
+        }
         const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
         auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
             [provider, label](const CallMessage& request) {
@@ -2102,9 +2462,7 @@ try {
                                     request.moduleName, request.token);
             });
         if (!network->start()) {
-            for (auto& active : provider->networkEndpoints) active->stop();
-            provider->networkEndpoints.clear();
-            provider->server.stop();
+            unwind();
             return LP_ERR_INTERNAL;
         }
         provider->networkEndpoints.push_back(std::move(network));
@@ -2135,7 +2493,9 @@ try {
                 logos::qt_remote_plain::moduleProxyDefinition(),
                 [provider](std::int32_t index, const std::vector<Variant>& args) {
                     return providerInvoke(provider, false, index, args);
-                }}, &error)) {
+                },
+                // informModuleToken and the three metadata methods.
+                [](std::int32_t index) { return index >= 3; }}, &error)) {
             return LP_ERR_INTERNAL;
         }
     }
@@ -2165,6 +2525,7 @@ try {
     for (const auto& item : data) arguments.push_back(jsonToRpc(item));
     for (auto& endpoint : provider->networkEndpoints)
         endpoint->emit(provider->moduleName, eventName, arguments);
+    logos::plain::inproc::emit(provider->inproc, provider->moduleName, eventName, arguments);
     if (!provider->qtroStarted) return LP_OK;
     Variant payload = jsonToVariant(data);
     if (!resultType.empty()) payload.nestedValues[1] = resultVariant(data[1], resultType);
@@ -2200,11 +2561,446 @@ int lp_provider_set_token_validator(lp_provider* provider,
     return LP_OK;
 }
 
+int lp_provider_set_caller_resolver(lp_provider* provider, lp_caller_resolver_cb resolve,
+                                    void* userData)
+{
+    if (!provider) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->resolveCaller = resolve;
+    provider->resolverUserData = userData;
+    return LP_OK;
+}
+
 int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned maxCalls)
 {
     if (!provider) return LP_ERR_INVALID_ARG;
     provider->server.setMaxConcurrentCalls(maxCalls);
+    {
+        std::lock_guard<std::mutex> lock(provider->gate.mutex);
+        provider->gate.capacity = maxCalls > 0 ? maxCalls : 64;
+        provider->gate.changed.notify_all();
+    }
+    logos::plain::inproc::setMaxWorkers(provider->inproc, maxCalls);
     return LP_OK;
+}
+
+// The public client surface: forwarded to the host when this image has a
+// delegate, served here otherwise.
+
+lp_client* lp_client_create(const char* targetModule, const char* originModule,
+                            const char* targetTransportJson,
+                            const char* capabilityTransportJson)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->client_create(delegate->context, targetModule, targetTransportJson,
+                                       capabilityTransportJson);
+    lp_client* client = clientCreateLocal(targetModule, originModule, targetTransportJson,
+                                          capabilityTransportJson);
+    if (client) gLocalClients.fetch_add(1);
+    return client;
+}
+
+void lp_client_destroy(lp_client* client)
+{
+    if (const auto* delegate = activeDelegate()) {
+        if (client) delegate->client_destroy(delegate->context, client);
+        return;
+    }
+    clientDestroyLocal(client);
+}
+
+int lp_invoke(lp_client* client, const char* method, const char* argsJson, int timeout,
+              char** outResultJson, char** outErrorJson)
+{
+    if (const auto* delegate = activeDelegate()) {
+        char* result = nullptr;
+        char* error = nullptr;
+        const int status = delegate->invoke(delegate->context, client, method, argsJson, timeout,
+                                            &result, &error);
+        if (outResultJson) *outResultJson = adoptHostString(delegate, result);
+        else if (result) delegate->string_free(delegate->context, result);
+        if (outErrorJson) *outErrorJson = adoptHostString(delegate, error);
+        else if (error) delegate->string_free(delegate->context, error);
+        return status;
+    }
+    return invokeLocal(client, method, argsJson, timeout, outResultJson, outErrorJson);
+}
+
+int lp_invoke_async(lp_client* client, const char* method, const char* argsJson, int timeout,
+                    lp_result_cb callback, void* userData)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->invoke_async(delegate->context, client, method, argsJson, timeout,
+                                      callback, userData);
+    return invokeAsyncLocal(client, method, argsJson, timeout, callback, userData);
+}
+
+lp_subscription* lp_subscribe(lp_client* client, const char* eventName, lp_event_cb callback,
+                              void* userData)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->subscribe(delegate->context, client, eventName, callback, userData);
+    return subscribeLocal(client, eventName, callback, userData);
+}
+
+int lp_client_set_subscription_status_cb(lp_client* client, lp_subscription_status_cb callback,
+                                         void* userData)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->set_subscription_status_cb(delegate->context, client, callback,
+                                                    userData);
+    return setSubscriptionStatusCbLocal(client, callback, userData);
+}
+
+unsigned long long lp_client_subscription_generation(lp_client* client)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->subscription_generation(delegate->context, client);
+    return subscriptionGenerationLocal(client);
+}
+
+int lp_client_set_subscription_options(lp_client* client, const char* optionsJson)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->set_subscription_options(delegate->context, client, optionsJson);
+    return setSubscriptionOptionsLocal(client, optionsJson);
+}
+
+int lp_client_rearm_subscriptions(lp_client* client)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->rearm_subscriptions(delegate->context, client);
+    return rearmSubscriptionsLocal(client);
+}
+
+void lp_unsubscribe(lp_subscription* subscription)
+{
+    if (const auto* delegate = activeDelegate()) {
+        if (subscription) delegate->unsubscribe(delegate->context, subscription);
+        return;
+    }
+    unsubscribeLocal(subscription);
+}
+
+char* lp_pending_subscriptions(lp_client* client)
+{
+    if (const auto* delegate = activeDelegate())
+        return adoptHostString(delegate, delegate->pending_subscriptions(delegate->context,
+                                                                         client));
+    return pendingSubscriptionsLocal(client);
+}
+
+char* lp_get_methods(lp_client* client)
+{
+    if (const auto* delegate = activeDelegate())
+        return adoptHostString(delegate, delegate->get_methods(delegate->context, client));
+    return getMethodsLocal(client);
+}
+
+int lp_inform_module_token(lp_client* client, const char* authToken, const char* moduleName,
+                           const char* token)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->inform_module_token(delegate->context, client, authToken, moduleName,
+                                             token);
+    return informModuleTokenLocal(client, authToken, moduleName, token);
+}
+
+int lp_inform_module_token_to(lp_client* client, const char* authToken, const char* originModule,
+                              const char* moduleName, const char* token, int timeout)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->inform_module_token_to(delegate->context, client, authToken,
+                                                originModule, moduleName, token, timeout);
+    if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return informModuleTokenTo(client ? client->state->origin : std::string(kRuntimePrincipal),
+                               authToken, originModule, moduleName, token, timeout);
+}
+
+char* lp_token_digest(const char* token)
+{
+    return token ? duplicate(tokenDigest(token)) : nullptr;
+}
+
+int lp_revoke_module_token_to(lp_client* client, const char* authToken, const char* originModule,
+                              const char* moduleName, const char* tokenDigest, int timeout)
+{
+    if (const auto* delegate = activeDelegate())
+        return delegate->revoke_module_token_to(delegate->context, client, authToken,
+                                                originModule, moduleName, tokenDigest, timeout);
+    if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return revokeModuleTokenTo(client ? client->state->origin : std::string(kRuntimePrincipal),
+                               authToken, originModule, moduleName, tokenDigest, timeout);
+}
+
+} // extern "C"
+
+namespace {
+
+// The host half of a delegate: one module identity, its grants, and the
+// clients and subscriptions it holds, so release can end them all.
+struct DelegateContext {
+    lp_runtime_delegate_v1 table{};
+    std::string identity;
+    unsigned grants = 0;
+    std::mutex mutex;
+    std::condition_variable idle;
+    bool released = false;
+    unsigned inflight = 0;
+    std::set<lp_client*> clients;
+    std::set<lp_subscription*> subscriptions;
+};
+
+// Counts a call through the table so release waits for it; `owns` checks a
+// handle came from this identity.
+class ContextCall {
+public:
+    explicit ContextCall(void* context) : m_context(*static_cast<DelegateContext*>(context))
+    {
+        std::lock_guard<std::mutex> lock(m_context.mutex);
+        m_open = !m_context.released;
+        if (m_open) ++m_context.inflight;
+    }
+    ~ContextCall()
+    {
+        if (!m_open) return;
+        std::lock_guard<std::mutex> lock(m_context.mutex);
+        --m_context.inflight;
+        m_context.idle.notify_all();
+    }
+    ContextCall(const ContextCall&) = delete;
+    ContextCall& operator=(const ContextCall&) = delete;
+
+    bool open() const { return m_open; }
+    DelegateContext& context() { return m_context; }
+    bool owns(lp_client* client)
+    {
+        std::lock_guard<std::mutex> lock(m_context.mutex);
+        return client && m_context.clients.count(client) != 0;
+    }
+
+private:
+    DelegateContext& m_context;
+    bool m_open = false;
+};
+
+lp_client* delegateClientCreate(void* context, const char* target, const char* targetTransport,
+                                const char* capabilityTransport)
+{
+    ContextCall call(context);
+    if (!call.open()) return nullptr;
+    lp_client* client = clientCreateLocal(target, call.context().identity.c_str(),
+                                          targetTransport, capabilityTransport);
+    if (client) {
+        std::lock_guard<std::mutex> lock(call.context().mutex);
+        call.context().clients.insert(client);
+    }
+    return client;
+}
+
+void delegateClientDestroy(void* context, lp_client* client)
+{
+    ContextCall call(context);
+    if (!call.open()) return;
+    {
+        std::lock_guard<std::mutex> lock(call.context().mutex);
+        if (!call.context().clients.erase(client)) return;
+    }
+    clientDestroyLocal(client);
+}
+
+int delegateInvoke(void* context, lp_client* client, const char* method, const char* args,
+                   int timeout, char** result, char** error)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return LP_ERR_UNAVAILABLE;
+    return invokeLocal(client, method, args, timeout, result, error);
+}
+
+int delegateInvokeAsync(void* context, lp_client* client, const char* method, const char* args,
+                        int timeout, lp_result_cb callback, void* userData)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return LP_ERR_UNAVAILABLE;
+    return invokeAsyncLocal(client, method, args, timeout, callback, userData);
+}
+
+lp_subscription* delegateSubscribe(void* context, lp_client* client, const char* event,
+                                   lp_event_cb callback, void* userData)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return nullptr;
+    lp_subscription* subscription = subscribeLocal(client, event, callback, userData);
+    if (subscription) {
+        std::lock_guard<std::mutex> lock(call.context().mutex);
+        call.context().subscriptions.insert(subscription);
+    }
+    return subscription;
+}
+
+void delegateUnsubscribe(void* context, lp_subscription* subscription)
+{
+    ContextCall call(context);
+    if (!call.open()) return;
+    {
+        std::lock_guard<std::mutex> lock(call.context().mutex);
+        if (!call.context().subscriptions.erase(subscription)) return;
+    }
+    unsubscribeLocal(subscription);
+}
+
+int delegateStatusCb(void* context, lp_client* client, lp_subscription_status_cb callback,
+                     void* userData)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return 0;
+    return setSubscriptionStatusCbLocal(client, callback, userData);
+}
+
+unsigned long long delegateGeneration(void* context, lp_client* client)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return 0;
+    return subscriptionGenerationLocal(client);
+}
+
+int delegateOptions(void* context, lp_client* client, const char* options)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return 0;
+    return setSubscriptionOptionsLocal(client, options);
+}
+
+int delegateRearm(void* context, lp_client* client)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return 0;
+    return rearmSubscriptionsLocal(client);
+}
+
+char* delegatePending(void* context, lp_client* client)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return nullptr;
+    return pendingSubscriptionsLocal(client);
+}
+
+char* delegateMethods(void* context, lp_client* client)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return nullptr;
+    return getMethodsLocal(client);
+}
+
+int delegateInform(void* context, lp_client* client, const char* auth, const char* module,
+                   const char* token)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return LP_ERR_UNAVAILABLE;
+    return informModuleTokenLocal(client, auth, module, token);
+}
+
+// The grant is the identity's own, and the pusher is always that identity.
+int delegateInformTo(void* context, lp_client*, const char* auth, const char* origin,
+                     const char* module, const char* token, int timeout)
+{
+    ContextCall call(context);
+    if (!call.open()) return LP_ERR_UNAVAILABLE;
+    if (!(call.context().grants & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return informModuleTokenTo(call.context().identity, auth, origin, module, token, timeout);
+}
+
+int delegateRevokeTo(void* context, lp_client*, const char* auth, const char* origin,
+                     const char* module, const char* digest, int timeout)
+{
+    ContextCall call(context);
+    if (!call.open()) return LP_ERR_UNAVAILABLE;
+    if (!(call.context().grants & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return revokeModuleTokenTo(call.context().identity, auth, origin, module, digest, timeout);
+}
+
+void delegateStringFree(void*, char* value) { lp_string_free(value); }
+
+} // namespace
+
+extern "C" {
+
+const lp_runtime_delegate_v1* lp_runtime_delegate_create(const char* identity,
+                                                         const char* grantsJson)
+try {
+    if (!identity || !*identity || isRuntimePrincipal(identity) || identity[0] == '@')
+        return nullptr;
+    unsigned grants = 0;
+    if (!parseHostServices(grantsJson, grants)) return nullptr;
+    {
+        // Never the host's store, and never without a credential of its own.
+        std::lock_guard<std::mutex> lock(gTokenMutex);
+        const auto found = gIdentityTokens.find(identity);
+        if (found == gIdentityTokens.end()) return nullptr;
+        std::lock_guard<std::mutex> storeLock(found->second->mutex);
+        if (found->second->credential.empty()) return nullptr;
+    }
+    auto* context = new DelegateContext();
+    context->identity = identity;
+    context->grants = grants;
+    auto& table = context->table;
+    table.size = sizeof(lp_runtime_delegate_v1);
+    table.version = LP_RUNTIME_DELEGATE_VERSION;
+    table.context = context;
+    table.client_create = delegateClientCreate;
+    table.client_destroy = delegateClientDestroy;
+    table.invoke = delegateInvoke;
+    table.invoke_async = delegateInvokeAsync;
+    table.subscribe = delegateSubscribe;
+    table.unsubscribe = delegateUnsubscribe;
+    table.set_subscription_status_cb = delegateStatusCb;
+    table.subscription_generation = delegateGeneration;
+    table.set_subscription_options = delegateOptions;
+    table.rearm_subscriptions = delegateRearm;
+    table.pending_subscriptions = delegatePending;
+    table.get_methods = delegateMethods;
+    table.inform_module_token = delegateInform;
+    table.inform_module_token_to = delegateInformTo;
+    table.revoke_module_token_to = delegateRevokeTo;
+    table.string_free = delegateStringFree;
+    return &context->table;
+} catch (...) {
+    return nullptr;
+}
+
+void lp_runtime_delegate_release(const lp_runtime_delegate_v1* delegate)
+{
+    if (!delegate || !delegate->context) return;
+    auto& context = *static_cast<DelegateContext*>(delegate->context);
+    std::set<lp_client*> clients;
+    std::set<lp_subscription*> subscriptions;
+    {
+        std::unique_lock<std::mutex> lock(context.mutex);
+        if (context.released) return;
+        context.released = true;
+        context.idle.wait(lock, [&] { return context.inflight == 0; });
+        clients.swap(context.clients);
+        subscriptions.swap(context.subscriptions);
+    }
+    for (lp_subscription* subscription : subscriptions) unsubscribeLocal(subscription);
+    for (lp_client* client : clients) clientDestroyLocal(client);
+}
+
+// The shared runtime is the host's: it refuses, but still defines the symbol
+// because Windows builds its export table from the static archive.
+int lp_runtime_install_delegate(const lp_runtime_delegate_v1* delegate)
+{
+#ifdef LOGOS_PROTOCOL_BUILDING_SHARED
+    (void)delegate;
+    return LP_ERR_UNSUPPORTED;
+#else
+    if (!delegate || delegate->size < sizeof(lp_runtime_delegate_v1)
+        || delegate->version < LP_RUNTIME_DELEGATE_VERSION)
+        return LP_ERR_INVALID_ARG;
+    if (gLocalClients.load() != 0) return LP_ERR_UNSUPPORTED;
+    const lp_runtime_delegate_v1* expected = nullptr;
+    return gDelegate.compare_exchange_strong(expected, delegate) ? LP_OK : LP_ERR_UNSUPPORTED;
+#endif
 }
 
 } // extern "C"
