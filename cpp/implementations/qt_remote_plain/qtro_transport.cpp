@@ -1549,6 +1549,25 @@ struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
                             found = true;
                         }
                     }
+                    if (found && callKind == 0 && object.invoke && object.runsInline
+                        && object.runsInline(methodIndex)) {
+                        Variant result;
+                        try {
+                            result = object.invoke(methodIndex, arguments);
+                        } catch (...) {
+                            result = Variant::fromRpc(plain::RpcValue{});
+                        }
+                        if (serial >= 0) {
+                            std::vector<std::uint8_t> reply;
+                            try {
+                                reply = invokeReplyPacket(frame.name, serial, result);
+                            } catch (const std::exception&) {
+                                reply = invokeReplyPacket(frame.name, serial, Variant{});
+                            }
+                            (void)send(connection, std::move(reply));
+                        }
+                        continue;
+                    }
                     if (found && callKind == 0 && object.invoke) {
                         auto state = shared_from_this();
                         const std::string objectName = std::move(frame.name);
