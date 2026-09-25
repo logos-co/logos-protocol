@@ -24,13 +24,14 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/include/cpp/implementations/qt_remote_plain
     mkdir -p $out/include/cpp/implementations/mock
     mkdir -p $out/include/cpp/implementations/plain
+    mkdir -p $out/include/cpp/implementations/plain_local
 
     # Top-level headers + sources (source-export layout)
     for file in cpp/*.h cpp/*.cpp; do
       cp "$file" $out/include/cpp/
     done
 
-    for dir in qt_local qt_remote qt_remote_plain mock plain; do
+    for dir in qt_local qt_remote qt_remote_plain mock plain plain_local; do
       for file in cpp/implementations/$dir/*; do
         cp "$file" $out/include/cpp/implementations/$dir/
       done

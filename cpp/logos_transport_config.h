@@ -21,6 +21,7 @@ enum class LogosProtocol {
     Tcp,           // Plain TCP (Boost.Asio + JSON framing)
     TcpSsl,        // TCP + TLS (Boost.Asio + OpenSSL + JSON framing)
     QtRemotePlain, // QtRO 2.0-compatible local IPC implemented without Qt
+    Inproc,        // a provider in this process (plain runtime only; the Qt runtime refuses it)
     // Noise, Quic — future work
 };
 

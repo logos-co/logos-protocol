@@ -1,5 +1,6 @@
 #include "logos_protocol.h"
 
+#include "implementations/plain_local/inproc_transport.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_network.h"
 #include "logos_protocol_plain_tokens.h"
@@ -235,6 +236,30 @@ std::string endpoint(const std::string& module)
     return "local:logos_" + module + "_" + instanceId();
 }
 
+// The engine's own identity on a bound connection; "core" is its older name.
+// Neither can be a module name.
+constexpr const char* kRuntimePrincipal = "@runtime";
+
+bool isRuntimePrincipal(const std::string& principal)
+{
+    return principal == kRuntimePrincipal || principal == "core";
+}
+
+bool isNetworkProtocol(LogosProtocol protocol)
+{
+    return protocol == LogosProtocol::Tcp || protocol == LogosProtocol::TcpSsl;
+}
+
+// A target meant for the local socket, or named inproc, is reached in-process
+// when its provider serves inproc here; the socket stays the fallback for the former.
+bool reachesInproc(const LogosTransportConfig& config, const std::string& module)
+{
+    if (config.protocol == LogosProtocol::Inproc) return true;
+    return (config.protocol == LogosProtocol::QtRemotePlain
+            || config.protocol == LogosProtocol::LocalSocket)
+        && logos::plain::inproc::isPublished(instanceId(), module);
+}
+
 std::mutex gDefaultMutex;
 std::string gDefaultTransport = R"({"protocol":"qt_remote_plain"})";
 
@@ -359,6 +384,9 @@ struct ClientState {
     std::deque<std::optional<EventMessage>> events;
     std::shared_ptr<Client> wire = std::make_shared<Client>();
     std::shared_ptr<RpcConnectionBase> networkWire;
+    // networkWire carries the calls (tcp, tls or inproc), not the qtro wire.
+    // Guarded by connectionMutex.
+    bool rpcRoute = false;
     LogosTransportConfig targetConfig;
     LogosTransportConfig capabilityConfig;
     std::string target;
@@ -623,13 +651,24 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         error = "connection timed out";
         return fail("timeout");
     }
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
-        if (state->networkWire && state->networkWire->isOpen()) return true;
+    if (state->rpcRoute && state->networkWire && state->networkWire->isOpen()) return true;
+    if (!state->rpcRoute && !isNetworkProtocol(state->targetConfig.protocol)
+        && state->targetConfig.protocol != LogosProtocol::Inproc
+        && state->wire->isConnected())
+        return true;
+    // Not connected: the route is chosen again, so a provider that moved into or
+    // out of this process is followed.
+    std::shared_ptr<RpcConnectionBase> wire;
+    if (isNetworkProtocol(state->targetConfig.protocol)) {
         if (state->networkWire) state->networkWire->stop("reconnecting");
-        auto wire = logos::plain::abi::connect(
-            state->targetConfig, remaining, error, &state->alive);
+        wire = logos::plain::abi::connect(state->targetConfig, remaining, error, &state->alive);
         if (!wire) return fail("object_unavailable");
+    } else if (reachesInproc(state->targetConfig, state->target)) {
+        if (state->networkWire) state->networkWire->stop("reconnecting");
+        wire = logos::plain::inproc::connect(instanceId(), state->target, state->origin, error);
+        if (!wire) return fail("object_unavailable");
+    }
+    if (wire) {
         if (!state->alive) {
             wire->stop("client destroyed");
             error = "client destroyed";
@@ -649,12 +688,22 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
                 if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
             });
         state->networkWire = std::move(wire);
+        state->rpcRoute = true;
+        if (!state->eventWorker.joinable())
+            state->eventWorker = std::thread([state] { networkEventLoop(state); });
         return true;
     }
+    state->rpcRoute = false;
     if (state->wire->isConnected()) return true;
     Client::Failure failure = Client::Failure::Transport;
     if (state->wire->connect(endpoint(state->target), remaining, &error, &failure)) return true;
     return fail(callErrorCode(failure));
+}
+
+bool onRpcRoute(const std::shared_ptr<ClientState>& state)
+{
+    std::lock_guard<std::timed_mutex> lock(state->connectionMutex);
+    return state->rpcRoute;
 }
 
 void subscriptionLoop(const std::shared_ptr<ClientState>& state)
@@ -684,13 +733,13 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         std::string error;
         // QtRO's local retry tick; a network dial (DNS, TCP, TLS) gets the
         // 5 s the Qt-side network client gave it.
-        const bool network = state->targetConfig.protocol == LogosProtocol::Tcp
-            || state->targetConfig.protocol == LogosProtocol::TcpSsl;
+        const bool network = isNetworkProtocol(state->targetConfig.protocol);
         bool acquired = ensureConnected(state, network ? 5000 : 250, error);
-        if (acquired && state->targetConfig.protocol == LogosProtocol::QtRemotePlain) {
+        if (acquired) {
             std::lock_guard<std::timed_mutex> connectionLock(state->connectionMutex);
-            acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
-                                             &error);
+            if (!state->rpcRoute)
+                acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
+                                                 &error);
         }
 
         if (!acquired) {
@@ -887,11 +936,13 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
     const std::string credential = tokenGet(state->tokens, "capability_module");
-    if (state->capabilityConfig.protocol == LogosProtocol::Tcp
-        || state->capabilityConfig.protocol == LogosProtocol::TcpSsl) {
-        auto wire = logos::plain::abi::connect(
-            state->capabilityConfig, std::chrono::milliseconds(timeout), error,
-            &state->alive);
+    const bool network = isNetworkProtocol(state->capabilityConfig.protocol);
+    if (network || reachesInproc(state->capabilityConfig, "capability_module")) {
+        auto wire = network
+            ? logos::plain::abi::connect(state->capabilityConfig,
+                                         std::chrono::milliseconds(timeout), error, &state->alive)
+            : logos::plain::inproc::connect(instanceId(), "capability_module", state->origin,
+                                            error);
         if (!wire) return {};
         CallMessage request;
         request.id = wire->nextId();
@@ -1004,9 +1055,13 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count()));
     };
-    std::string token = tokenFor(state, remaining(), error);
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+    // The engine's in-process connection is its identity: it needs no token.
+    std::string token;
+    if (!(isRuntimePrincipal(state->origin) && reachesInproc(state->targetConfig, state->target)))
+        token = tokenFor(state, remaining(), error);
+    // Connecting decides the route the call takes.
+    if (!ensureConnected(state, remaining(), error, &code)) return std::nullopt;
+    if (onRpcRoute(state)) {
         auto result = networkCall(state, state->target, method, args, token,
                                   remaining(), error, code, sent);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
@@ -1163,6 +1218,7 @@ struct lp_provider {
     Server server;
     bool qtroStarted = false;
     std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networkEndpoints;
+    std::shared_ptr<logos::plain::inproc::Endpoint> inproc;
     lp_dispatch_cb dispatch = nullptr;
     lp_getmethods_cb getMethods = nullptr;
     lp_token_cb onToken = nullptr;
@@ -1208,8 +1264,10 @@ bool isAnchorKey(const std::string& key)
 // never names, and a value two callers share names neither; a token the host's
 // validator accepts is authorized too, and named by no one.
 std::string providerCaller(lp_provider* provider, const std::string& token,
-                           const char* protocol = "local")
+                           const char* protocol = "local",
+                           const std::string* principal = nullptr)
 {
+    if (principal && isRuntimePrincipal(*principal)) return R"({"kind":"host"})";
     if (token.empty()) return {};
     lp_validate_token_cb validate = nullptr;
     void* validatorData = nullptr;
@@ -1282,10 +1340,12 @@ std::string providerReturnType(lp_provider* provider, const std::string& method)
 // Recorded only once the module took it: a refused push must not later
 // authorize, or name, whoever presents that token.
 bool providerAcceptToken(lp_provider* provider, const std::string& auth,
-                         const std::string& module, const std::string& token)
+                         const std::string& module, const std::string& token,
+                         const std::string* principal = nullptr)
 {
-    bool trusted = false;
-    {
+    bool trusted = principal
+        && (isRuntimePrincipal(*principal) || *principal == "capability_module");
+    if (!trusted) {
         std::lock_guard<std::mutex> lock(provider->mutex);
         trusted = !provider->credential.empty() && constantTimeEquals(provider->credential, auth);
     }
@@ -1364,9 +1424,20 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
 }
 
 
+// On a bound connection a token may authorize only the principal it names.
+bool bindingMismatch(const std::string& caller, const std::string& principal)
+{
+    const json document = json::parse(caller, nullptr, false);
+    if (!document.is_object()) return false;
+    const std::string kind = stringField(document, "kind");
+    if (kind == "host") return !isRuntimePrincipal(principal);
+    return kind == "module" && stringField(document, "name") != principal;
+}
+
 ResultMessage providerNetworkCall(lp_provider* provider,
                                   const CallMessage& request,
-                                  const char* protocol)
+                                  const char* protocol,
+                                  const std::string* principal = nullptr)
 {
     ResultMessage reply;
     reply.id = request.id;
@@ -1384,7 +1455,7 @@ ResultMessage providerNetworkCall(lp_provider* provider,
         }
         reply.ok = true;
         reply.value = RpcValue{providerAcceptToken(provider, request.authToken,
-            request.args[0].asString(), request.args[1].asString())};
+            request.args[0].asString(), request.args[1].asString(), principal)};
         return reply;
     }
     if (!provider->registered) {
@@ -1400,10 +1471,16 @@ ResultMessage providerNetworkCall(lp_provider* provider,
             : request.method == "getPluginEvents" ? "events" : "interface"));
         return reply;
     }
-    const std::string caller = providerCaller(provider, request.authToken, protocol);
+    const std::string caller = providerCaller(provider, request.authToken, protocol, principal);
     if (caller.empty()) {
         reply.ok = true;
         reply.value = jsonToRpc(json{{kStatusKey, "unauthorized"}});
+        return reply;
+    }
+    if (principal && bindingMismatch(caller, *principal)) {
+        // Not the unauthorized sentinel: a new token would not make it match.
+        reply.err = "the token names another caller than this connection's";
+        reply.errCode = "BINDING_MISMATCH";
         return reply;
     }
     json args = json::array();
@@ -1459,6 +1536,33 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
     }
     reply.ok = true;
     return reply;
+}
+
+} // namespace
+
+namespace {
+
+// informModuleToken over an in-process connection bound to `principal`.
+int pushTokenInproc(const std::string& target, const std::string& principal,
+                    const std::string& authToken, const std::string& moduleName,
+                    const std::string& token, int timeout)
+{
+    std::string error;
+    auto wire = logos::plain::inproc::connect(instanceId(), target, principal, error);
+    if (!wire) return LP_ERR_INTERNAL;
+    CallMessage request;
+    request.id = wire->nextId();
+    request.authToken = authToken;
+    request.object = target;
+    request.method = "informModuleToken";
+    request.args = {RpcValue{moduleName}, RpcValue{token}};
+    auto future = wire->sendCall(std::move(request));
+    const bool answered = future.wait_for(std::chrono::milliseconds(timeoutMs(timeout)))
+        == std::future_status::ready;
+    wire->stop("token delivered");
+    if (!answered) return LP_ERR_INTERNAL;
+    const ResultMessage result = future.get();
+    return result.ok && result.value.isBool() && result.value.asBool() ? LP_OK : LP_ERR_INTERNAL;
 }
 
 } // namespace
@@ -1842,8 +1946,8 @@ try {
     if (!client) return nullptr;
     const auto& state = client->state;
     std::string error;
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl) {
+    if (!ensureConnected(state, kDefaultTimeoutMs, error)) return nullptr;
+    if (onRpcRoute(state)) {
         std::string code;
         auto result = networkCall(state, state->target, "getPluginInterface", json::array(), {},
                                   kDefaultTimeoutMs, error, code);
@@ -1859,7 +1963,6 @@ try {
         const auto legacy = legacyInterface(part("getPluginMethods"), part("getPluginEvents"));
         return legacy ? duplicate(dumpJson(*legacy)) : nullptr;
     }
-    if (!ensureConnected(state, kDefaultTimeoutMs, error)) return nullptr;
     Client& wire = *state->wire;
     const auto timeout = std::chrono::milliseconds(kDefaultTimeoutMs);
     if (!wire.acquire(state->target, timeout, &error)) return nullptr;
@@ -1997,6 +2100,9 @@ try {
                             Variant::fromRpc(RpcValue{moduleName}),
                             Variant::fromRpc(RpcValue{token})};
     std::string error;
+    if (!isNetworkProtocol(config.protocol) && reachesInproc(config, "capability_module"))
+        return pushTokenInproc("capability_module", state->origin, authToken, moduleName, token,
+                               kDefaultTimeoutMs);
     if (config.protocol == LogosProtocol::Tcp || config.protocol == LogosProtocol::TcpSsl) {
         if (own) {
             if (!ensureConnected(state, kDefaultTimeoutMs, error)) return LP_ERR_INTERNAL;
@@ -2038,13 +2144,16 @@ try {
     return LP_ERR_INTERNAL;
 }
 
-int lp_inform_module_token_to(lp_client*, const char* authToken,
+int lp_inform_module_token_to(lp_client* client, const char* authToken,
                               const char* originModule, const char* moduleName,
                               const char* token, int timeout)
 try {
     if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
     if (!authToken || !originModule || !*originModule || !moduleName || !token)
         return LP_ERR_INVALID_ARG;
+    if (logos::plain::inproc::isPublished(instanceId(), originModule))
+        return pushTokenInproc(originModule, client ? client->state->origin : kRuntimePrincipal,
+                               authToken, moduleName, token, timeout);
     std::string error;
     Client target;
     const int wait = timeoutMs(timeout);
@@ -2101,6 +2210,7 @@ void lp_provider_destroy(lp_provider* provider)
     if (!provider) return;
     // Stop waits for every outstanding connection handler before the callback
     // pointers and module-owned user data in `provider` can be destroyed.
+    logos::plain::inproc::withdraw(provider->inproc);
     for (auto& endpoint : provider->networkEndpoints) endpoint->stop();
     provider->networkEndpoints.clear();
     provider->server.stop();
@@ -2124,7 +2234,42 @@ try {
         local.protocol = LogosProtocol::QtRemotePlain;
         transports.push_back(local);
     }
+    const auto unwind = [provider] {
+        logos::plain::inproc::withdraw(provider->inproc);
+        provider->inproc.reset();
+        for (auto& active : provider->networkEndpoints) active->stop();
+        provider->networkEndpoints.clear();
+        provider->server.stop();
+    };
     for (const auto& config : transports) {
+        if (config.protocol == LogosProtocol::Inproc) {
+            if (provider->inproc) continue;
+            logos::plain::inproc::Handlers handlers;
+            handlers.call = [provider](const CallMessage& request, const std::string& principal) {
+                return providerNetworkCall(provider, request, "local", &principal);
+            };
+            handlers.control = handlers.call;
+            handlers.methods = [provider](const logos::plain::MethodsMessage& request) {
+                return providerNetworkMethods(provider, request);
+            };
+            handlers.token = [provider](const logos::plain::TokenMessage& request,
+                                        const std::string& principal) {
+                return providerAcceptToken(provider, request.authToken, request.moduleName,
+                                           request.token, &principal);
+            };
+            std::size_t workers = 0;
+            {
+                std::lock_guard<std::mutex> lock(provider->gate.mutex);
+                workers = provider->gate.capacity;
+            }
+            provider->inproc = logos::plain::inproc::publish(
+                instanceId(), provider->moduleName, std::move(handlers), workers);
+            if (!provider->inproc) {
+                unwind();
+                return LP_ERR_INTERNAL;
+            }
+            continue;
+        }
         if (config.protocol == LogosProtocol::QtRemotePlain
             || config.protocol == LogosProtocol::LocalSocket) {
             if (provider->qtroStarted) continue;
@@ -2135,14 +2280,16 @@ try {
                         return providerInvoke(provider, true, index, args);
                     },
                     [](std::int32_t) { return true; }}, &error)) {
-                provider->server.stop();
+                unwind();
                 return LP_ERR_INTERNAL;
             }
             provider->qtroStarted = true;
             continue;
         }
-        if (config.protocol != LogosProtocol::Tcp
-            && config.protocol != LogosProtocol::TcpSsl) return LP_ERR_UNSUPPORTED;
+        if (!isNetworkProtocol(config.protocol)) {
+            unwind();
+            return LP_ERR_UNSUPPORTED;
+        }
         const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
         auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
             [provider, label](const CallMessage& request) {
@@ -2156,9 +2303,7 @@ try {
                                     request.moduleName, request.token);
             });
         if (!network->start()) {
-            for (auto& active : provider->networkEndpoints) active->stop();
-            provider->networkEndpoints.clear();
-            provider->server.stop();
+            unwind();
             return LP_ERR_INTERNAL;
         }
         provider->networkEndpoints.push_back(std::move(network));
@@ -2221,6 +2366,7 @@ try {
     for (const auto& item : data) arguments.push_back(jsonToRpc(item));
     for (auto& endpoint : provider->networkEndpoints)
         endpoint->emit(provider->moduleName, eventName, arguments);
+    logos::plain::inproc::emit(provider->inproc, provider->moduleName, eventName, arguments);
     if (!provider->qtroStarted) return LP_OK;
     Variant payload = jsonToVariant(data);
     if (!resultType.empty()) payload.nestedValues[1] = resultVariant(data[1], resultType);
@@ -2265,6 +2411,7 @@ int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned maxCall
         provider->gate.capacity = maxCalls > 0 ? maxCalls : 64;
         provider->gate.changed.notify_all();
     }
+    logos::plain::inproc::setMaxWorkers(provider->inproc, maxCalls);
     return LP_OK;
 }
 

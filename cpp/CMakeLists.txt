@@ -52,6 +52,12 @@ set(LOGOS_PLAIN_NETWORK_SOURCES
     implementations/plain/io_context_pool.cpp
 )
 
+# plain_local: the in-process transport, part of the Qt-free runtime only.
+set(LOGOS_PLAIN_LOCAL_SOURCES
+    implementations/plain_local/inproc_transport.cpp
+    implementations/plain_local/inproc_transport.h
+)
+
 add_library(logos_socket_paths STATIC
     logos_socket_paths.cpp
     logos_socket_paths.h
@@ -109,6 +115,7 @@ add_library(logos_protocol_plain STATIC
     logos_protocol_plain_network.cpp
     logos_protocol_plain_network.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
+    ${LOGOS_PLAIN_LOCAL_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
@@ -143,6 +150,7 @@ add_library(logos_protocol_plain_shared SHARED
     logos_protocol_plain_network.cpp
     logos_protocol_plain_network.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
+    ${LOGOS_PLAIN_LOCAL_SOURCES}
     logos_protocol.h
     logos_transport_config_json.cpp
     logos_transport_config_json.h
