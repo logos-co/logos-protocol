@@ -87,6 +87,7 @@ char* dispatch(const char* method, const char* argsJson, void* userData)
         --module.running;
         return copyText("true");
     }
+    if (std::strcmp(method, "unanswered") == 0) return nullptr;
     return copyText("null");
 }
 
@@ -262,6 +263,30 @@ TEST(PlainLocalInproc, AnExplicitInprocTargetNeverFallsBackToTheSocket)
     // The socket still serves a client that asked for it.
     lp_client* socket = lp_client_create("inproc_explicit", "caller", nullptr, nullptr);
     EXPECT_EQ(invoke(socket, "echo", R"(["x"])").status, LP_OK);
+    lp_client_destroy(socket);
+    lp_provider_destroy(provider);
+}
+
+// A method the module does not answer reads the same in-process as over the
+// socket: a null value, which a caller tells from a failure by the method list.
+TEST(PlainLocalInproc, AnUnansweredMethodIsNullAsOverTheSocket)
+{
+    useInstance("inproc_unanswered_");
+    Module module;
+    lp_provider* provider = startProvider(
+        "inproc_unanswered", R"([{"protocol":"qt_remote_plain"},{"protocol":"inproc"}])", module);
+    ASSERT_NE(provider, nullptr);
+    ASSERT_EQ(lp_token_save("inproc_unanswered", "secret"), LP_OK);
+    lp_client* socket = lp_client_create("inproc_unanswered", "caller",
+                                         R"({"protocol":"qt_remote_plain"})", nullptr);
+    lp_client* inproc = lp_client_create("inproc_unanswered", "caller",
+                                         R"({"protocol":"inproc"})", nullptr);
+    const Invocation overSocket = invoke(socket, "unanswered", "[]");
+    const Invocation inProcess = invoke(inproc, "unanswered", "[]");
+    ASSERT_EQ(overSocket.status, LP_OK) << overSocket.error.dump();
+    EXPECT_EQ(inProcess.status, LP_OK) << inProcess.error.dump();
+    EXPECT_EQ(inProcess.result, overSocket.result);
+    lp_client_destroy(inproc);
     lp_client_destroy(socket);
     lp_provider_destroy(provider);
 }

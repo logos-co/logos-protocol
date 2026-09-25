@@ -1623,7 +1623,13 @@ ResultMessage providerNetworkCall(lp_provider* provider,
                                   provider->userData);
         gCurrentCaller = previousCaller;
     }
+    // In-process, a method the module does not answer reads as it does over
+    // qt_remote_plain: a null value, not a failure (only inproc passes a principal).
     if (!text) {
+        if (principal) {
+            reply.ok = true;
+            return reply;
+        }
         reply.err = "method failed";
         reply.errCode = "METHOD_FAILED";
         return reply;
@@ -1631,6 +1637,10 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     const json result = json::parse(text, nullptr, false);
     lp_string_free(text);
     if (result.is_discarded()) {
+        if (principal) {
+            reply.ok = true;
+            return reply;
+        }
         reply.err = "invalid method result";
         reply.errCode = "METHOD_FAILED";
         return reply;
