@@ -1051,6 +1051,8 @@ LP_API int lp_provider_set_max_concurrent_calls(lp_provider* provider,
  *  return a heap string (freed with lp_string_free):
  *    {"caller":{"kind":"remote","peer":"...","name":"..."} or {"kind":"operator","name":"..."},
  *     "lifetime_ms":<n>,"session":{<metadata close/extend filters match>}}
+ *  A session whose metadata says "calls": false may introspect and subscribe,
+ *  and every other call on it is refused.
  *  or {"error":"..."} / NULL to refuse. Runs on a worker thread, never the I/O
  *  thread; a host document is always refused. */
 typedef char* (*lp_session_authenticator_cb)(const char* request_json, void* user_data);

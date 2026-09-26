@@ -425,6 +425,21 @@ TEST(RemoteSession, AnUnanchoredDialStillNeedsTheServerPurpose)
     EXPECT_EQ(f.state.authCount(), 0);
 }
 
+TEST(RemoteSession, ASessionBoundWithoutCallsOnlyLooks)
+{
+    Fixture f;
+    f.state.reply = R"({"caller":{"kind":"remote","peer":"peer-1","name":"runtime"},"lifetime_ms":60000,)"
+                    R"("session":{"peer":"peer-1","calls":false}})";
+    f.start();
+    json result;
+    json error;
+    EXPECT_NE(f.invoke("echo", R"(["hello"])", &result, &error), LP_OK);
+    EXPECT_EQ(error.value("code", ""), "unauthorized");
+    char* methods = lp_get_methods(f.consumer);
+    EXPECT_NE(methods, nullptr);
+    lp_string_free(methods);
+}
+
 TEST(RemoteSession, ExtendingASessionKeepsItOpen)
 {
     Fixture f;
