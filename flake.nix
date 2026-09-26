@@ -1,7 +1,7 @@
 {
   description = "Logos Protocol - transports, token exchange and the language-neutral lp_* C ABI";
 
-  inputs.logos-nix.url = "github:logos-co/logos-nix";
+  inputs.logos-nix.url = "github:logos-co/logos-nix/feat/standalone-apps";
   inputs.nixpkgs.follows = "logos-nix/nixpkgs";
 
   outputs = { self, nixpkgs, logos-nix }:
