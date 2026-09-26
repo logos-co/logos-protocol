@@ -917,6 +917,7 @@ void SessionEndpoint::onCall(const CallMessage& request, CallReply reply)
 void SessionEndpoint::onCall(const CallMessage& request, CallReply reply, const void* connectionId)
 {
     std::string caller;
+    bool mayCall = true;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         const auto found = impl_->sessions.find(connectionId);
@@ -925,14 +926,21 @@ void SessionEndpoint::onCall(const CallMessage& request, CallReply reply, const 
             return;
         }
         caller = found->second.caller;
+        const json& meta = found->second.meta;
+        mayCall = !(meta.is_object() && meta.contains("calls") && meta["calls"] == false);
     }
     // Tokens never cross a session: a remote peer manages no local credential.
     if (request.method == "informModuleToken" || request.method == "revokeModuleToken") {
         reply(refusal(request, "tokens are not accepted over a session"));
         return;
     }
-    auto impl = impl_;
     const bool control = isControlMethod(request.method);
+    // Bound with "calls": false, a session may introspect and subscribe only.
+    if (!mayCall && !control) {
+        reply(refusal(request, "this session may not call methods"));
+        return;
+    }
+    auto impl = impl_;
     std::shared_ptr<GatePlace> place = !control && impl->reserve ? impl->reserve() : nullptr;
     auto job = [impl, request, reply = std::move(reply), caller, place = std::move(place)]() mutable {
         try {
