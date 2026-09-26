@@ -16,6 +16,7 @@ const char* protocolToString(LogosProtocol p)
     case LogosProtocol::Tcp:         return "tcp";
     case LogosProtocol::TcpSsl:      return "tcp_ssl";
     case LogosProtocol::Inproc:      return "inproc";
+    case LogosProtocol::TlsTcp:      return "tls_tcp";
     }
     return "local";
 }
@@ -26,6 +27,7 @@ LogosProtocol protocolFromString(const std::string& s)
     if (s == "tcp")     return LogosProtocol::Tcp;
     if (s == "tcp_ssl") return LogosProtocol::TcpSsl;
     if (s == "inproc")  return LogosProtocol::Inproc;
+    if (s == "tls_tcp") return LogosProtocol::TlsTcp;
     return LogosProtocol::LocalSocket;
 }
 
@@ -52,7 +54,8 @@ std::string transportSetToJsonString(const LogosTransportSet& set)
     for (const auto& cfg : set) {
         json o;
         o["protocol"] = protocolToString(cfg.protocol);
-        if (cfg.protocol == LogosProtocol::Tcp || cfg.protocol == LogosProtocol::TcpSsl) {
+        if (cfg.protocol == LogosProtocol::Tcp || cfg.protocol == LogosProtocol::TcpSsl
+            || cfg.protocol == LogosProtocol::TlsTcp) {
             o["host"]  = cfg.host;
             o["port"]  = cfg.port;
             o["codec"] = codecToString(cfg.codec);
@@ -94,7 +97,7 @@ bool parseTransportSet(const std::string& jsonStr, LogosTransportSet* out, std::
                 return fail("transport port is not 0..65535: " + o["port"].dump());
             const std::string protocol = o.value("protocol", std::string{"local"});
             if (protocol != "local" && protocol != "qt_remote_plain" && protocol != "tcp"
-                && protocol != "tcp_ssl" && protocol != "inproc")
+                && protocol != "tcp_ssl" && protocol != "inproc" && protocol != "tls_tcp")
                 return fail("unknown transport protocol '" + protocol + "'");
             const std::string codec = o.value("codec", std::string{"json"});
             if (codec != "json" && codec != "cbor")

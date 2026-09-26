@@ -549,6 +549,7 @@ add_executable(qt_remote_plain_cabi_tests
     test_plain_local_inproc.cpp
     test_plain_caller_resolver.cpp
     test_plain_token_revocation.cpp
+    test_plain_remote_session.cpp
 )
 target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
     logos_protocol_plain

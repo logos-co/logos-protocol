@@ -30,6 +30,13 @@ enum class MessageType : uint8_t {
     Token       = 6,
     Methods     = 7,
     MethodsResult = 8,
+    // Session frames (tls_tcp only), never decoded by an IWireCodec: their
+    // payload is a JSON object (Hello/HelloAck) or empty (Ping/Pong). They go
+    // only to a peer that opened a tls_tcp session, so older peers never see them.
+    Hello       = 9,
+    HelloAck    = 10,
+    Ping        = 11,
+    Pong        = 12,
 };
 
 struct MethodMetadata {

@@ -1022,6 +1022,54 @@ int lp_provider_set_caller_resolver(lp_provider* provider, lp_caller_resolver_cb
     return LP_ERR_UNSUPPORTED;
 }
 
+// Sessions (tls_tcp) belong to the plain runtime.
+int lp_provider_set_tls_credential(lp_provider* provider, const char*, const char*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_provider_set_trust_anchors(lp_provider* provider, const char*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_provider_set_session_authenticator(lp_provider* provider, lp_session_authenticator_cb, void*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_provider_set_session_options(lp_provider* provider, const char*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+char* lp_provider_endpoints_json(lp_provider*) { return nullptr; }
+
+int lp_provider_close_sessions(lp_provider* provider, const char*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_provider_extend_sessions(lp_provider* provider, const char*, long long)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_provider_add_endpoint(lp_provider* provider, const char*)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_client_set_tls_credential(lp_client* client, const char*, const char*)
+{
+    return client ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
+int lp_client_set_session_hook(lp_client* client, lp_session_hook_cb, lp_session_hook_cb, void*)
+{
+    return client ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
 const lp_runtime_delegate_v1* lp_runtime_delegate_create(const char*, const char*)
 {
     return nullptr;

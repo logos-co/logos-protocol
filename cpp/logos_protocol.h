@@ -286,9 +286,16 @@
 //       It also retires the token registry: "token_registry" is still accepted
 //       by lp_grant_host_services and grants nothing, and lp_token_keys always
 //       refuses. capability_module is the token authority and needs neither.
-#define LOGOS_PROTOCOL_VERSION_MINOR 13
+// 0.14: sessions between runtimes, all additive: the "tls_tcp" transport
+// (mutual TLS 1.3 with embedder-supplied trust anchors, a Hello before any
+// call, a caller document bound per session and no per-call tokens), the
+// provider's session functions (credential, anchors, authenticator, options,
+// endpoints, close/extend, add_endpoint) and the client's credential and
+// session hook. Network endpoints gain a control lane and run business calls
+// on as many threads as the dispatch gate allows.
+#define LOGOS_PROTOCOL_VERSION_MINOR 14
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.13.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.14.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -329,6 +336,10 @@
 #define LOGOS_PROTOCOL_HAS_CALLER_RESOLVER 1   /* lp_provider_set_caller_resolver */
 #define LOGOS_PROTOCOL_HAS_RUNTIME_DELEGATE 1  /* logos_runtime_delegate.h */
 #define LOGOS_PROTOCOL_HAS_TOKEN_REVOCATION 1  /* lp_revoke_module_token_to, revokeModuleToken */
+
+// FEATURE MACRO for 0.14: the tls_tcp transport and the session functions
+// below. The Qt runtime declares them and returns LP_ERR_UNSUPPORTED.
+#define LOGOS_PROTOCOL_HAS_REMOTE_SESSIONS 1
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -414,7 +425,8 @@ LP_API const char* lp_get_mode(void);
  *    {"protocol":"tcp","host":"127.0.0.1","port":6001,"codec":"json"}
  *    {"protocol":"tcp_ssl","host":"...","port":6443,"codec":"cbor",
  *     "ca_file":"...","cert_file":"...","key_file":"...","verify_peer":true}
- *  "protocol" is one of "local", "qt_remote_plain", "tcp" or "tcp_ssl". Returns
+ *  "protocol" is one of "local", "qt_remote_plain", "tcp", "tcp_ssl", "inproc"
+ *  or "tls_tcp" (plain runtime only; see the session functions). Returns
  *  LP_OK, or LP_ERR_INVALID_ARG for malformed JSON, an unknown protocol or
  *  codec, or a mistyped field. lp_client_create refuses the same inputs. */
 LP_API int lp_set_default_transport(const char* transport_json);
@@ -1019,6 +1031,75 @@ LP_API int lp_provider_set_caller_resolver(lp_provider* provider,
  *  loop and returns LP_ERR_UNSUPPORTED. */
 LP_API int lp_provider_set_max_concurrent_calls(lp_provider* provider,
                            unsigned max_calls);
+
+/* ---------------------------------------------------------------------------
+ * Sessions (tls_tcp), plain runtime only; the Qt runtime returns
+ * LP_ERR_UNSUPPORTED (or NULL) from every one of these.
+ *
+ * A tls_tcp listener requires mutual TLS 1.3: the client's chain must verify
+ * against the provider's trust anchors, and the client pins the provider's
+ * exact key. The first frame after the handshake is the client's Hello; the
+ * provider's session authenticator turns it into the caller document bound to
+ * the connection, which lp_current_caller_json() returns for every call on it.
+ * No per-call token crosses a session, and a session never delivers or
+ * revokes tokens.
+ * ------------------------------------------------------------------------- */
+
+/** Given the request document
+ *    {"hello":{...},"peer_chain":["<base64url DER>",...],"exporter":"<base64url>",
+ *     "remote":"<ip:port>","protocol":"tls_tcp","port":<bound port>}
+ *  return a heap string (freed with lp_string_free):
+ *    {"caller":{"kind":"remote","peer":"...","name":"..."} or {"kind":"operator","name":"..."},
+ *     "lifetime_ms":<n>,"session":{<metadata close/extend filters match>}}
+ *  or {"error":"..."} / NULL to refuse. Runs on a worker thread, never the I/O
+ *  thread; a host document is always refused. */
+typedef char* (*lp_session_authenticator_cb)(const char* request_json, void* user_data);
+
+/** PEM chain (leaf first) and PEM private key for tls_tcp listeners. May be
+ *  replaced at any time; sessions accepted afterwards use the new one. */
+LP_API int lp_provider_set_tls_credential(lp_provider* provider,
+                           const char* cert_chain_pem, const char* key_pem);
+/** PEM certificates a client's chain must verify against. Replaceable at any
+ *  time; an empty string refuses every new session. */
+LP_API int lp_provider_set_trust_anchors(lp_provider* provider, const char* anchors_pem);
+LP_API int lp_provider_set_session_authenticator(lp_provider* provider,
+                           lp_session_authenticator_cb authenticate, void* user_data);
+/** JSON object of limits for listeners created afterwards: max_frame,
+ *  handshake_timeout_ms, hello_timeout_ms, keepalive_ms, keepalive_timeout_ms,
+ *  max_lifetime_ms, max_sessions, max_pending, max_pending_per_address,
+ *  max_concurrent_auth, port_min, port_max. An unknown key is refused. */
+LP_API int lp_provider_set_session_options(lp_provider* provider, const char* options_json);
+/** The bound network listeners as a JSON array of transport objects
+ *  ({"protocol","host","port"}); a heap string freed with lp_string_free. */
+LP_API char* lp_provider_endpoints_json(lp_provider* provider);
+/** Closes the sessions a filter selects and returns how many, or a negative
+ *  error. Every key of the filter object must equal the same key in the
+ *  authenticator's "session" metadata or in the caller document, except
+ *  "generation_below", which compares with the metadata's "generation". "{}"
+ *  selects every session. */
+LP_API int lp_provider_close_sessions(lp_provider* provider, const char* filter_json);
+/** Extends the selected sessions to at least `lifetime_ms` from now; returns
+ *  how many, or a negative error. */
+LP_API int lp_provider_extend_sessions(lp_provider* provider, const char* filter_json,
+                           long long lifetime_ms);
+/** Starts one more network listener (tcp, tcp_ssl or tls_tcp) on a provider
+ *  already prepared or registered. */
+LP_API int lp_provider_add_endpoint(lp_provider* provider, const char* transport_json);
+
+/** Client side of a session: the embedder's hooks, called on the calling
+ *  thread before each dial and after each handshake. The dial hook takes
+ *  {"target","timeout_ms"} and returns
+ *    {"addresses":["..."],"port":<n>,"server_pin":"sha256:<base64url>","anchors":"<PEM>"};
+ *  the hello hook takes {"target","peer_chain":[...],"exporter":"..."} and
+ *  returns the Hello object. Either may return {"error":"..."}. Returned
+ *  strings are freed with lp_string_free. */
+typedef char* (*lp_session_hook_cb)(const char* request_json, void* user_data);
+
+/** PEM chain and key this client presents on tls_tcp. Set before the first call. */
+LP_API int lp_client_set_tls_credential(lp_client* client, const char* cert_chain_pem,
+                           const char* key_pem);
+LP_API int lp_client_set_session_hook(lp_client* client, lp_session_hook_cb dial,
+                           lp_session_hook_cb hello, void* user_data);
 
 #ifdef __cplusplus
 }

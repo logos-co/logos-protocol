@@ -66,6 +66,26 @@ public:
     virtual void onConnectionClosed(const void* connectionId) = 0;
 
     virtual void onToken(const TokenMessage& req) = 0;
+
+    // The same three, told which connection the message came on. RpcConnection
+    // calls these; the defaults forward to the forms above, so a handler that
+    // does not care where a message came from implements only those.
+    virtual void onCall(const CallMessage& req, CallReply reply, const void* connectionId)
+    {
+        (void)connectionId;
+        onCall(req, std::move(reply));
+    }
+    virtual void onMethods(const MethodsMessage& req, MethodsReply reply,
+                           const void* connectionId)
+    {
+        (void)connectionId;
+        onMethods(req, std::move(reply));
+    }
+    virtual void onToken(const TokenMessage& req, const void* connectionId)
+    {
+        (void)connectionId;
+        onToken(req);
+    }
 };
 
 } // namespace logos::plain

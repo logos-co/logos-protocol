@@ -221,6 +221,7 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
  *   {"kind":"module","name":"chat_module","instance":"a41f"}
  *   {"kind":"derived","parent":"wallet_module","leaf":"wallet_ui"}
  *   {"kind":"operator","name":"ops-readonly"}
+ *   {"kind":"remote","peer":"<runtime uuid>","name":"wallet_ui"}
  *
  * Rules, in the order a reader applies them:
  *
@@ -259,12 +260,21 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
  *      and would mean a later protocol emitting a richer "instance" silently
  *      stops one language's modules recognising callers the other still does.
  *      A backend that needs the distinction reads the field itself.
+ *   7. A key that appears twice anywhere in the document ⇒ unknown. Parsers
+ *      disagree about which copy wins, and an identity must not depend on it.
+ *   8. "remote" is a consumer on another runtime, vouched for by that runtime
+ *      over a tls_tcp session: "peer" is its runtime id and "name" the consumer
+ *      it named ("runtime" for that runtime itself, "@op:<name>" for its
+ *      operator). Both are required. It is never is_module(): a remote caller
+ *      called "wallet_ui" is not the local wallet_ui.
  *
  * Nothing here is spelled "verified". capability_module checks only that an
  * asserted name EXISTS as a key, so the strongest honest word for a named module
  * is token-bound.
  *
- * PRODUCERS TODAY: "unknown", "host", and "module" WITHOUT "instance". The
+ * PRODUCERS TODAY: "unknown", "host", "module" WITHOUT "instance", "operator"
+ * (logosctl through core_service, and a remote operator's session), and
+ * "remote" (a tls_tcp session). The
  * "derived" and "operator" arms are specified and must be parsed, but nothing
  * emits them yet — said here rather than left for someone to discover.
  * "derived" is reserved for the isolated per-plugin identity

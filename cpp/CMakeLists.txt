@@ -113,7 +113,9 @@ set_target_properties(logos_qt_remote_plain_transport PROPERTIES POSITION_INDEPE
 add_library(logos_protocol_plain STATIC
     logos_protocol_plain.cpp
     logos_protocol_plain_network.cpp
+    logos_protocol_plain_session.cpp
     logos_protocol_plain_network.h
+    logos_protocol_plain_session.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
     ${LOGOS_PLAIN_LOCAL_SOURCES}
     logos_protocol.h
@@ -148,6 +150,7 @@ set_target_properties(logos_protocol_plain PROPERTIES
 add_library(logos_protocol_plain_shared SHARED
     logos_protocol_plain.cpp
     logos_protocol_plain_network.cpp
+    logos_protocol_plain_session.cpp
     logos_protocol_plain_network.h
     ${LOGOS_PLAIN_NETWORK_SOURCES}
     ${LOGOS_PLAIN_LOCAL_SOURCES}
@@ -539,7 +542,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.13.0
+    VERSION 0.14.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES

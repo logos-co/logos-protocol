@@ -266,6 +266,12 @@ AnyMessage jsonToMessage(MessageType tag, const json& j)
         }
         return m;
     }
+    // Session frames are handled below the codec, and only on tls_tcp.
+    case MessageType::Hello:
+    case MessageType::HelloAck:
+    case MessageType::Ping:
+    case MessageType::Pong:
+        throw CodecError("session frame outside a session handshake");
     }
     throw CodecError("unknown message tag");
 }

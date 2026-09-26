@@ -22,6 +22,7 @@ enum class LogosProtocol {
     TcpSsl,        // TCP + TLS (Boost.Asio + OpenSSL + JSON framing)
     QtRemotePlain, // QtRO 2.0-compatible local IPC implemented without Qt
     Inproc,        // a provider in this process (plain runtime only; the Qt runtime refuses it)
+    TlsTcp,        // mutual TLS 1.3 session between runtimes (plain runtime only; the Qt runtime refuses it)
     // Noise, Quic — future work
 };
 
@@ -43,14 +44,15 @@ struct LogosTransportConfig {
     // file so clients can find it.
     uint16_t port = 0;
 
-    // TcpSsl only.
+    // TcpSsl only. TlsTcp takes its credential and trust anchors through the
+    // C ABI (lp_provider_set_tls_credential and friends), never from files.
     std::string caFile;
     std::string certFile;
     std::string keyFile;
     bool verifyPeer = true;
 
     // Wire-format codec used for RPC framing on this transport. Only
-    // meaningful for JSON-RPC transports (Tcp / TcpSsl); LocalSocket and
+    // meaningful for JSON-RPC transports (Tcp / TcpSsl / TlsTcp); LocalSocket and
     // QtRemotePlain use the QtRO wire profile.
     LogosWireCodec codec = LogosWireCodec::Json;
 };
