@@ -94,20 +94,30 @@ struct Client {
     std::string pin;
     int port = 0;
     std::string ticket = "good";
+    bool unanchored = false;
     std::atomic<int> dials{0};
+    std::mutex mutex;
+    std::vector<json> hellos; // what the hello hook saw
 };
 
 char* dialHook(const char*, void* userData)
 {
     auto& c = *static_cast<Client*>(userData);
     ++c.dials;
+    if (c.unanchored)
+        return copyText(json{{"addresses", {"127.0.0.1"}}, {"port", c.port},
+                             {"unanchored", true}}.dump());
     return copyText(json{{"addresses", {"127.0.0.1"}}, {"port", c.port},
                          {"server_pin", c.pin}, {"anchors", c.anchors}}.dump());
 }
 
-char* helloHook(const char*, void* userData)
+char* helloHook(const char* request, void* userData)
 {
     auto& c = *static_cast<Client*>(userData);
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        c.hellos.push_back(json::parse(request));
+    }
     return copyText(json{{"ticket", c.ticket}, {"module", "session_echo"}}.dump());
 }
 
@@ -311,6 +321,108 @@ TEST(RemoteSession, ASessionEndsWhenItsLifetimeDoes)
     ASSERT_EQ(f.invoke("whoami", "[]", &result), LP_OK);
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
     EXPECT_EQ(lp_provider_close_sessions(f.provider, "{}"), 0);
+}
+
+TEST(RemoteSession, AnUnknownRootPassesOnlyWhileUnanchoredAdmissionIsOn)
+{
+    Fixture f;
+    f.start();
+    const Identity stranger("clientAuth");
+    ASSERT_EQ(lp_client_set_tls_credential(f.consumer, stranger.chainPem().c_str(),
+                                           stranger.keyPem().c_str()), LP_OK);
+    json result;
+    EXPECT_NE(f.invoke("whoami", "[]", &result, nullptr, 3000), LP_OK);
+    EXPECT_EQ(f.state.authCount(), 0);
+
+    ASSERT_EQ(lp_provider_set_unanchored_admission(f.provider, 1), LP_OK);
+    ASSERT_EQ(f.invoke("whoami", "[]", &result), LP_OK);
+    std::lock_guard<std::mutex> lock(f.state.mutex);
+    ASSERT_EQ(f.state.requests.size(), 1u);
+    const json& request = f.state.requests.front();
+    EXPECT_EQ(request["anchored"], false);
+    ASSERT_EQ(request["peer_chain"].size(), 2u);
+    EXPECT_EQ(request["peer_chain"][0], session_test::der64(stranger.leaf.get()));
+    EXPECT_EQ(request["peer_chain"][1], session_test::der64(stranger.root.get()));
+}
+
+TEST(RemoteSession, AnAnchoredClientIsMarkedSoWhileAdmissionIsOn)
+{
+    Fixture f;
+    ASSERT_EQ(lp_provider_set_unanchored_admission(f.provider, 1), LP_OK);
+    f.start();
+    json result;
+    ASSERT_EQ(f.invoke("whoami", "[]", &result), LP_OK);
+    std::lock_guard<std::mutex> lock(f.state.mutex);
+    ASSERT_EQ(f.state.requests.size(), 1u);
+    EXPECT_EQ(f.state.requests.front()["anchored"], true);
+}
+
+TEST(RemoteSession, ALeafWithoutItsRootIsRefusedEvenWhenAdmitted)
+{
+    Fixture f;
+    ASSERT_EQ(lp_provider_set_unanchored_admission(f.provider, 1), LP_OK);
+    f.start();
+    const Identity stranger("clientAuth");
+    ASSERT_EQ(lp_client_set_tls_credential(f.consumer,
+                                           session_test::pem(stranger.leaf.get()).c_str(),
+                                           stranger.keyPem().c_str()), LP_OK);
+    json result;
+    EXPECT_NE(f.invoke("whoami", "[]", &result, nullptr, 3000), LP_OK);
+    EXPECT_EQ(f.state.authCount(), 0);
+}
+
+TEST(RemoteSession, AnUnanchoredClientStillNeedsTheClientPurpose)
+{
+    Fixture f;
+    ASSERT_EQ(lp_provider_set_unanchored_admission(f.provider, 1), LP_OK);
+    f.start();
+    const Identity serverLike("serverAuth");
+    ASSERT_EQ(lp_client_set_tls_credential(f.consumer, serverLike.chainPem().c_str(),
+                                           serverLike.keyPem().c_str()), LP_OK);
+    json result;
+    EXPECT_NE(f.invoke("whoami", "[]", &result, nullptr, 3000), LP_OK);
+    EXPECT_EQ(f.state.authCount(), 0);
+}
+
+TEST(RemoteSession, AnUnanchoredDialLetsTheHelloHookDecide)
+{
+    Fixture f;
+    f.start();
+    f.hooks.unanchored = true;
+    json result;
+    ASSERT_EQ(f.invoke("whoami", "[]", &result), LP_OK);
+    std::lock_guard<std::mutex> lock(f.hooks.mutex);
+    ASSERT_EQ(f.hooks.hellos.size(), 1u);
+    const json& hello = f.hooks.hellos.front();
+    EXPECT_EQ(hello["anchored"], false);
+    ASSERT_EQ(hello["peer_chain"].size(), 2u);
+    EXPECT_EQ(hello["peer_chain"][0], session_test::der64(f.server.leaf.get()));
+    EXPECT_EQ(hello["peer_chain"][1], session_test::der64(f.server.root.get()));
+}
+
+TEST(RemoteSession, APinnedDialIsMarkedAnchored)
+{
+    Fixture f;
+    f.start();
+    json result;
+    ASSERT_EQ(f.invoke("whoami", "[]", &result), LP_OK);
+    std::lock_guard<std::mutex> lock(f.hooks.mutex);
+    ASSERT_EQ(f.hooks.hellos.size(), 1u);
+    EXPECT_EQ(f.hooks.hellos.front()["anchored"], true);
+}
+
+TEST(RemoteSession, AnUnanchoredDialStillNeedsTheServerPurpose)
+{
+    Fixture f;
+    // A server presenting a client leaf: self-consistent, wrong purpose.
+    const Identity clientLike("clientAuth");
+    ASSERT_EQ(lp_provider_set_tls_credential(f.provider, clientLike.chainPem().c_str(),
+                                             clientLike.keyPem().c_str()), LP_OK);
+    f.start();
+    f.hooks.unanchored = true;
+    json result;
+    EXPECT_NE(f.invoke("whoami", "[]", &result, nullptr, 3000), LP_OK);
+    EXPECT_EQ(f.state.authCount(), 0);
 }
 
 TEST(RemoteSession, ExtendingASessionKeepsItOpen)

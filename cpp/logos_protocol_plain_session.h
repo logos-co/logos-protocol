@@ -88,6 +88,10 @@ public:
     int extendSessions(const nlohmann::json& filter, std::chrono::milliseconds lifetime);
     // Used by sessions accepted from now on.
     bool replaceCredential(TlsCredential credential, std::string& error);
+    // While on, a client chain the anchors refuse still reaches the authenticator
+    // when it is self-consistent (a leaf and the self-signed root that issued it),
+    // with "anchored": false. Applies to handshakes that start afterwards.
+    void setUnanchoredAdmission(bool enabled);
 
     void onCall(const CallMessage& request, CallReply reply) override;
     void onCall(const CallMessage& request, CallReply reply, const void* connectionId) override;
@@ -112,7 +116,9 @@ struct ClientSessionConfig {
     LogosWireCodec codec = LogosWireCodec::Json;
     TlsCredential credential;
     // {"target","timeout_ms"} -> {"addresses":[...],"port":n,"server_pin":"sha256:...",
-    //                             "anchors":"<PEM>"} or {"error":"..."}
+    //                             "anchors":"<PEM>"} or {"error":"..."}; or, with
+    // "unanchored":true and no pin or anchors, any self-consistent chain passes and
+    // the hello hook (told "anchored":false) decides.
     std::function<std::string(const std::string&)> dial;
     // {"target","peer_chain":[...],"exporter"} -> the Hello object, or {"error":"..."}
     std::function<std::string(const std::string&)> hello;

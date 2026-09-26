@@ -1033,6 +1033,11 @@ int lp_provider_set_trust_anchors(lp_provider* provider, const char*)
     return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
 }
 
+int lp_provider_set_unanchored_admission(lp_provider* provider, int)
+{
+    return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
+}
+
 int lp_provider_set_session_authenticator(lp_provider* provider, lp_session_authenticator_cb, void*)
 {
     return provider ? LP_ERR_UNSUPPORTED : LP_ERR_INVALID_ARG;
