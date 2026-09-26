@@ -1047,7 +1047,7 @@ LP_API int lp_provider_set_max_concurrent_calls(lp_provider* provider,
 
 /** Given the request document
  *    {"hello":{...},"peer_chain":["<base64url DER>",...],"exporter":"<base64url>",
- *     "remote":"<ip:port>","protocol":"tls_tcp","port":<bound port>}
+ *     "anchored":<bool>,"remote":"<ip:port>","protocol":"tls_tcp","port":<bound port>}
  *  return a heap string (freed with lp_string_free):
  *    {"caller":{"kind":"remote","peer":"...","name":"..."} or {"kind":"operator","name":"..."},
  *     "lifetime_ms":<n>,"session":{<metadata close/extend filters match>}}
@@ -1062,6 +1062,10 @@ LP_API int lp_provider_set_tls_credential(lp_provider* provider,
 /** PEM certificates a client's chain must verify against. Replaceable at any
  *  time; an empty string refuses every new session. */
 LP_API int lp_provider_set_trust_anchors(lp_provider* provider, const char* anchors_pem);
+/** While enabled, a client chain the anchors refuse still reaches the
+ *  authenticator when it is self-consistent (a leaf, then the self-signed root
+ *  that issued it); the request then says "anchored": false. For pairing. */
+LP_API int lp_provider_set_unanchored_admission(lp_provider* provider, int enabled);
 LP_API int lp_provider_set_session_authenticator(lp_provider* provider,
                            lp_session_authenticator_cb authenticate, void* user_data);
 /** JSON object of limits for listeners created afterwards: max_frame,
@@ -1089,9 +1093,10 @@ LP_API int lp_provider_add_endpoint(lp_provider* provider, const char* transport
 /** Client side of a session: the embedder's hooks, called on the calling
  *  thread before each dial and after each handshake. The dial hook takes
  *  {"target","timeout_ms"} and returns
- *    {"addresses":["..."],"port":<n>,"server_pin":"sha256:<base64url>","anchors":"<PEM>"};
- *  the hello hook takes {"target","peer_chain":[...],"exporter":"..."} and
- *  returns the Hello object. Either may return {"error":"..."}. Returned
+ *    {"addresses":["..."],"port":<n>,"server_pin":"sha256:<base64url>","anchors":"<PEM>"},
+ *  or {"addresses","port","unanchored":true} to accept any self-consistent chain;
+ *  the hello hook takes {"target","peer_chain":[...],"exporter":"...","anchored":<bool>}
+ *  and returns the Hello object. Either may return {"error":"..."}. Returned
  *  strings are freed with lp_string_free. */
 typedef char* (*lp_session_hook_cb)(const char* request_json, void* user_data);
 

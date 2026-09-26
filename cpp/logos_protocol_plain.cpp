@@ -1404,6 +1404,7 @@ struct lp_provider {
     logos::plain::abi::TlsCredential sessionCredential;
     logos::plain::abi::SessionOptions sessionOptions;
     std::string trustAnchors;
+    bool unanchoredAdmission = false;
     lp_session_authenticator_cb authenticator = nullptr;
     void* authenticatorData = nullptr;
 };
@@ -1883,10 +1884,12 @@ std::unique_ptr<logos::plain::abi::SessionEndpoint> makeSessionEndpoint(
 {
     logos::plain::abi::TlsCredential credential;
     logos::plain::abi::SessionOptions options;
+    bool unanchored = false;
     {
         std::lock_guard<std::mutex> lock(provider->mutex);
         credential = provider->sessionCredential;
         options = provider->sessionOptions;
+        unanchored = provider->unanchoredAdmission;
     }
     if (credential.empty()) {
         code = LP_ERR_INVALID_ARG;
@@ -1921,6 +1924,7 @@ std::unique_ptr<logos::plain::abi::SessionEndpoint> makeSessionEndpoint(
         },
         [provider] { return gateCapacity(provider); },
         [provider] { return reservePlace(provider->gate); });
+    endpoint->setUnanchoredAdmission(unanchored);
     std::string error;
     if (!endpoint->start(error)) {
         code = LP_ERR_INTERNAL;
@@ -2894,6 +2898,20 @@ try {
     if (!provider) return LP_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(provider->mutex);
     provider->trustAnchors = anchorsPem ? anchorsPem : "";
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_set_unanchored_admission(lp_provider* provider, int enabled)
+try {
+    if (!provider) return LP_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        provider->unanchoredAdmission = enabled != 0;
+    }
+    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+    for (auto& endpoint : provider->sessionEndpoints) endpoint->setUnanchoredAdmission(enabled != 0);
     return LP_OK;
 } catch (...) {
     return LP_ERR_INTERNAL;

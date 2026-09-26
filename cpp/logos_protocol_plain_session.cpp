@@ -78,6 +78,68 @@ std::string certDer64(X509* cert)
     return out;
 }
 
+// Per-connection ex_data: whether an unanchored chain may pass, and the chain it
+// verified to when one did.
+void freeChain(void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*)
+{
+    if (ptr) sk_X509_pop_free(static_cast<STACK_OF(X509)*>(ptr), X509_free);
+}
+
+int unanchoredIndex()
+{
+    static const int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    return index;
+}
+
+int selfChainIndex()
+{
+    static const int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, &freeChain);
+    return index;
+}
+
+void allowUnanchored(SSL* ssl)
+{
+    static int marker = 1;
+    SSL_set_ex_data(ssl, unanchoredIndex(), &marker);
+}
+
+bool isAnchored(SSL* ssl) { return SSL_get_ex_data(ssl, selfChainIndex()) == nullptr; }
+
+// The anchors first. Where the connection allows it, a chain that fails them
+// may still pass when it is self-consistent: the leaf and, last, the
+// self-signed CA that issued it, checked for the same purpose.
+int verifyPresentedChain(X509_STORE_CTX* ctx, void*)
+{
+    if (X509_verify_cert(ctx) == 1) return 1;
+    auto* ssl = static_cast<SSL*>(
+        X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx()));
+    if (!ssl || !SSL_get_ex_data(ssl, unanchoredIndex())) return 0;
+    X509* leaf = X509_STORE_CTX_get0_cert(ctx);
+    STACK_OF(X509)* presented = X509_STORE_CTX_get0_untrusted(ctx);
+    const int count = presented ? sk_X509_num(presented) : 0;
+    X509* root = count == 2 ? sk_X509_value(presented, 1) : nullptr;
+    if (!leaf || !root || root == leaf || X509_self_signed(root, 1) != 1
+        || X509_check_ca(root) < 1) {
+        X509_STORE_CTX_set_error(ctx, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+        return 0;
+    }
+    X509_STORE* own = X509_STORE_new();
+    X509_STORE_CTX* second = X509_STORE_CTX_new();
+    int ok = 0;
+    if (own && second && X509_STORE_add_cert(own, root) == 1
+        && X509_STORE_CTX_init(second, own, leaf, presented) == 1) {
+        X509_STORE_CTX_set_flags(second, X509_V_FLAG_X509_STRICT);
+        X509_STORE_CTX_set_purpose(second, SSL_is_server(ssl) ? X509_PURPOSE_SSL_CLIENT
+                                                               : X509_PURPOSE_SSL_SERVER);
+        ok = X509_verify_cert(second) == 1;
+        if (ok) SSL_set_ex_data(ssl, selfChainIndex(), X509_STORE_CTX_get1_chain(second));
+        X509_STORE_CTX_set_error(ctx, ok ? X509_V_OK : X509_STORE_CTX_get_error(second));
+    }
+    X509_STORE_CTX_free(second);
+    X509_STORE_free(own);
+    return ok;
+}
+
 // RFC 9266: 32 bytes, label EXPORTER-Channel-Binding, no context.
 std::string exporterOf(SSL* ssl)
 {
@@ -92,7 +154,8 @@ std::string exporterOf(SSL* ssl)
 json verifiedChain(SSL* ssl)
 {
     json chain = json::array();
-    STACK_OF(X509)* verified = SSL_get0_verified_chain(ssl);
+    auto* verified = static_cast<STACK_OF(X509)*>(SSL_get_ex_data(ssl, selfChainIndex()));
+    if (!verified) verified = SSL_get0_verified_chain(ssl);
     for (int i = 0; verified && i < sk_X509_num(verified); ++i)
         chain.push_back(certDer64(sk_X509_value(verified, i)));
     return chain;
@@ -163,6 +226,7 @@ std::shared_ptr<boost::asio::ssl::context> sessionContext(bool server, const Tls
         throw std::runtime_error("the session certificate and key do not match");
     SSL_CTX_set_verify(native, SSL_VERIFY_PEER | (server ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0),
                        nullptr);
+    SSL_CTX_set_cert_verify_callback(native, &verifyPresentedChain, nullptr);
     return context;
 }
 
@@ -370,6 +434,7 @@ struct SessionEndpoint::Impl : std::enable_shared_from_this<SessionEndpoint::Imp
     boost::asio::strand<boost::asio::any_io_executor> acceptorStrand;
     std::shared_ptr<IWireCodec> codec;
     std::atomic<std::uint16_t> boundPort{0};
+    std::atomic<bool> admitUnanchored{false};
 
     std::mutex mutex;
     std::shared_ptr<boost::asio::ssl::context> context;
@@ -395,6 +460,7 @@ struct Pending {
     std::vector<std::uint8_t> body;
     json chain = json::array();
     std::string exporter;
+    bool anchored = true;
     std::vector<std::uint8_t> ack;
     bool done = false;
 
@@ -443,6 +509,7 @@ void SessionEndpoint::Impl::admit(boost::asio::ip::tcp::socket socket)
     // No anchors: the handshake fails, since nothing can verify.
     if (trust) SSL_set1_verify_cert_store(ssl, trust.get());
     SSL_set_purpose(ssl, X509_PURPOSE_SSL_CLIENT);
+    if (admitUnanchored.load()) allowUnanchored(ssl);
     pending->deadline.expires_after(options.handshakeTimeout);
     pending->deadline.async_wait([pending](const boost::system::error_code& waited) {
         if (!waited) pending->impl->finish(pending);
@@ -480,6 +547,7 @@ void SessionEndpoint::Impl::onHandshake(const std::shared_ptr<Pending>& pending,
     }
     pending->chain = verifiedChain(ssl);
     pending->exporter = exporterOf(ssl);
+    pending->anchored = isAnchored(ssl);
     if (pending->chain.empty() || pending->exporter.empty()) {
         finish(pending);
         return;
@@ -535,6 +603,7 @@ void SessionEndpoint::Impl::onHello(const std::shared_ptr<Pending>& pending, jso
     json request = {{"hello", hello},
                     {"peer_chain", pending->chain},
                     {"exporter", pending->exporter},
+                    {"anchored", pending->anchored},
                     {"remote", pending->remote},
                     {"protocol", "tls_tcp"},
                     {"port", boundPort.load()}};
@@ -685,6 +754,11 @@ bool SessionEndpoint::replaceCredential(TlsCredential credential, std::string& e
         error = ex.what();
         return false;
     }
+}
+
+void SessionEndpoint::setUnanchoredAdmission(bool enabled)
+{
+    impl_->admitUnanchored = enabled;
 }
 
 bool SessionEndpoint::start(std::string& error)
@@ -961,6 +1035,7 @@ struct Handshake {
     json chain;
     std::string exporter;
     std::string error;
+    bool anchored = true;
 };
 
 struct Acknowledgement {
@@ -970,6 +1045,8 @@ struct Acknowledgement {
 
 class ClientAttempt : public std::enable_shared_from_this<ClientAttempt> {
 public:
+    // An empty pin means an unanchored dial: any self-consistent chain passes
+    // and the hello hook decides.
     ClientAttempt(boost::asio::io_context& io, std::shared_ptr<boost::asio::ssl::context> context,
                   Store store, std::string host, std::string port, std::string pin)
         : io_(io), resolver_(io), context_(std::move(context)), store_(std::move(store)),
@@ -979,6 +1056,7 @@ public:
         SSL* ssl = stream_->native_handle();
         if (store_) SSL_set1_verify_cert_store(ssl, store_.get());
         SSL_set_purpose(ssl, X509_PURPOSE_SSL_SERVER);
+        if (pin_.empty()) allowUnanchored(ssl);
         // No SNI: the peer is pinned, and a name would only leak.
     }
 
@@ -1089,11 +1167,11 @@ private:
             finishHandshake({{}, {}, "the peer's certificate does not chain to its anchor"});
             return;
         }
-        if (spkiPin(leaf) != pin_) {
+        if (!pin_.empty() && spkiPin(leaf) != pin_) {
             finishHandshake({{}, {}, "the peer's key is not the one pinned for it"});
             return;
         }
-        finishHandshake({verifiedChain(ssl), exporterOf(ssl), {}});
+        finishHandshake({verifiedChain(ssl), exporterOf(ssl), {}, isAnchored(ssl)});
     }
 
     void readAck()
@@ -1217,16 +1295,27 @@ try {
     const std::int64_t port = intField(*route, "port", 0);
     const auto pinIt = route->find("server_pin");
     const auto anchorsIt = route->find("anchors");
-    if (addresses.empty() || port <= 0 || port > 0xFFFF || pinIt == route->end()
-        || !pinIt->is_string() || anchorsIt == route->end() || !anchorsIt->is_string()) {
-        error = "the session hook named no address, port, pin or anchors";
+    const auto unanchoredIt = route->find("unanchored");
+    const bool unanchored = unanchoredIt != route->end() && unanchoredIt->is_boolean()
+        && unanchoredIt->get<bool>();
+    if (addresses.empty() || port <= 0 || port > 0xFFFF) {
+        error = "the session hook named no address or port";
         return {};
     }
-    const Store trust = storeFromPem(anchorsIt->get<std::string>());
-    if (!trust) {
+    if (unanchored ? (pinIt != route->end() || anchorsIt != route->end())
+                   : (pinIt == route->end() || !pinIt->is_string()
+                      || pinIt->get<std::string>().empty() || anchorsIt == route->end()
+                      || !anchorsIt->is_string())) {
+        error = unanchored ? "an unanchored dial takes no pin or anchors"
+                           : "the session hook named no pin or anchors";
+        return {};
+    }
+    const Store trust = unanchored ? Store() : storeFromPem(anchorsIt->get<std::string>());
+    if (!unanchored && !trust) {
         error = "the session hook's anchors hold no certificate";
         return {};
     }
+    const std::string pin = unanchored ? std::string() : pinIt->get<std::string>();
     auto context = sessionContext(false, config.credential);
     auto& io = IoContextPool::shared().ioContext();
 
@@ -1234,8 +1323,7 @@ try {
     Handshake handshake;
     for (const auto& address : addresses) {
         auto candidate = std::make_shared<ClientAttempt>(io, context, trust, address,
-                                                         std::to_string(port),
-                                                         pinIt->get<std::string>());
+                                                         std::to_string(port), pin);
         auto future = candidate->handshake();
         if (!waitUntil(future, deadline, alive)) {
             candidate->abandon();
@@ -1254,7 +1342,7 @@ try {
 
     auto hello = callHook(config.hello,
         json{{"target", config.target}, {"peer_chain", handshake.chain},
-             {"exporter", handshake.exporter}}, error);
+             {"exporter", handshake.exporter}, {"anchored", handshake.anchored}}, error);
     if (!hello) {
         attempt->abandon();
         return {};
