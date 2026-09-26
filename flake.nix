@@ -16,6 +16,26 @@
       # attribute is its BUILD platform, so packages.x86_64-windows.* evaluates
       # anywhere but realises on x86_64-linux.
       forAllTargets = logos-nix.lib.forAllTargets;
+
+      # The Qt-free runtime for Android (pseudo-system aarch64-android): the plain
+      # library and its headers only; the Qt runtime has no Android build here.
+      androidPackages = pkgs:
+        let
+          common = import ./nix/default.nix { inherit pkgs; };
+          src = ./.;
+          plain-lib = import ./nix/plain-lib.nix { inherit pkgs common src; };
+          include = import ./nix/include.nix { inherit pkgs common src; };
+        in
+        {
+          logos-protocol-plain-lib = plain-lib;
+          logos-protocol-include = include;
+          logos-protocol-plain = pkgs.symlinkJoin {
+            name = "logos-protocol-plain";
+            paths = [ plain-lib include ];
+            propagatedBuildInputs = [ pkgs.boost pkgs.openssl pkgs.nlohmann_json ];
+          };
+          default = plain-lib;
+        };
     in
     {
       packages = forAllTargets ({ pkgs, ... }:
@@ -67,7 +87,9 @@
         } // pkgs.lib.optionalAttrs common.isWindows {
           tests-qt = import ./nix/tests-windows-qt.nix { inherit pkgs common src; };
         }
-      );
+      ) // {
+        aarch64-android = androidPackages logos-nix.lib.mobileTargets.aarch64-android.pkgs;
+      };
 
       checks = forAllSystems ({ pkgs, ... }:
         let
