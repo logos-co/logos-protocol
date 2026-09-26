@@ -23,12 +23,12 @@ uint32_t readBe32(const uint8_t* p)
 } // anonymous namespace
 
 std::vector<uint8_t>
-encodeFrame(MessageType tag, const std::vector<uint8_t>& payload)
+encodeFrame(MessageType tag, const std::vector<uint8_t>& payload, uint32_t limit)
 {
     // Total frame body length = 1 byte (tag) + payload bytes. The 4-byte
     // length prefix is not included in the length value it describes.
     const uint64_t bodyLen = 1u + payload.size();
-    if (bodyLen > kMaxFrameLength)
+    if (bodyLen > limit)
         throw FramingError("frame too large");
 
     std::vector<uint8_t> out;
@@ -40,9 +40,9 @@ encodeFrame(MessageType tag, const std::vector<uint8_t>& payload)
 }
 
 std::vector<uint8_t>
-encodeFrame(IWireCodec& codec, const AnyMessage& msg)
+encodeFrame(IWireCodec& codec, const AnyMessage& msg, uint32_t limit)
 {
-    return encodeFrame(messageTypeOf(msg), codec.encode(msg));
+    return encodeFrame(messageTypeOf(msg), codec.encode(msg), limit);
 }
 
 void FrameReader::append(const uint8_t* data, std::size_t len)
@@ -57,7 +57,7 @@ bool FrameReader::next(MessageType& tag, std::vector<uint8_t>& payload)
 
     const uint32_t bodyLen = readBe32(m_buf.data());
     if (bodyLen == 0)                         throw FramingError("zero-length frame");
-    if (bodyLen > kMaxFrameLength)            throw FramingError("frame length exceeds cap");
+    if (bodyLen > m_limit)                    throw FramingError("frame length exceeds cap");
 
     const std::size_t total = 4u + bodyLen;
     if (m_buf.size() < total) return false;

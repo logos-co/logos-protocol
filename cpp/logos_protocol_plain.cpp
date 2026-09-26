@@ -4,6 +4,7 @@
 #include "implementations/plain_local/inproc_transport.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_network.h"
+#include "logos_protocol_plain_session.h"
 #include "logos_protocol_plain_tokens.h"
 #include "logos_codec.h"
 #include "logos_call_error.h"
@@ -250,8 +251,11 @@ bool isRuntimePrincipal(const std::string& principal)
 
 bool isNetworkProtocol(LogosProtocol protocol)
 {
-    return protocol == LogosProtocol::Tcp || protocol == LogosProtocol::TcpSsl;
+    return protocol == LogosProtocol::Tcp || protocol == LogosProtocol::TcpSsl
+        || protocol == LogosProtocol::TlsTcp;
 }
+
+bool isSessionProtocol(LogosProtocol protocol) { return protocol == LogosProtocol::TlsTcp; }
 
 // A target meant for the local socket, or named inproc, is reached in-process
 // when its provider serves inproc here; the socket stays the fallback for the former.
@@ -422,6 +426,13 @@ struct ClientState {
     std::uint64_t asyncNextToSend = 0;
     std::set<std::uint64_t> asyncSent;
     std::condition_variable asyncTurn;
+    // tls_tcp: this client's credential and the embedder's hooks, and whether
+    // the current wire carries the wildcard subscription. Guarded by connectionMutex.
+    logos::plain::abi::TlsCredential sessionCredential;
+    lp_session_hook_cb sessionDial = nullptr;
+    lp_session_hook_cb sessionHello = nullptr;
+    void* sessionHookData = nullptr;
+    bool wildcardSent = false;
 };
 
 constexpr std::size_t kMaxAsyncWorkers = 16;
@@ -624,6 +635,55 @@ const char* callErrorCode(Client::Failure failure)
     return "transport_error";
 }
 
+bool hasAnySubscription(const std::shared_ptr<ClientState>& state)
+{
+    std::lock_guard<std::mutex> lock(state->mutex);
+    for (const auto& weak : state->subscriptions)
+        if (auto subscription = weak.lock())
+            if (subscription->active) return true;
+    return false;
+}
+
+// Caller holds connectionMutex.
+void sendWildcard(const std::shared_ptr<ClientState>& state,
+                  const std::shared_ptr<RpcConnectionBase>& wire)
+{
+    if (state->wildcardSent || !wire) return;
+    std::weak_ptr<ClientState> weak = state;
+    wire->sendSubscribe({state->target, ""},
+        [weak](EventMessage event) {
+            if (event.eventName == kCompletionEvent) return;
+            if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
+        });
+    state->wildcardSent = true;
+}
+
+// The embedder's C hooks as the session layer's callbacks.
+std::function<std::string(const std::string&)> sessionHook(lp_session_hook_cb hook, void* userData)
+{
+    if (!hook) return {};
+    return [hook, userData](const std::string& request) {
+        char* text = hook(request.c_str(), userData);
+        std::string reply = text ? text : "";
+        lp_string_free(text);
+        return reply;
+    };
+}
+
+// Caller holds connectionMutex.
+std::shared_ptr<RpcConnectionBase> connectSessionFor(const std::shared_ptr<ClientState>& state,
+                                                     std::chrono::milliseconds timeout,
+                                                     std::string& error)
+{
+    logos::plain::abi::ClientSessionConfig config;
+    config.target = state->target;
+    config.codec = state->targetConfig.codec;
+    config.credential = state->sessionCredential;
+    config.dial = sessionHook(state->sessionDial, state->sessionHookData);
+    config.hello = sessionHook(state->sessionHello, state->sessionHookData);
+    return logos::plain::abi::connectSession(config, timeout, error, &state->alive);
+}
+
 // `code`, when given, names a failure in the protocol's call-error vocabulary.
 bool ensureConnected(const std::shared_ptr<ClientState>& state,
                      int timeout, std::string& error, std::string* code = nullptr)
@@ -662,7 +722,11 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
     // Not connected: the route is chosen again, so a provider that moved into or
     // out of this process is followed.
     std::shared_ptr<RpcConnectionBase> wire;
-    if (isNetworkProtocol(state->targetConfig.protocol)) {
+    if (isSessionProtocol(state->targetConfig.protocol)) {
+        if (state->networkWire) state->networkWire->stop("reconnecting");
+        wire = connectSessionFor(state, remaining, error);
+        if (!wire) return fail("object_unavailable");
+    } else if (isNetworkProtocol(state->targetConfig.protocol)) {
         if (state->networkWire) state->networkWire->stop("reconnecting");
         wire = logos::plain::abi::connect(state->targetConfig, remaining, error, &state->alive);
         if (!wire) return fail("object_unavailable");
@@ -681,15 +745,16 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         wire->setErrorHandler([weak](const std::string&) {
             if (auto locked = weak.lock()) queueNetworkLoss(locked);
         });
-        wire->sendSubscribe({state->target, kCompletionEvent},
-            [weak](EventMessage event) {
-                if (auto locked = weak.lock()) recordNetworkCompletion(locked, event);
-            });
-        wire->sendSubscribe({state->target, ""},
-            [weak](EventMessage event) {
-                if (event.eventName == kCompletionEvent) return;
-                if (auto locked = weak.lock()) queueNetworkEvent(locked, std::move(event));
-            });
+        const bool session = isSessionProtocol(state->targetConfig.protocol);
+        // A session never carries the completion channel, and subscribes to
+        // events only once something here listens.
+        if (!session)
+            wire->sendSubscribe({state->target, kCompletionEvent},
+                [weak](EventMessage event) {
+                    if (auto locked = weak.lock()) recordNetworkCompletion(locked, event);
+                });
+        state->wildcardSent = false;
+        if (!session || hasAnySubscription(state)) sendWildcard(state, wire);
         state->networkWire = std::move(wire);
         state->rpcRoute = true;
         if (!state->eventWorker.joinable())
@@ -743,6 +808,8 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
             if (!state->rpcRoute)
                 acquired = state->wire->acquire(state->target, std::chrono::milliseconds(250),
                                                  &error);
+            else if (isSessionProtocol(state->targetConfig.protocol))
+                sendWildcard(state, state->networkWire);
         }
 
         if (!acquired) {
@@ -939,6 +1006,10 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout);
     const std::string credential = tokenGet(state->tokens, "capability_module");
+    if (isSessionProtocol(state->capabilityConfig.protocol)) {
+        error = "tokens are never requested over a session";
+        return {};
+    }
     const bool network = isNetworkProtocol(state->capabilityConfig.protocol);
     if (network || reachesInproc(state->capabilityConfig, "capability_module")) {
         auto wire = network
@@ -1059,8 +1130,11 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
                 deadline - std::chrono::steady_clock::now()).count()));
     };
     // The engine's in-process connection is its identity: it needs no token.
+    // Nor does a session: the connection itself is authenticated.
+    const bool session = isSessionProtocol(state->targetConfig.protocol);
     std::string token;
-    if (!(isRuntimePrincipal(state->origin) && reachesInproc(state->targetConfig, state->target)))
+    if (!session
+        && !(isRuntimePrincipal(state->origin) && reachesInproc(state->targetConfig, state->target)))
         token = tokenFor(state, remaining(), error);
     // Connecting decides the route the call takes.
     if (!ensureConnected(state, remaining(), error, &code)) return std::nullopt;
@@ -1072,7 +1146,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
             const RpcValue* status = value->asMap().find(kStatusKey);
             return status && status->isString() && status->asString() == "unauthorized";
         };
-        if (unauthorized(result) && state->target != "capability_module") {
+        if (!session && unauthorized(result) && state->target != "capability_module") {
             token = tokenFor(state, remaining(), error, token);
             if (!token.empty())
                 result = networkCall(state, state->target, method, args,
@@ -1085,8 +1159,9 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         }
         if (!result) return std::nullopt;
         Variant wrapped = Variant::fromRpc(*result);
+        // Over a session a value shaped like the pending sentinel is only data.
         std::string completion;
-        if (pendingId(wrapped, completion)) {
+        if (!session && pendingId(wrapped, completion)) {
             std::unique_lock<std::mutex> lock(state->mutex);
             if (!state->completionChanged.wait_until(lock, deadline, [&] {
                     return !state->alive || state->completions.count(completion) != 0;
@@ -1217,10 +1292,57 @@ struct DispatchGate {
     std::deque<std::uint64_t> waiting;
 };
 
+// A place reserved when a network call arrived: GateEntry waits for it, and one
+// never entered is taken out of the line so it holds nobody up.
+struct ReservedPlace final : logos::plain::abi::GatePlace {
+    ReservedPlace(DispatchGate& g, std::uint64_t t) : gate(g), ticket(t) {}
+    ~ReservedPlace() override
+    {
+        if (entered) return;
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        gate.waiting.erase(std::remove(gate.waiting.begin(), gate.waiting.end(), ticket),
+                           gate.waiting.end());
+        gate.changed.notify_all();
+    }
+    DispatchGate& gate;
+    std::uint64_t ticket;
+    bool entered = false;
+};
+
+std::shared_ptr<logos::plain::abi::GatePlace> reservePlace(DispatchGate& gate)
+{
+    std::lock_guard<std::mutex> lock(gate.mutex);
+    const std::uint64_t ticket = gate.nextTicket++;
+    gate.waiting.push_back(ticket);
+    return std::make_shared<ReservedPlace>(gate, ticket);
+}
+
 class GateEntry {
 public:
-    explicit GateEntry(DispatchGate& gate) : m_gate(gate)
+    // Enters at the place a network call reserved on arrival, if it has one.
+    GateEntry(DispatchGate& gate, logos::plain::abi::GatePlace* place) : m_gate(gate)
     {
+        auto* reserved = dynamic_cast<ReservedPlace*>(place);
+        if (!reserved || &reserved->gate != &gate) {
+            enter();
+            return;
+        }
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        const std::uint64_t ticket = reserved->ticket;
+        gate.changed.wait(lock, [&] {
+            return gate.waiting.front() == ticket && gate.running < gate.capacity;
+        });
+        gate.waiting.pop_front();
+        reserved->entered = true;
+        ++gate.running;
+        gate.changed.notify_all();
+    }
+    explicit GateEntry(DispatchGate& gate) : m_gate(gate) { enter(); }
+
+private:
+    void enter()
+    {
+        DispatchGate& gate = m_gate;
         std::unique_lock<std::mutex> lock(gate.mutex);
         const std::uint64_t ticket = gate.nextTicket++;
         gate.waiting.push_back(ticket);
@@ -1232,6 +1354,8 @@ public:
         // Under the lock: mingw was seen to lose a notify made after unlocking.
         gate.changed.notify_all();
     }
+
+public:
     ~GateEntry()
     {
         std::lock_guard<std::mutex> lock(m_gate.mutex);
@@ -1254,6 +1378,10 @@ struct lp_provider {
     Server server;
     bool qtroStarted = false;
     std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networkEndpoints;
+    std::vector<std::unique_ptr<logos::plain::abi::SessionEndpoint>> sessionEndpoints;
+    // Guards both endpoint lists once the provider is prepared: add_endpoint
+    // may grow them while events are emitted.
+    std::mutex endpointsMutex;
     std::shared_ptr<logos::plain::inproc::Endpoint> inproc;
     lp_dispatch_cb dispatch = nullptr;
     lp_getmethods_cb getMethods = nullptr;
@@ -1271,6 +1399,14 @@ struct lp_provider {
     std::string credential;
     std::atomic<bool> prepared{false};
     std::atomic<bool> registered{false};
+    // tls_tcp. The credential and options are read when a listener starts; the
+    // anchors and the authenticator on every session. Guarded by `mutex`.
+    logos::plain::abi::TlsCredential sessionCredential;
+    logos::plain::abi::SessionOptions sessionOptions;
+    std::string trustAnchors;
+    bool unanchoredAdmission = false;
+    lp_session_authenticator_cb authenticator = nullptr;
+    void* authenticatorData = nullptr;
 };
 
 namespace {
@@ -1552,7 +1688,8 @@ bool bindingMismatch(const std::string& caller, const std::string& principal)
 ResultMessage providerNetworkCall(lp_provider* provider,
                                   const CallMessage& request,
                                   const char* protocol,
-                                  const std::string* principal = nullptr)
+                                  const std::string* principal = nullptr,
+                                  logos::plain::abi::GatePlace* place = nullptr)
 {
     ResultMessage reply;
     reply.id = request.id;
@@ -1615,7 +1752,7 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     const std::string argsText = dumpJson(args);
     char* text = nullptr;
     {
-        GateEntry entry(provider->gate);
+        GateEntry entry(provider->gate, place);
         const std::string previousCaller = std::move(gCurrentCaller);
         gCurrentCaller = caller;
         text = provider->dispatch(request.method.c_str(), argsText.c_str(),
@@ -1673,6 +1810,162 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
     }
     reply.ok = true;
     return reply;
+}
+
+// A call on a tls_tcp session: the connection's caller document stands for the
+// caller, no token is read, and a session can never deliver or revoke one.
+ResultMessage providerSessionCall(lp_provider* provider, const CallMessage& request,
+                                  const std::string& caller,
+                                  logos::plain::abi::GatePlace* place = nullptr)
+{
+    ResultMessage reply;
+    reply.id = request.id;
+    if (request.object != provider->moduleName || !provider->registered) {
+        reply.err = "object not published: " + request.object;
+        reply.errCode = "MODULE_NOT_LOADED";
+        return reply;
+    }
+    if (request.method == "informModuleToken" || request.method == "revokeModuleToken") {
+        reply.err = "tokens are not accepted over a session";
+        reply.errCode = "UNAUTHORIZED";
+        return reply;
+    }
+    if (request.method == "getPluginMethods" || request.method == "getPluginEvents"
+        || request.method == "getPluginInterface") {
+        reply.ok = true;
+        reply.value = jsonToRpc(providerMetadata(provider,
+            request.method == "getPluginMethods" ? "methods"
+            : request.method == "getPluginEvents" ? "events" : "interface"));
+        return reply;
+    }
+    if (!provider->dispatch) {
+        reply.err = "method failed";
+        reply.errCode = "METHOD_FAILED";
+        return reply;
+    }
+    json args = json::array();
+    for (const auto& value : request.args) args.push_back(rpcToJson(value));
+    const std::string argsText = dumpJson(args);
+    char* text = nullptr;
+    {
+        GateEntry entry(provider->gate, place);
+        const std::string previousCaller = std::move(gCurrentCaller);
+        gCurrentCaller = caller;
+        text = provider->dispatch(request.method.c_str(), argsText.c_str(), provider->userData);
+        gCurrentCaller = previousCaller;
+    }
+    const json result = text ? json::parse(text, nullptr, false) : json(json::value_t::discarded);
+    lp_string_free(text);
+    if (result.is_discarded()) {
+        reply.err = "method failed";
+        reply.errCode = "METHOD_FAILED";
+        return reply;
+    }
+    reply.ok = true;
+    reply.value = jsonToRpc(result);
+    return reply;
+}
+
+std::optional<json> sessionFilter(const char* filterJson)
+{
+    const json filter = json::parse(filterJson && *filterJson ? filterJson : "{}", nullptr, false);
+    if (filter.is_discarded() || !filter.is_object()) return std::nullopt;
+    return filter;
+}
+
+std::size_t gateCapacity(lp_provider* provider)
+{
+    std::lock_guard<std::mutex> lock(provider->gate.mutex);
+    return provider->gate.capacity;
+}
+
+std::unique_ptr<logos::plain::abi::SessionEndpoint> makeSessionEndpoint(
+    lp_provider* provider, const LogosTransportConfig& config, int& code)
+{
+    logos::plain::abi::TlsCredential credential;
+    logos::plain::abi::SessionOptions options;
+    bool unanchored = false;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        credential = provider->sessionCredential;
+        options = provider->sessionOptions;
+        unanchored = provider->unanchoredAdmission;
+    }
+    if (credential.empty()) {
+        code = LP_ERR_INVALID_ARG;
+        return nullptr;
+    }
+    auto endpoint = std::make_unique<logos::plain::abi::SessionEndpoint>(config, options,
+        credential,
+        [provider] {
+            std::lock_guard<std::mutex> lock(provider->mutex);
+            return provider->trustAnchors;
+        },
+        [provider](const std::string& request) -> std::string {
+            lp_session_authenticator_cb authenticate = nullptr;
+            void* data = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(provider->mutex);
+                authenticate = provider->authenticator;
+                data = provider->authenticatorData;
+            }
+            if (!authenticate) return {};
+            char* text = authenticate(request.c_str(), data);
+            std::string reply = text ? text : "";
+            lp_string_free(text);
+            return reply;
+        },
+        [provider](const CallMessage& request, const std::string& caller,
+                   std::shared_ptr<logos::plain::abi::GatePlace> place) {
+            return providerSessionCall(provider, request, caller, place.get());
+        },
+        [provider](const logos::plain::MethodsMessage& request) {
+            return providerNetworkMethods(provider, request);
+        },
+        [provider] { return gateCapacity(provider); },
+        [provider] { return reservePlace(provider->gate); });
+    endpoint->setUnanchoredAdmission(unanchored);
+    std::string error;
+    if (!endpoint->start(error)) {
+        code = LP_ERR_INTERNAL;
+        return nullptr;
+    }
+    return endpoint;
+}
+
+std::unique_ptr<logos::plain::abi::ServerEndpoint> makeNetworkEndpoint(
+    lp_provider* provider, const LogosTransportConfig& config)
+{
+    const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
+    auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
+        [provider, label](const CallMessage& request,
+                          std::shared_ptr<logos::plain::abi::GatePlace> place) {
+            return providerNetworkCall(provider, request, label, nullptr, place.get());
+        },
+        [provider](const logos::plain::MethodsMessage& request) {
+            return providerNetworkMethods(provider, request);
+        },
+        [provider](const logos::plain::TokenMessage& request) {
+            providerAcceptToken(provider, request.authToken,
+                                request.moduleName, request.token);
+        },
+        [provider] { return gateCapacity(provider); },
+        [provider] { return reservePlace(provider->gate); });
+    if (!network->start()) return nullptr;
+    return network;
+}
+
+void stopEndpoints(lp_provider* provider)
+{
+    std::vector<std::unique_ptr<logos::plain::abi::SessionEndpoint>> sessions;
+    std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networks;
+    {
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+        sessions.swap(provider->sessionEndpoints);
+        networks.swap(provider->networkEndpoints);
+    }
+    for (auto& endpoint : sessions) endpoint->stop();
+    for (auto& endpoint : networks) endpoint->stop();
 }
 
 } // namespace
@@ -1812,8 +2105,7 @@ try {
         if (auto state = weak.lock()) connectionLost(state);
     });
     state->subscriptionWorker = std::thread([state] { subscriptionLoop(state); });
-    if (state->targetConfig.protocol == LogosProtocol::Tcp
-        || state->targetConfig.protocol == LogosProtocol::TcpSsl)
+    if (isNetworkProtocol(state->targetConfig.protocol))
         state->eventWorker = std::thread([state] { networkEventLoop(state); });
     return new lp_client{std::move(state)};
 } catch (...) {
@@ -2233,6 +2525,7 @@ try {
                             Variant::fromRpc(RpcValue{moduleName}),
                             Variant::fromRpc(RpcValue{token})};
     std::string error;
+    if (isSessionProtocol(config.protocol)) return LP_ERR_UNSUPPORTED;
     if (!isNetworkProtocol(config.protocol) && reachesInproc(config, "capability_module"))
         return pushTokenInproc("capability_module", state->origin, authToken, moduleName, token,
                                kDefaultTimeoutMs);
@@ -2363,8 +2656,7 @@ void lp_provider_destroy(lp_provider* provider)
     // Stop waits for every outstanding connection handler before the callback
     // pointers and module-owned user data in `provider` can be destroyed.
     logos::plain::inproc::withdraw(provider->inproc);
-    for (auto& endpoint : provider->networkEndpoints) endpoint->stop();
-    provider->networkEndpoints.clear();
+    stopEndpoints(provider);
     provider->server.stop();
     delete provider;
 }
@@ -2389,8 +2681,7 @@ try {
     const auto unwind = [provider] {
         logos::plain::inproc::withdraw(provider->inproc);
         provider->inproc.reset();
-        for (auto& active : provider->networkEndpoints) active->stop();
-        provider->networkEndpoints.clear();
+        stopEndpoints(provider);
         provider->server.stop();
     };
     for (const auto& config : transports) {
@@ -2438,26 +2729,27 @@ try {
             provider->qtroStarted = true;
             continue;
         }
+        if (isSessionProtocol(config.protocol)) {
+            int code = LP_ERR_INTERNAL;
+            auto session = makeSessionEndpoint(provider, config, code);
+            if (!session) {
+                unwind();
+                return code;
+            }
+            std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+            provider->sessionEndpoints.push_back(std::move(session));
+            continue;
+        }
         if (!isNetworkProtocol(config.protocol)) {
             unwind();
             return LP_ERR_UNSUPPORTED;
         }
-        const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
-        auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
-            [provider, label](const CallMessage& request) {
-                return providerNetworkCall(provider, request, label);
-            },
-            [provider](const logos::plain::MethodsMessage& request) {
-                return providerNetworkMethods(provider, request);
-            },
-            [provider](const logos::plain::TokenMessage& request) {
-                providerAcceptToken(provider, request.authToken,
-                                    request.moduleName, request.token);
-            });
-        if (!network->start()) {
+        auto network = makeNetworkEndpoint(provider, config);
+        if (!network) {
             unwind();
             return LP_ERR_INTERNAL;
         }
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
         provider->networkEndpoints.push_back(std::move(network));
     }
     provider->prepared = true;
@@ -2516,8 +2808,13 @@ try {
     }
     std::vector<RpcValue> arguments;
     for (const auto& item : data) arguments.push_back(jsonToRpc(item));
-    for (auto& endpoint : provider->networkEndpoints)
-        endpoint->emit(provider->moduleName, eventName, arguments);
+    {
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+        for (auto& endpoint : provider->networkEndpoints)
+            endpoint->emit(provider->moduleName, eventName, arguments);
+        for (auto& endpoint : provider->sessionEndpoints)
+            endpoint->emit(provider->moduleName, eventName, arguments);
+    }
     logos::plain::inproc::emit(provider->inproc, provider->moduleName, eventName, arguments);
     if (!provider->qtroStarted) return LP_OK;
     Variant payload = jsonToVariant(data);
@@ -2575,6 +2872,149 @@ int lp_provider_set_max_concurrent_calls(lp_provider* provider, unsigned maxCall
     }
     logos::plain::inproc::setMaxWorkers(provider->inproc, maxCalls);
     return LP_OK;
+}
+
+int lp_provider_set_tls_credential(lp_provider* provider, const char* certChainPem,
+                                   const char* keyPem)
+try {
+    if (!provider || !certChainPem || !keyPem) return LP_ERR_INVALID_ARG;
+    const logos::plain::abi::TlsCredential credential{certChainPem, keyPem};
+    std::string error;
+    if (!logos::plain::abi::validateCredential(credential, error)) return LP_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+        for (auto& endpoint : provider->sessionEndpoints)
+            if (!endpoint->replaceCredential(credential, error)) return LP_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->sessionCredential = credential;
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_set_trust_anchors(lp_provider* provider, const char* anchorsPem)
+try {
+    if (!provider) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->trustAnchors = anchorsPem ? anchorsPem : "";
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_set_unanchored_admission(lp_provider* provider, int enabled)
+try {
+    if (!provider) return LP_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(provider->mutex);
+        provider->unanchoredAdmission = enabled != 0;
+    }
+    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+    for (auto& endpoint : provider->sessionEndpoints) endpoint->setUnanchoredAdmission(enabled != 0);
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_set_session_authenticator(lp_provider* provider,
+                                          lp_session_authenticator_cb authenticate,
+                                          void* userData)
+{
+    if (!provider) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    provider->authenticator = authenticate;
+    provider->authenticatorData = userData;
+    return LP_OK;
+}
+
+int lp_provider_set_session_options(lp_provider* provider, const char* optionsJson)
+try {
+    if (!provider) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(provider->mutex);
+    logos::plain::abi::SessionOptions options = provider->sessionOptions;
+    std::string error;
+    if (!logos::plain::abi::parseSessionOptions(optionsJson ? optionsJson : "", options, error))
+        return LP_ERR_INVALID_ARG;
+    provider->sessionOptions = options;
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+char* lp_provider_endpoints_json(lp_provider* provider)
+try {
+    if (!provider) return nullptr;
+    LogosTransportSet bound;
+    {
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+        for (auto& endpoint : provider->networkEndpoints) bound.push_back(endpoint->bound());
+        for (auto& endpoint : provider->sessionEndpoints) bound.push_back(endpoint->bound());
+    }
+    json listeners = json::array();
+    for (const auto& config : bound) {
+        const json full = json::parse(logos::transportSetToJsonString({config}), nullptr, false);
+        if (!full.is_array() || full.empty()) continue;
+        json entry = full[0];
+        // Paths to key material are the embedder's business, not a listener's.
+        for (const char* key : {"ca_file", "cert_file", "key_file", "verify_peer"}) entry.erase(key);
+        listeners.push_back(entry);
+    }
+    return duplicate(dumpJson(listeners));
+} catch (...) {
+    return nullptr;
+}
+
+int lp_provider_close_sessions(lp_provider* provider, const char* filterJson)
+try {
+    const auto filter = sessionFilter(filterJson);
+    if (!provider || !filter) return LP_ERR_INVALID_ARG;
+    int closed = 0;
+    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+    for (auto& endpoint : provider->sessionEndpoints)
+        closed += endpoint->closeSessions(*filter, "session closed by its provider");
+    return closed;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_extend_sessions(lp_provider* provider, const char* filterJson,
+                                long long lifetimeMs)
+try {
+    const auto filter = sessionFilter(filterJson);
+    if (!provider || !filter || lifetimeMs <= 0) return LP_ERR_INVALID_ARG;
+    int extended = 0;
+    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+    for (auto& endpoint : provider->sessionEndpoints)
+        extended += endpoint->extendSessions(*filter, std::chrono::milliseconds(lifetimeMs));
+    return extended;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_provider_add_endpoint(lp_provider* provider, const char* transportJson)
+try {
+    if (!provider || !provider->prepared || !transportJson) return LP_ERR_INVALID_ARG;
+    LogosTransportSet set;
+    if (!logos::parseTransportSet(std::string("[") + transportJson + "]", &set) || set.size() != 1)
+        return LP_ERR_INVALID_ARG;
+    const LogosTransportConfig& config = set.front();
+    if (isSessionProtocol(config.protocol)) {
+        int code = LP_ERR_INTERNAL;
+        auto session = makeSessionEndpoint(provider, config, code);
+        if (!session) return code;
+        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+        provider->sessionEndpoints.push_back(std::move(session));
+        return LP_OK;
+    }
+    if (!isNetworkProtocol(config.protocol)) return LP_ERR_UNSUPPORTED;
+    auto network = makeNetworkEndpoint(provider, config);
+    if (!network) return LP_ERR_INTERNAL;
+    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
+    provider->networkEndpoints.push_back(std::move(network));
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
 }
 
 // The public client surface: forwarded to the host when this image has a
@@ -2657,6 +3097,33 @@ int lp_client_set_subscription_options(lp_client* client, const char* optionsJso
     if (const auto* delegate = activeDelegate())
         return delegate->set_subscription_options(delegate->context, client, optionsJson);
     return setSubscriptionOptionsLocal(client, optionsJson);
+}
+
+// Sessions are dialled by a module host's own runtime, never through a delegate.
+int lp_client_set_tls_credential(lp_client* client, const char* certChainPem, const char* keyPem)
+try {
+    if (activeDelegate()) return LP_ERR_UNSUPPORTED;
+    if (!client || !certChainPem || !keyPem) return LP_ERR_INVALID_ARG;
+    const logos::plain::abi::TlsCredential credential{certChainPem, keyPem};
+    std::string error;
+    if (!logos::plain::abi::validateCredential(credential, error)) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
+    client->state->sessionCredential = credential;
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+int lp_client_set_session_hook(lp_client* client, lp_session_hook_cb dial,
+                               lp_session_hook_cb hello, void* userData)
+{
+    if (activeDelegate()) return LP_ERR_UNSUPPORTED;
+    if (!client) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
+    client->state->sessionDial = dial;
+    client->state->sessionHello = hello;
+    client->state->sessionHookData = userData;
+    return LP_OK;
 }
 
 int lp_client_rearm_subscriptions(lp_client* client)

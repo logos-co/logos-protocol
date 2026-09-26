@@ -447,6 +447,8 @@ TEST(PlainNetworkCAbi, TcpAsyncCallsReachTheProviderInTheOrderMade)
     TcpArrivals arrivals;
     lp_provider* provider = lp_provider_create("plain_async_order", ("[" + config + "]").c_str());
     ASSERT_NE(provider, nullptr);
+    // One call at a time, so the provider sees the wire order (as the local twin does).
+    ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 1), LP_OK);
     ASSERT_EQ(lp_provider_save_token(provider, "network_test", "secret"), LP_OK);
     ASSERT_EQ(lp_provider_register(provider, recordTcpArrival, methods, token, &arrivals), LP_OK);
     ASSERT_EQ(lp_token_save("plain_async_order", "secret"), LP_OK);
@@ -638,7 +640,7 @@ TEST(PlainNetworkCAbi, IntrospectionFallsBackForProvidersBeforeGetPluginInterfac
         return RpcValue{RpcList{{RpcValue{std::move(entry)}}}};
     };
     logos::plain::abi::ServerEndpoint endpoint(serverConfig,
-        [&](const CallMessage& request) {
+        [&](const CallMessage& request, std::shared_ptr<logos::plain::abi::GatePlace>) {
             ResultMessage result;
             result.id = request.id;
             result.ok = request.method != "getPluginInterface";
@@ -685,7 +687,7 @@ TEST(PlainNetworkCAbi, AnEventWithInvalidUtf8ArrivesReplaced)
     serverConfig.port = freePort();
     serverConfig.codec = LogosWireCodec::Cbor;
     logos::plain::abi::ServerEndpoint endpoint(serverConfig,
-        [](const CallMessage& request) {
+        [](const CallMessage& request, std::shared_ptr<logos::plain::abi::GatePlace>) {
             ResultMessage result;
             result.id = request.id;
             result.ok = true;

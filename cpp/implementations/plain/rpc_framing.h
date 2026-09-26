@@ -30,12 +30,15 @@ public:
 // malformed input.
 constexpr uint32_t kMaxFrameLength = 16u * 1024u * 1024u;
 
-// Build a complete frame around a codec-produced payload.
+// Build a complete frame around a codec-produced payload. Throws FramingError
+// when the frame would exceed `limit` (a connection's negotiated maximum).
 std::vector<uint8_t>
-encodeFrame(MessageType tag, const std::vector<uint8_t>& payload);
+encodeFrame(MessageType tag, const std::vector<uint8_t>& payload,
+            uint32_t limit = kMaxFrameLength);
 
 // Convenience: encode message via codec + frame in one step.
-std::vector<uint8_t> encodeFrame(IWireCodec& codec, const AnyMessage& msg);
+std::vector<uint8_t> encodeFrame(IWireCodec& codec, const AnyMessage& msg,
+                                 uint32_t limit = kMaxFrameLength);
 
 // Incremental reader: feed bytes via `append`, pull complete frames out via
 // `next`. Useful with Asio async reads that deliver arbitrary chunk sizes.
@@ -53,8 +56,14 @@ public:
 
     std::size_t buffered() const { return m_buf.size(); }
 
+    // The largest frame this reader accepts; kMaxFrameLength unless a session
+    // negotiated another.
+    void setLimit(uint32_t limit) { m_limit = limit; }
+    uint32_t limit() const { return m_limit; }
+
 private:
     std::vector<uint8_t> m_buf;
+    uint32_t m_limit = kMaxFrameLength;
 };
 
 } // namespace logos::plain

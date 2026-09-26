@@ -128,3 +128,16 @@ TEST_F(TransportFactoryTest, TheQtRuntimeRefusesInproc)
     EXPECT_FALSE(conn->connectToHost());
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(inproc));
 }
+
+// tls_tcp sessions too: refused, never served by another transport.
+TEST_F(TransportFactoryTest, TheQtRuntimeRefusesTlsTcp)
+{
+    LogosModeConfig::setMode(LogosMode::Remote);
+    LogosTransportConfig session;
+    session.protocol = LogosProtocol::TlsTcp;
+    EXPECT_EQ(LogosTransportFactory::createHost(session, "local:tls_tcp_refused"), nullptr);
+    auto conn = LogosTransportFactory::createConnection(session, "local:tls_tcp_refused");
+    ASSERT_NE(conn, nullptr);
+    EXPECT_FALSE(conn->connectToHost());
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(session));
+}
