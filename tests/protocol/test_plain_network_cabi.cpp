@@ -447,6 +447,8 @@ TEST(PlainNetworkCAbi, TcpAsyncCallsReachTheProviderInTheOrderMade)
     TcpArrivals arrivals;
     lp_provider* provider = lp_provider_create("plain_async_order", ("[" + config + "]").c_str());
     ASSERT_NE(provider, nullptr);
+    // One call at a time, so the provider sees the wire order (as the local twin does).
+    ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 1), LP_OK);
     ASSERT_EQ(lp_provider_save_token(provider, "network_test", "secret"), LP_OK);
     ASSERT_EQ(lp_provider_register(provider, recordTcpArrival, methods, token, &arrivals), LP_OK);
     ASSERT_EQ(lp_token_save("plain_async_order", "secret"), LP_OK);
