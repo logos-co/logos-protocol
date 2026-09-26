@@ -638,7 +638,7 @@ TEST(PlainNetworkCAbi, IntrospectionFallsBackForProvidersBeforeGetPluginInterfac
         return RpcValue{RpcList{{RpcValue{std::move(entry)}}}};
     };
     logos::plain::abi::ServerEndpoint endpoint(serverConfig,
-        [&](const CallMessage& request) {
+        [&](const CallMessage& request, std::shared_ptr<logos::plain::abi::GatePlace>) {
             ResultMessage result;
             result.id = request.id;
             result.ok = request.method != "getPluginInterface";
@@ -685,7 +685,7 @@ TEST(PlainNetworkCAbi, AnEventWithInvalidUtf8ArrivesReplaced)
     serverConfig.port = freePort();
     serverConfig.codec = LogosWireCodec::Cbor;
     logos::plain::abi::ServerEndpoint endpoint(serverConfig,
-        [](const CallMessage& request) {
+        [](const CallMessage& request, std::shared_ptr<logos::plain::abi::GatePlace>) {
             ResultMessage result;
             result.id = request.id;
             result.ok = true;
