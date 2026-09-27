@@ -1,4 +1,5 @@
 #include "logos_protocol.h"
+#include "logos_transport_config_json.h"
 #include "logos_codec.h"
 #include "implementations/qt_remote_plain/qtro_transport.h"
 #include "logos_protocol_plain_tokens.h"
@@ -501,7 +502,7 @@ TEST(QtRemotePlainCabiTest, AProviderIsNotCreatedFromAnUnusableTransportSet)
 {
     for (const char* unusable : {
              "W3sicHJvdG9jb2wiOiJ0Y3AiLCJwb3J0Ijo2MDAxfV0=", "{}", "[1]",
-             R"([{"protocol":"tcp","port":"6001"}])", R"([{"protocol":"tcp","port":70000}])",
+             R"([{"protocol":"tls_tcp","port":"6001"}])", R"([{"protocol":"tls_tcp","port":70000}])",
              R"([{"protocol":"quic"}])", R"([{"codec":"xml"}])"}) {
         lp_provider* provider = lp_provider_create("transport_set_probe", unusable);
         EXPECT_EQ(provider, nullptr) << unusable;
@@ -509,26 +510,51 @@ TEST(QtRemotePlainCabiTest, AProviderIsNotCreatedFromAnUnusableTransportSet)
     }
     for (const char* usable : {
              "", "[]", R"([{"protocol":"local"}])",
-             R"([{"protocol":"tcp","host":"127.0.0.1","port":0,"codec":"cbor"}])"}) {
+             R"([{"protocol":"tls_tcp","host":"127.0.0.1","port":0,"codec":"cbor"}])"}) {
         lp_provider* provider = lp_provider_create("transport_set_probe", usable);
         EXPECT_NE(provider, nullptr) << usable;
         lp_provider_destroy(provider);
     }
 }
 
-// {"protocol":"local"} is the header's own first example.
+// {"protocol":"local"} and the tls_tcp object are the header's own examples.
 TEST(QtRemotePlainCabiTest, TheHeadersTransportExamplesAreAccepted)
 {
+    EXPECT_EQ(lp_set_default_transport(
+                  R"({"protocol":"tls_tcp","host":"127.0.0.1","port":7443,"codec":"json"})"),
+              LP_OK);
     EXPECT_EQ(lp_set_default_transport(R"({"protocol":"local"})"), LP_OK);
     lp_client* client = lp_client_create("transport_probe", "test", R"({"protocol":"local"})", nullptr);
     EXPECT_NE(client, nullptr);
     lp_client_destroy(client);
-    for (const char* refused : {R"({"protocol":"tpc"})", R"({"protocol":"tcp","port":"6001"})",
+    for (const char* refused : {R"({"protocol":"tpc"})", R"({"protocol":"tls_tcp","port":"6001"})",
                                 "[]", "not json"}) {
         EXPECT_EQ(lp_set_default_transport(refused), LP_ERR_INVALID_ARG) << refused;
         EXPECT_EQ(lp_client_create("transport_probe", "test", refused, nullptr), nullptr) << refused;
     }
     EXPECT_EQ(lp_set_default_transport(R"({"protocol":"qt_remote_plain"})"), LP_OK);
+}
+
+// Removed in 0.15: refused wherever a transport is named, never served as another.
+TEST(QtRemotePlainCabiTest, TheRemovedTcpTransportsAreRefusedEverywhere)
+{
+    lp_provider* served = lp_provider_create("removed_probe", R"([{"protocol":"inproc"}])");
+    ASSERT_NE(served, nullptr);
+    ASSERT_EQ(lp_provider_register(served, [](const char*, const char*, void*) -> char* { return nullptr; },
+                                   nullptr, nullptr, nullptr), LP_OK);
+    for (const char* removed : {R"({"protocol":"tcp","host":"127.0.0.1","port":0})",
+                                R"({"protocol":"tcp_ssl","host":"127.0.0.1","port":0})"}) {
+        const std::string set = std::string("[") + removed + "]";
+        EXPECT_EQ(lp_provider_create("removed_probe", set.c_str()), nullptr) << removed;
+        EXPECT_EQ(lp_set_default_transport(removed), LP_ERR_INVALID_ARG) << removed;
+        EXPECT_EQ(lp_client_create("removed_probe", "test", removed, nullptr), nullptr) << removed;
+        EXPECT_EQ(lp_client_create("removed_probe", "test", nullptr, removed), nullptr) << removed;
+        EXPECT_EQ(lp_provider_add_endpoint(served, removed), LP_ERR_INVALID_ARG) << removed;
+        std::string why;
+        EXPECT_FALSE(logos::parseTransportSet(set, nullptr, &why)) << removed;
+        EXPECT_NE(why.find("removed in protocol 0.15"), std::string::npos) << why;
+    }
+    lp_provider_destroy(served);
 }
 
 TEST(QtRemotePlainCabiTest, ModesThisRuntimeLacksAreUnsupported)

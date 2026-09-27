@@ -18,8 +18,8 @@
 // with the host in-process.
 enum class LogosProtocol {
     LocalSocket,   // QLocalSocket via QRemoteObjects (existing code path)
-    Tcp,           // Plain TCP (Boost.Asio + JSON framing)
-    TcpSsl,        // TCP + TLS (Boost.Asio + OpenSSL + JSON framing)
+    Tcp,           // removed in 0.15: reserved, and refused by both runtimes
+    TcpSsl,        // removed in 0.15: reserved, and refused by both runtimes
     QtRemotePlain, // QtRO 2.0-compatible local IPC implemented without Qt
     Inproc,        // a provider in this process (plain runtime only; the Qt runtime refuses it)
     TlsTcp,        // mutual TLS 1.3 session between runtimes (plain runtime only; the Qt runtime refuses it)
@@ -34,25 +34,20 @@ enum class LogosWireCodec {
 struct LogosTransportConfig {
     LogosProtocol protocol = LogosProtocol::LocalSocket;
 
-    // Tcp / TcpSsl bind address on the daemon side.
-    // On the client side this is the address to connect to; clients may
-    // override via --tcp-host to, e.g., reach a container bound to 0.0.0.0
-    // as "localhost" from the host.
+    // TlsTcp: the address a provider binds, or a client dials.
     std::string host = "127.0.0.1";
 
-    // 0 = let the daemon pick; the chosen port is written into the endpoint
-    // file so clients can find it.
+    // 0 = the provider picks one (lp_provider_endpoints_json reports it).
     uint16_t port = 0;
 
-    // TcpSsl only. TlsTcp takes its credential and trust anchors through the
-    // C ABI (lp_provider_set_tls_credential and friends), never from files.
+    // Unused since 0.15, when TcpSsl went; kept so the layout does not change.
+    // TlsTcp takes its credential and trust anchors through the C ABI.
     std::string caFile;
     std::string certFile;
     std::string keyFile;
     bool verifyPeer = true;
 
-    // Wire-format codec used for RPC framing on this transport. Only
-    // meaningful for JSON-RPC transports (Tcp / TcpSsl / TlsTcp); LocalSocket and
+    // Wire-format codec used for RPC framing on TlsTcp; LocalSocket and
     // QtRemotePlain use the QtRO wire profile.
     LogosWireCodec codec = LogosWireCodec::Json;
 };

@@ -15,24 +15,17 @@
 //     it comes from the extract-and-erase under m_mu — three contenders
 //     (dispatchIncoming, fail()'s sweep, cancelPending) and only one can win;
 //   * exactly-once DELIVERY to the user is NOT the connection's. It belongs to
-//     the handler, and for PlainLogosObject it is AsyncCall::deliver()'s CAS.
+//     the handler.
 //
 // These tests construct that interleaving by hand rather than racing for it: a
 // connection stub reproduces dispatchIncoming's extract-then-invoke exactly and
 // lets the test stand between the two halves.
-//
-// The second test is a validated detector: against a transport whose
-// AsyncCall::claim() does not compare-exchange and whose takeCallback() copies
-// rather than swaps — a local edit in a throwaway checkout, not a switch in
-// this tree; see the top of test_iofold.cpp — it reports 2 deliveries for 1
-// call.
 
 #include <gtest/gtest.h>
 
 #include "incoming_call_handler.h"
 #include "json_codec.h"
 #include "logos_call_error.h"
-#include "plain_logos_object.h"
 #include "rpc_connection.h"
 #include "rpc_message.h"
 
@@ -172,90 +165,6 @@ ResultMessage okResult(std::uint64_t id, int value)
 }
 
 }  // namespace
-
-// ── 1. the literal claim: cancelPending() does NOT prevent a callback ────────
-TEST(PlainCancelPendingRaceTest, CancelPendingCannotStopAnAlreadyExtractedHandler)
-{
-    ensureApp();
-    auto conn = std::make_shared<StubConnection>();
-    auto* obj = new PlainLogosObject("cancel_probe", conn);
-
-    std::atomic<int> deliveries{0};
-    obj->callMethodAsyncWithError(QStringLiteral("tok"), QStringLiteral("ping"),
-                                  QVariantList{}, 20000,
-                                  [&deliveries](QVariant, const logos::CallError&) {
-                                      deliveries.fetch_add(1);
-                                  });
-    const std::uint64_t id = conn->lastId();
-
-    // The reply is decoded: the handler leaves the map.
-    RpcConnectionBase::ResultHandler h = conn->extract(id);
-    ASSERT_TRUE(h) << "the call never registered a handler";
-
-    // The caller gives up HERE, in the gap. cancelPending() finds nothing.
-    conn->cancelPending(id);
-    EXPECT_EQ(conn->pendingCount(), 0u);
-    EXPECT_EQ(deliveries.load(), 0) << "nothing should have been delivered yet";
-
-    // ...and the handler runs anyway.
-    h(okResult(id, 42));
-    pumpUntil(deliveries, 1, 2000);
-
-    EXPECT_EQ(deliveries.load(), 1)
-        << "cancelPending() ran before this callback and did not stop it — which "
-           "is the point: the comment claiming a cancelled caller 'is never "
-           "called back at all' is what is wrong, not the code";
-
-    obj->release();
-    pump(50);
-}
-
-// ── 2. so exactly-once has to come from somewhere else: the CAS ─────────────
-//
-// The same gap, but with the second resolver being the one that actually exists
-// in production — teardown, which cancels every outstanding call. Both paths
-// reach AsyncCall::deliver() for the same call. With the CAS removed this
-// reports 2.
-TEST(PlainCancelPendingRaceTest, AnExtractedReplyRacingTeardownDeliversExactlyOnce)
-{
-    ensureApp();
-    auto conn = std::make_shared<StubConnection>();
-    auto* obj = new PlainLogosObject("cancel_probe", conn);
-
-    std::atomic<int> deliveries{0};
-    std::atomic<int> released{0};      // callErrorReleased — teardown won
-    std::atomic<int> answered{0};      // no error            — the reply won
-    obj->callMethodAsyncWithError(QStringLiteral("tok"), QStringLiteral("ping"),
-                                  QVariantList{}, 20000,
-                                  [&](QVariant, const logos::CallError& e) {
-                                      deliveries.fetch_add(1);
-                                      if (e.ok()) answered.fetch_add(1);
-                                      else        released.fetch_add(1);
-                                  });
-    const std::uint64_t id = conn->lastId();
-
-    // The io thread has the handler in hand...
-    RpcConnectionBase::ResultHandler h = conn->extract(id);
-    ASSERT_TRUE(h);
-
-    // ...teardown resolves the call and frees the handle out from under it...
-    obj->release();
-
-    // ...and only then does the reply run. It holds a shared_ptr to its
-    // AsyncCall, so it is safe to run at all — and finds the gate taken.
-    h(okResult(id, 42));
-
-    pumpUntil(deliveries, 1, 2000);
-    pump(100);   // a second delivery would land in here
-
-    EXPECT_EQ(deliveries.load(), 1)
-        << "the call was delivered " << deliveries.load()
-        << " times; exactly-once is AsyncCall::deliver()'s CAS and nothing else";
-    EXPECT_EQ(released.load(), 1) << "teardown should have been the resolver";
-    EXPECT_EQ(answered.load(), 0);
-
-    pump(50);
-}
 
 // ── 3. the OTHER caller of sendCallAsync: a promise, not an AsyncCall ────────
 //

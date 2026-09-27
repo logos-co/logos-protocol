@@ -250,9 +250,22 @@ TEST_F(LpClientTest, UnknownTransportProtocolFailsCreate)
 // A mistyped field used to throw out through the C ABI.
 TEST_F(LpClientTest, MistypedTransportFieldFailsCreate)
 {
-    EXPECT_EQ(lp_client_create("t", "o", R"({"protocol":"tcp","port":"6001"})", nullptr), nullptr);
-    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"tcp","port":"6001"})"),
+    EXPECT_EQ(lp_client_create("t", "o", R"({"protocol":"tls_tcp","port":"7443"})", nullptr), nullptr);
+    EXPECT_EQ(lp_set_default_transport(R"({"protocol":"tls_tcp","port":"7443"})"),
               LP_ERR_INVALID_ARG);
+}
+
+// Removed in 0.15: refused, never read as the local socket.
+TEST_F(LpClientTest, TheRemovedTcpTransportsFailCreate)
+{
+    for (const char* removed : {R"({"protocol":"tcp","host":"127.0.0.1","port":6001})",
+                                R"({"protocol":"tcp_ssl","host":"127.0.0.1","port":6443})"}) {
+        EXPECT_EQ(lp_client_create("t", "o", removed, nullptr), nullptr) << removed;
+        EXPECT_EQ(lp_client_create("t", "o", nullptr, removed), nullptr) << removed;
+        EXPECT_EQ(lp_set_default_transport(removed), LP_ERR_INVALID_ARG) << removed;
+        const std::string set = std::string("[") + removed + "]";
+        EXPECT_EQ(lp_provider_create("m", set.c_str()), nullptr) << removed;
+    }
 }
 
 TEST_F(LpClientTest, TokenStoreRoundTrip)

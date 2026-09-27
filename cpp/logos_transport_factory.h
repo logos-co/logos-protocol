@@ -19,13 +19,13 @@ namespace LogosTransportFactory {
      *   - LogosMode::Mock                 → MockTransportHost   (cfg ignored)
      *   - LogosMode::Local                → LocalTransportHost  (cfg ignored)
      *   - LogosMode::Remote + LocalSocket → RemoteTransportHost (QRO)
-     *   - LogosMode::Remote + Tcp/TcpSsl  → PlainTransportHost(cfg)
+     *   - LogosMode::Remote + anything else → nullptr: inproc and tls_tcp
+     *     are the plain runtime's, tcp and tcp_ssl were removed in 0.15
      *
      * Mode wins over `cfg.protocol` so test fixtures that switch the
      * process into Mock/Local always get the test transport, regardless
      * of which overload (or which LogosAPIProvider constructor) was
-     * used. In Remote mode, `cfg` chooses the wire protocol and
-     * carries the bind/dial address + TLS material.
+     * used.
      */
     std::unique_ptr<LogosTransportHost>
         createHost(const LogosTransportConfig& cfg,
@@ -62,8 +62,7 @@ namespace LogosTransportFactory {
      * its QLocalSocket, whose replica acquisition and reply delivery both ride
      * the owning thread's event loop — and for the in-process qt_local
      * transport, which invokes on QObjects living on the module's main thread.
-     * False for the plain Tcp/TcpSsl transports (Qt-free by design) and for
-     * Mock (no sockets at all).
+     * False for the refused transports and for Mock (no sockets at all).
      *
      * Callers use this to decide *which thread must construct* a client: see
      * lp_client_create(). Mirrors the createConnection resolution rule above —

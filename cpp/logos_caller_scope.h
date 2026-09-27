@@ -62,11 +62,6 @@
  *
  *   qt_remote (QtRO local socket)  YES. The replica invokes "callRemoteMethod"
  *                                  by name (remote_transport.cpp:155).
- *   plain tcp / tcp_ssl            YES for the identity. An operator-issued
- *                                  named token authorizes through
- *                                  TokenValidator, which returns bool only, so
- *                                  those land on Unknown until it is widened.
- *                                  This is the main plain-transport case.
  *   qt_local (in-process)          UNKNOWN. local_transport.cpp:94 and :111
  *                                  call m_proxy->callRemoteMethod DIRECTLY.
  *                                  Routing it through the meta-object would fix

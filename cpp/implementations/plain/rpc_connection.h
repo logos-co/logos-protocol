@@ -38,10 +38,9 @@ namespace logos::plain {
 // -----------------------------------------------------------------------------
 // RpcConnectionBase — type-erased public surface of RpcConnection<Stream>.
 //
-// Callers (plain_logos_object, plain_transport_host) hold a
-// shared_ptr<RpcConnectionBase> so they don't have to know whether the
-// underlying socket is plain TCP or TLS-wrapped TCP. All the async machinery
-// lives in the templated subclass.
+// Callers (the plain runtime's clients, its session and in-process endpoints)
+// hold a shared_ptr<RpcConnectionBase> so they don't have to know the stream
+// type. All the async machinery lives in the templated subclass.
 // -----------------------------------------------------------------------------
 class RpcConnectionBase {
 public:
@@ -53,14 +52,13 @@ public:
     //   * the connection's strand (io thread) when the peer's Result frame is
     //     decoded — the normal path;
     //   * an arbitrary caller thread inside fail(), which sweeps every pending
-    //     call when the connection is torn down (stop(), ~PlainTransport-
-    //     Connection, RpcServer::stop());
+    //     call when the connection is torn down (stop(), or an endpoint's
+    //     stop());
     //   * INLINE on the calling thread, inside sendCallAsync itself, when the
     //     connection is stopped — either before the call was made, or while it
     //     was registering, which is a race sendCallAsync resolves by reclaiming
     //     its own entry rather than by hoping fail() sees it.
-    // It must therefore not block and must not run user code directly — see
-    // postDelivery in plain_logos_object.cpp.
+    // It must therefore not block and must not run user code directly.
     //
     // AT MOST ONCE is a property of the REGISTRATION, and it is weaker than it
     // sounds. Four things contend for a registered handler — dispatchIncoming,
@@ -77,16 +75,10 @@ public:
     // copies the handler out under m_mu and invokes it with the mutex RELEASED,
     // so a cancelPending() landing in that gap erases nothing and the handler
     // runs to completion AFTER cancelPending() has already returned. A caller
-    // that gives up must therefore be able to absorb one more call. Both callers
-    // here are:
-    //   * PlainLogosObject funnels every outcome into AsyncCall::deliver(),
-    //     whose CAS makes the later arrival a no-op — that CAS, and nothing at
-    //     this layer, is what makes DELIVERY to the user exactly-once;
-    //   * sendCall()'s promise handler cannot be reached twice at all (only one
-    //     contender ever gets it) and fulfilling a future its caller has already
-    //     walked away from is a no-op.
-    // test_plain_cancel_pending_race.cpp builds that interleaving by hand rather
-    // than racing for it, and pins both.
+    // that gives up must therefore be able to absorb one more call.
+    // sendCall()'s promise handler is: it cannot be reached twice at all (only
+    // one contender ever gets it), and fulfilling a future its caller has
+    // already walked away from is a no-op.
     using ResultHandler = std::function<void(ResultMessage)>;
 
     virtual ~RpcConnectionBase() = default;
@@ -137,10 +129,9 @@ public:
     // Register `callback` for (msg.object, msg.eventName) and put the Subscribe
     // frame on the wire. Returns the token that withdraws THIS registration.
     //
-    // MANY REGISTRATIONS PER (object, event) ARE THE POINT. One RpcConnection is
-    // shared by every handle a PlainTransportConnection hands out, and
-    // requestObject() mints a fresh handle per acquire, so two handles
-    // subscribing to the same event on the same module is ordinary — including
+    // MANY REGISTRATIONS PER (object, event) ARE THE POINT. One RpcConnection
+    // may serve several subscribers, so two subscribing to the same event on
+    // the same module is ordinary — including
     // the deferred-completion channel every handle subscribes to on its first
     // call. This map used to be keyed by (object, event) and ASSIGNED, so the
     // second one silently took the first one's channel away: a lost
@@ -174,7 +165,7 @@ public:
 
 // -----------------------------------------------------------------------------
 // RpcConnection<Stream> — one full-duplex RPC conversation over a Boost.Asio
-// stream-like socket (plain TCP or SSL-wrapped TCP, sharing this template).
+// stream-like socket: a tls_tcp session's TLS stream, or a plain socket in tests.
 //
 // Roles: the same connection supports both directions. Either peer can
 // initiate Call / Methods / Subscribe / Token / Event messages. Provider-side
@@ -237,11 +228,6 @@ public:
         m_keepaliveTimeout = timeout;
     }
 
-    // A stopping server's side: calls arriving from now on are not started.
-    void beginDrain() { m_draining.store(true); }
-    // Every call it started has answered and every frame it queued is written.
-    bool drained() const { return m_callsRunning.load() == 0 && m_framesUnwritten.load() == 0; }
-
 private:
     void doRead();
     void handleFrame(MessageType tag, std::vector<uint8_t> payload);
@@ -295,10 +281,6 @@ private:
     std::atomic<uint64_t>                        m_nextId{1};
     std::atomic<bool>                            m_stopped{false};
     std::atomic<bool>                            m_started{false};
-    // What RpcServer*::stop() waits for before it closes the connection.
-    std::atomic<bool>                            m_draining{false};
-    std::atomic<std::size_t>                     m_callsRunning{0};
-    std::atomic<std::size_t>                     m_framesUnwritten{0};
 
     uint32_t                                     m_maxFrame = kMaxFrameLength;
     std::chrono::milliseconds                    m_keepaliveInterval{0};
@@ -480,10 +462,8 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
             for (auto& cb : cbs) cb(m);
 
         } else if constexpr (std::is_same_v<T, CallMessage>) {
-            // A stopping server answers only the calls it had started.
-            if (!m_handler || m_draining.load()) return;
+            if (!m_handler) return;
             auto self = this->shared_from_this();
-            m_callsRunning.fetch_add(1);
             m_handler->onCall(m, [self](ResultMessage res) {
                 // A result over the connection's frame limit is answered as a
                 // failure, not dropped: the caller would otherwise wait out its deadline.
@@ -498,15 +478,12 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                     failure.errCode = "METHOD_FAILED";
                     frame = encodeFrame(*self->m_codec, AnyMessage{std::move(failure)}, self->m_maxFrame);
                 }
-                // Queue the reply before the count drops, so drained() can't miss it.
                 self->writeFrame(std::move(frame));
-                self->m_callsRunning.fetch_sub(1);
             }, static_cast<const void*>(this));
 
         } else if constexpr (std::is_same_v<T, MethodsMessage>) {
-            if (!m_handler || m_draining.load()) return;
+            if (!m_handler) return;
             auto self = this->shared_from_this();
-            m_callsRunning.fetch_add(1);
             m_handler->onMethods(m, [self](MethodsResultMessage res) {
                 const uint64_t id = res.id;
                 std::vector<uint8_t> frame;
@@ -519,7 +496,6 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                     frame = encodeFrame(*self->m_codec, AnyMessage{std::move(failure)}, self->m_maxFrame);
                 }
                 self->writeFrame(std::move(frame));
-                self->m_callsRunning.fetch_sub(1);
             }, static_cast<const void*>(this));
 
         } else if constexpr (std::is_same_v<T, SubscribeMessage>) {
@@ -843,13 +819,12 @@ template <typename Stream>
 void RpcConnection<Stream>::writeFrame(std::vector<uint8_t> frame)
 {
     if (m_stopped.load()) return;
-    m_framesUnwritten.fetch_add(1);
     auto self = this->shared_from_this();
     boost::asio::post(m_strand, [self, frame = std::move(frame)]() mutable {
         // Re-check inside the strand: the load above is a hint, and fail()
         // can land between it and this handler. Without this the queued
         // frame would start an async_write on a socket fail() is closing.
-        if (self->m_stopped.load()) { self->m_framesUnwritten.fetch_sub(1); return; }
+        if (self->m_stopped.load()) return;
         self->m_writeQueue.push_back(std::move(frame));
         if (!self->m_writing) {
             self->m_writing = true;
@@ -872,7 +847,6 @@ void RpcConnection<Stream>::doWrite()
             [self](const boost::system::error_code& ec, std::size_t /*n*/) {
                 if (ec) { self->fail(ec.message()); return; }
                 self->m_writeQueue.pop_front();
-                self->m_framesUnwritten.fetch_sub(1);
                 if (self->m_writeQueue.empty()) {
                     self->m_writing = false;
                 } else {
@@ -908,8 +882,8 @@ void RpcConnection<Stream>::closeStreamOnStrand()
     //
     // fail() is reached from both sides: from the io thread (a read/write
     // handler that saw an error, already inside the strand) and from an
-    // arbitrary caller thread (stop(), ~PlainTransportConnection,
-    // RpcServer::stop()). Closing on the caller's thread let close() run
+    // arbitrary caller thread (stop(), an endpoint's stop()). Closing on the
+    // caller's thread let close() run
     // concurrently with an in-flight doWrite() initiating async_write on
     // the io thread, and the reactor dereferenced the descriptor state the
     // close had just nulled → SIGSEGV inside

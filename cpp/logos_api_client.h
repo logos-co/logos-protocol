@@ -50,10 +50,8 @@ public:
      *
      * Two transports because the SDK's auto-`requestModule` flow inside
      * invokeRemoteMethod{,Async} dials `capability_module` to fetch a
-     * per-target token. When the daemon advertises capability_module on
-     * a different transport from the target (e.g. CLI on host →
-     * core_service over TCP, but capability_module also over TCP on a
-     * sibling port), the auto-dial must use the right one. Pre-building
+     * per-target token. When capability_module is reached on a different
+     * transport from the target, the auto-dial must use the right one. Pre-building
      * the consumer once in the constructor (see m_capability_consumer)
      * keeps the hot path free of per-call lookups.
      */

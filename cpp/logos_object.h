@@ -30,26 +30,9 @@
  *     common shape that trips it is a handle shared with a worker thread and
  *     released on teardown without waiting for the worker. Wait for it.
  *
- *     WHAT EACH TRANSPORT ACTUALLY DOES, because the answer is no longer uniform
- *     and the difference is not something a caller should rely on:
- *
- *       - PLAIN: safe. The object counts the callers inside it, release() drops
- *         the owner's reference rather than deleting, and the LAST call to leave
- *         destroys the object. A call that had entered before release() was
- *         called therefore runs to completion against a live object. release()
- *         itself still returns immediately and waits for nothing. Two shapes
- *         remain caller errors even there — STARTING a call at or after
- *         release() (its first act is to touch storage that may already be
- *         freed), and `delete obj` in place of release() with a call in flight —
- *         and both are reported, aborting in debug builds, whenever the object
- *         still exists to notice. See plain_logos_object.cpp.
- *       - QT REMOTE / QT LOCAL / MOCK: not safe. release() ends in `delete
- *         this`, with no counting and no detector.
- *
- *     So the INTERFACE contract is the strict one above. A transport may be
- *     kinder than the contract; code written against the contract is correct on
- *     all of them, and code written against the plain transport's behaviour
- *     breaks the day it is handed a QtRO handle.
+ *     QT REMOTE / QT LOCAL / MOCK release() ends in `delete this`, with no
+ *     counting and no detector. A transport may be kinder than the contract,
+ *     but code written against the contract is correct on all of them.
  */
 class LogosObject {
 public:
@@ -245,7 +228,7 @@ public:
  *     else
  *         obj->callMethod(...);             // today's behaviour, unchanged
  *
- * Implemented by the plain (tcp/tcp_ssl), qt_remote (QtRO) and qt_local
+ * Implemented by the qt_remote (QtRO), qt_remote_plain and qt_local
  * transports. NOT implemented by the mock transport: MockStore always answers,
  * so there is no failure to report, and leaving MockLogosObject alone keeps the
  * one subclass whose header is installed (implementations/mock/mock_transport.h)

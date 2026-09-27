@@ -250,12 +250,7 @@ bool isRuntimePrincipal(const std::string& principal)
     return principal == kRuntimePrincipal || principal == "core";
 }
 
-bool isNetworkProtocol(LogosProtocol protocol)
-{
-    return protocol == LogosProtocol::Tcp || protocol == LogosProtocol::TcpSsl
-        || protocol == LogosProtocol::TlsTcp;
-}
-
+// The one network transport since 0.15, when tcp and tcp_ssl went.
 bool isSessionProtocol(LogosProtocol protocol) { return protocol == LogosProtocol::TlsTcp; }
 
 // A target meant for the local socket, or named inproc, is reached in-process
@@ -392,7 +387,7 @@ struct ClientState {
     std::deque<std::optional<EventMessage>> events;
     std::shared_ptr<Client> wire = std::make_shared<Client>();
     std::shared_ptr<RpcConnectionBase> networkWire;
-    // networkWire carries the calls (tcp, tls or inproc), not the qtro wire.
+    // networkWire carries the calls (tls_tcp or inproc), not the qtro wire.
     // Guarded by connectionMutex.
     bool rpcRoute = false;
     LogosTransportConfig targetConfig;
@@ -716,7 +711,7 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
         return fail("timeout");
     }
     if (state->rpcRoute && state->networkWire && state->networkWire->isOpen()) return true;
-    if (!state->rpcRoute && !isNetworkProtocol(state->targetConfig.protocol)
+    if (!state->rpcRoute && !isSessionProtocol(state->targetConfig.protocol)
         && state->targetConfig.protocol != LogosProtocol::Inproc
         && state->wire->isConnected())
         return true;
@@ -726,10 +721,6 @@ bool ensureConnected(const std::shared_ptr<ClientState>& state,
     if (isSessionProtocol(state->targetConfig.protocol)) {
         if (state->networkWire) state->networkWire->stop("reconnecting");
         wire = connectSessionFor(state, remaining, error);
-        if (!wire) return fail("object_unavailable");
-    } else if (isNetworkProtocol(state->targetConfig.protocol)) {
-        if (state->networkWire) state->networkWire->stop("reconnecting");
-        wire = logos::plain::abi::connect(state->targetConfig, remaining, error, &state->alive);
         if (!wire) return fail("object_unavailable");
     } else if (reachesInproc(state->targetConfig, state->target)) {
         if (state->networkWire) state->networkWire->stop("reconnecting");
@@ -800,9 +791,8 @@ void subscriptionLoop(const std::shared_ptr<ClientState>& state)
         }
 
         std::string error;
-        // QtRO's local retry tick; a network dial (DNS, TCP, TLS) gets the
-        // 5 s the Qt-side network client gave it.
-        const bool network = isNetworkProtocol(state->targetConfig.protocol);
+        // QtRO's local retry tick; a session's dial (DNS, TCP, TLS) gets 5 s.
+        const bool network = isSessionProtocol(state->targetConfig.protocol);
         bool acquired = ensureConnected(state, network ? 5000 : 250, error);
         if (acquired) {
             std::lock_guard<std::timed_mutex> connectionLock(state->connectionMutex);
@@ -1011,13 +1001,9 @@ std::string mintToken(const std::shared_ptr<ClientState>& state,
         error = "tokens are never requested over a session";
         return {};
     }
-    const bool network = isNetworkProtocol(state->capabilityConfig.protocol);
-    if (network || reachesInproc(state->capabilityConfig, "capability_module")) {
-        auto wire = network
-            ? logos::plain::abi::connect(state->capabilityConfig,
-                                         std::chrono::milliseconds(timeout), error, &state->alive)
-            : logos::plain::inproc::connect(instanceId(), "capability_module", state->origin,
-                                            error);
+    if (reachesInproc(state->capabilityConfig, "capability_module")) {
+        auto wire = logos::plain::inproc::connect(instanceId(), "capability_module", state->origin,
+                                                  error);
         if (!wire) return {};
         CallMessage request;
         request.id = wire->nextId();
@@ -1393,10 +1379,9 @@ struct lp_provider {
     std::string transportSetJson;
     Server server;
     bool qtroStarted = false;
-    std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networkEndpoints;
     std::vector<std::unique_ptr<logos::plain::abi::SessionEndpoint>> sessionEndpoints;
-    // Guards both endpoint lists once the provider is prepared: add_endpoint
-    // may grow them while events are emitted.
+    // Guards the endpoint list once the provider is prepared: add_endpoint
+    // may grow it while events are emitted.
     std::mutex endpointsMutex;
     std::shared_ptr<logos::plain::inproc::Endpoint> inproc;
     lp_dispatch_cb dispatch = nullptr;
@@ -1949,39 +1934,14 @@ std::unique_ptr<logos::plain::abi::SessionEndpoint> makeSessionEndpoint(
     return endpoint;
 }
 
-std::unique_ptr<logos::plain::abi::ServerEndpoint> makeNetworkEndpoint(
-    lp_provider* provider, const LogosTransportConfig& config)
-{
-    const char* label = config.protocol == LogosProtocol::Tcp ? "tcp" : "tcp_ssl";
-    auto network = std::make_unique<logos::plain::abi::ServerEndpoint>(config,
-        [provider, label](const CallMessage& request,
-                          std::shared_ptr<logos::plain::abi::GatePlace> place) {
-            return providerNetworkCall(provider, request, label, nullptr, place.get());
-        },
-        [provider](const logos::plain::MethodsMessage& request) {
-            return providerNetworkMethods(provider, request);
-        },
-        [provider](const logos::plain::TokenMessage& request) {
-            providerAcceptToken(provider, request.authToken,
-                                request.moduleName, request.token);
-        },
-        [provider] { return gateCapacity(provider); },
-        [provider] { return reservePlace(provider->gate); });
-    if (!network->start()) return nullptr;
-    return network;
-}
-
 void stopEndpoints(lp_provider* provider)
 {
     std::vector<std::unique_ptr<logos::plain::abi::SessionEndpoint>> sessions;
-    std::vector<std::unique_ptr<logos::plain::abi::ServerEndpoint>> networks;
     {
         std::lock_guard<std::mutex> lock(provider->endpointsMutex);
         sessions.swap(provider->sessionEndpoints);
-        networks.swap(provider->networkEndpoints);
     }
     for (auto& endpoint : sessions) endpoint->stop();
-    for (auto& endpoint : networks) endpoint->stop();
 }
 
 } // namespace
@@ -2121,7 +2081,7 @@ try {
         if (auto state = weak.lock()) connectionLost(state);
     });
     state->subscriptionWorker = std::thread([state] { subscriptionLoop(state); });
-    if (isNetworkProtocol(state->targetConfig.protocol))
+    if (isSessionProtocol(state->targetConfig.protocol))
         state->eventWorker = std::thread([state] { networkEventLoop(state); });
     return new lp_client{std::move(state)};
 } catch (...) {
@@ -2566,31 +2526,9 @@ try {
                             Variant::fromRpc(RpcValue{token})};
     std::string error;
     if (isSessionProtocol(config.protocol)) return LP_ERR_UNSUPPORTED;
-    if (!isNetworkProtocol(config.protocol) && reachesInproc(config, "capability_module"))
+    if (reachesInproc(config, "capability_module"))
         return pushTokenInproc("capability_module", state->origin, authToken, moduleName, token,
                                kDefaultTimeoutMs);
-    if (config.protocol == LogosProtocol::Tcp || config.protocol == LogosProtocol::TcpSsl) {
-        if (own) {
-            if (!ensureConnected(state, kDefaultTimeoutMs, error)) return LP_ERR_INTERNAL;
-            std::shared_ptr<RpcConnectionBase> wire;
-            {
-                std::lock_guard<std::timed_mutex> lock(state->connectionMutex);
-                wire = state->networkWire;
-            }
-            wire->sendToken({authToken, moduleName, token});
-            return LP_OK;
-        }
-        auto wire = logos::plain::abi::connect(
-            config, std::chrono::milliseconds(kDefaultTimeoutMs), error, &state->alive);
-        if (!wire) return LP_ERR_INTERNAL;
-        wire->sendToken({authToken, moduleName, token});
-        // A reply to a later frame means the token frame was read before the close.
-        auto barrier = wire->sendMethods({wire->nextId(), authToken, "capability_module"});
-        const bool read = barrier.wait_for(std::chrono::milliseconds(kDefaultTimeoutMs))
-            == std::future_status::ready;
-        wire->stop("capability token delivered");
-        return read ? LP_OK : LP_ERR_INTERNAL;
-    }
     std::optional<Variant> result;
     if (own) {
         std::string code;
@@ -2680,7 +2618,7 @@ try {
 lp_provider* lp_provider_create(const char* moduleName, const char* transportSetJson)
 try {
     if (!moduleName || !*moduleName) return nullptr;
-    // Refused, not served as local only: that hid a module's TCP listeners.
+    // Refused, not served as local only: that hid a module's network listeners.
     if (transportSetJson && !logos::parseTransportSet(transportSetJson, nullptr)) return nullptr;
     auto* provider = new lp_provider();
     provider->moduleName = moduleName;
@@ -2780,17 +2718,8 @@ try {
             provider->sessionEndpoints.push_back(std::move(session));
             continue;
         }
-        if (!isNetworkProtocol(config.protocol)) {
-            unwind();
-            return LP_ERR_UNSUPPORTED;
-        }
-        auto network = makeNetworkEndpoint(provider, config);
-        if (!network) {
-            unwind();
-            return LP_ERR_INTERNAL;
-        }
-        std::lock_guard<std::mutex> lock(provider->endpointsMutex);
-        provider->networkEndpoints.push_back(std::move(network));
+        unwind();
+        return LP_ERR_UNSUPPORTED;
     }
     provider->prepared = true;
     return LP_OK;
@@ -2850,8 +2779,6 @@ try {
     for (const auto& item : data) arguments.push_back(jsonToRpc(item));
     {
         std::lock_guard<std::mutex> lock(provider->endpointsMutex);
-        for (auto& endpoint : provider->networkEndpoints)
-            endpoint->emit(provider->moduleName, eventName, arguments);
         for (auto& endpoint : provider->sessionEndpoints)
             endpoint->emit(provider->moduleName, eventName, arguments);
     }
@@ -2988,17 +2915,13 @@ try {
     LogosTransportSet bound;
     {
         std::lock_guard<std::mutex> lock(provider->endpointsMutex);
-        for (auto& endpoint : provider->networkEndpoints) bound.push_back(endpoint->bound());
         for (auto& endpoint : provider->sessionEndpoints) bound.push_back(endpoint->bound());
     }
     json listeners = json::array();
     for (const auto& config : bound) {
         const json full = json::parse(logos::transportSetToJsonString({config}), nullptr, false);
         if (!full.is_array() || full.empty()) continue;
-        json entry = full[0];
-        // Paths to key material are the embedder's business, not a listener's.
-        for (const char* key : {"ca_file", "cert_file", "key_file", "verify_peer"}) entry.erase(key);
-        listeners.push_back(entry);
+        listeners.push_back(full[0]);
     }
     return duplicate(dumpJson(listeners));
 } catch (...) {
@@ -3047,12 +2970,7 @@ try {
         provider->sessionEndpoints.push_back(std::move(session));
         return LP_OK;
     }
-    if (!isNetworkProtocol(config.protocol)) return LP_ERR_UNSUPPORTED;
-    auto network = makeNetworkEndpoint(provider, config);
-    if (!network) return LP_ERR_INTERNAL;
-    std::lock_guard<std::mutex> lock(provider->endpointsMutex);
-    provider->networkEndpoints.push_back(std::move(network));
-    return LP_OK;
+    return LP_ERR_UNSUPPORTED;
 } catch (...) {
     return LP_ERR_INTERNAL;
 }

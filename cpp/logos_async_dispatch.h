@@ -21,10 +21,9 @@
 // (callCompleteEvent(), data = [callId, result]) over the SAME event channel it
 // already uses (setEventListener). The host (ModuleProxy / liblogos) is a pure
 // forwarder — it returns whatever callMethod returned and forwards whatever
-// events the module emits. The CONSUMER transport (RemoteLogosObject for QtRO,
-// PlainLogosObject for the plain transport) detects the sentinel, waits for the
-// matching completion keyed by callId, and returns the real result — so
-// generated clients call transparently. Both transports use this path; the
+// events the module emits. The CONSUMER transport (RemoteLogosObject for QtRO)
+// detects the sentinel, waits for the matching completion keyed by callId, and
+// returns the real result — so generated clients call transparently. The
 // version that speaks it is logos-protocol 0.2 (additive minor — see
 // logos_protocol.h).
 namespace logos {

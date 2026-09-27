@@ -546,7 +546,7 @@ TEST(RemoteSession, TheSenderRefusesACallOverTheNegotiatedLimit)
 
 TEST(RemoteSession, AnEndpointCanBeAddedAfterRegistration)
 {
-    Fixture f(nullptr, R"([{"protocol":"tcp","host":"127.0.0.1","port":0}])");
+    Fixture f(nullptr, R"([{"protocol":"qt_remote_plain"}])");
     ASSERT_EQ(lp_provider_register(f.provider, &dispatch, &methods, nullptr, &f.state), LP_OK);
     EXPECT_EQ(f.sessionPort(), 0);
     ASSERT_EQ(lp_provider_add_endpoint(f.provider, R"({"protocol":"tls_tcp","host":"127.0.0.1","port":0})"),
@@ -554,8 +554,7 @@ TEST(RemoteSession, AnEndpointCanBeAddedAfterRegistration)
     char* text = lp_provider_endpoints_json(f.provider);
     const json endpoints = json::parse(text);
     lp_string_free(text);
-    ASSERT_EQ(endpoints.size(), 2u);
-    EXPECT_FALSE(endpoints[0].contains("key_file"));
+    ASSERT_EQ(endpoints.size(), 1u);
     f.hooks.port = f.sessionPort();
     f.hooks.anchors = f.server.rootPem();
     f.hooks.pin = f.server.leafPin();

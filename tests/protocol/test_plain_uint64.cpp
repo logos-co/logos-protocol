@@ -12,7 +12,7 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// uint64 across the plain (tcp / tcp_ssl) wire.
+// uint64 across the plain runtime's wire (RpcValue).
 //
 // RpcValue's variant had no unsigned alternative, so every uint64 above
 // int64max was squeezed through int64_t and arrived as -1 — independently in

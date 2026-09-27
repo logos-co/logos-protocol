@@ -75,12 +75,11 @@ class ModuleProxy : public QObject
 
 public:
     // A host-installed extra authorizer. Returns true if `token` is valid for a
-    // call arriving over `transportProtocol` ("local" | "tcp" | "tcp_ssl").
+    // call arriving over `transportProtocol`, always "local" since 0.15.
     // Consulted IN ADDITION to the built-in issued-token scan, so installing one
     // only ever grants access to tokens the built-in scan wouldn't (e.g. the
     // daemon backs it with TokenStore::lookupByToken to make operator-issued
-    // named tokens work, with per-token expiry and local_only enforced by the
-    // transport it's handed).
+    // named tokens work, with per-token expiry).
     using TokenValidator = std::function<bool(const QString& token,
                                               const QString& transportProtocol)>;
 
@@ -109,10 +108,8 @@ public:
     // transport arg: the Qt meta-object system matches by full parameter list
     // and does not apply C++ default arguments, so the existing QtRO/local
     // 3-arg call must remain a real 3-arg method. It forwards to the
-    // transport-aware 4-arg form with "local" (RemoteTransportHost is always
-    // local); remote hosts that know their wire (PlainTransportHost) call the
-    // 4-arg form so a transport-sensitive validator (local_only tokens) can
-    // enforce it.
+    // transport-aware 4-arg form with "local", the only transport the Qt runtime
+    // serves since 0.15; the 4-arg form stays for the validator's signature.
     Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList());
     Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args, const QString& transportProtocol);
     Q_INVOKABLE bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);

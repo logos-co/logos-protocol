@@ -54,20 +54,10 @@ std::string transportSetToJsonString(const LogosTransportSet& set)
     for (const auto& cfg : set) {
         json o;
         o["protocol"] = protocolToString(cfg.protocol);
-        if (cfg.protocol == LogosProtocol::Tcp || cfg.protocol == LogosProtocol::TcpSsl
-            || cfg.protocol == LogosProtocol::TlsTcp) {
+        if (cfg.protocol == LogosProtocol::TlsTcp) {
             o["host"]  = cfg.host;
             o["port"]  = cfg.port;
             o["codec"] = codecToString(cfg.codec);
-        }
-        if (cfg.protocol == LogosProtocol::TcpSsl) {
-            // Cert/key paths intentionally included — this serialization
-            // is the parent → child handoff so the child knows what
-            // files to load when binding its TLS listener.
-            if (!cfg.caFile.empty())   o["ca_file"]   = cfg.caFile;
-            if (!cfg.certFile.empty()) o["cert_file"] = cfg.certFile;
-            if (!cfg.keyFile.empty())  o["key_file"]  = cfg.keyFile;
-            o["verify_peer"] = cfg.verifyPeer;
         }
         arr.push_back(std::move(o));
     }
@@ -86,18 +76,19 @@ bool parseTransportSet(const std::string& jsonStr, LogosTransportSet* out, std::
         if (!arr.is_array()) return fail("transport set is not a JSON array");
         for (const auto& o : arr) {
             if (!o.is_object()) return fail("transport entry is not an object: " + o.dump());
-            for (const char* key : {"protocol", "host", "codec", "ca_file", "cert_file", "key_file"})
+            for (const char* key : {"protocol", "host", "codec"})
                 if (o.contains(key) && !o[key].is_string())
                     return fail(std::string("transport field '") + key + "' is not a string");
-            if (o.contains("verify_peer") && !o["verify_peer"].is_boolean())
-                return fail("transport field 'verify_peer' is not a boolean");
             if (o.contains("port")
                 && (!o["port"].is_number_integer() || o["port"].get<long long>() < 0
                     || o["port"].get<long long>() > 0xFFFF))
                 return fail("transport port is not 0..65535: " + o["port"].dump());
             const std::string protocol = o.value("protocol", std::string{"local"});
-            if (protocol != "local" && protocol != "qt_remote_plain" && protocol != "tcp"
-                && protocol != "tcp_ssl" && protocol != "inproc" && protocol != "tls_tcp")
+            if (protocol == "tcp" || protocol == "tcp_ssl")
+                return fail("the " + protocol + " transport was removed in protocol 0.15: runtimes "
+                            "reach each other over tls_tcp (peering)");
+            if (protocol != "local" && protocol != "qt_remote_plain" && protocol != "inproc"
+                && protocol != "tls_tcp")
                 return fail("unknown transport protocol '" + protocol + "'");
             const std::string codec = o.value("codec", std::string{"json"});
             if (codec != "json" && codec != "cbor")
@@ -130,10 +121,6 @@ LogosTransportSet transportSetFromJsonString(const std::string& jsonStr)
         if (rawPort < 0 || rawPort > 0xFFFF) continue;
         cfg.port = static_cast<uint16_t>(rawPort);
         cfg.codec = codecFromString(o.value("codec", std::string{"json"}));
-        cfg.caFile   = o.value("ca_file",   std::string{});
-        cfg.certFile = o.value("cert_file", std::string{});
-        cfg.keyFile  = o.value("key_file",  std::string{});
-        cfg.verifyPeer = o.value("verify_peer", true);
         out.push_back(std::move(cfg));
     }
     return out;

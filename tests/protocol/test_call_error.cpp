@@ -11,10 +11,8 @@
 // logos_call_error.h).
 TEST(CallErrorChannel, UnreachableTargetYieldsCanonicalError)
 {
-    // Plain TCP to a port nothing listens on: connection refused, fast,
-    // no daemon or event loop required.
-    const char* deadTarget =
-        "{\"protocol\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":9}";
+    // The local socket of a module nothing serves.
+    const char* deadTarget = "{\"protocol\":\"local\"}";
 
     // Pre-save a token so the capability requestModule flow is skipped —
     // this test exercises the transport-acquisition failure only.

@@ -3,112 +3,15 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
 # ── which of these tests are detectors, and how that was checked ─────────────
 #
-# A race assertion that has never been seen to fail is not evidence. Three of the
-# guarantees in this suite are single points of mechanism — the exactly-once CAS
-# in AsyncCall::deliver(), the deadline living on its own thread rather than the
-# shared io thread, and the serialization that keeps a concurrent first caller
-# from outrunning the completion subscription — so each was checked by running
-# the tests against code that does not have it.
+# A race assertion that has never been seen to fail is not evidence, so each
+# detector here was run against the code the fix replaced (the pre-fix commit,
+# not a switch in this tree), and the numbers each run produced are recorded in
+# the test file:
 #
-# That check is done on the PRE-FIX TREE, not on a switch in this one: copy the
-# test file onto the commit the fix replaced and run it there. For the completion
-# subscription that tree is `master`, which still has both the racy
-# ensureCompletionSub() and the raw-`this` handler capture; for the fold's two
-# mechanisms it is a local edit to the transport, made in a throwaway checkout
-# and thrown away with it. The numbers each run produced are recorded in the test
-# files themselves.
+#   PlainSendAfterFailTest.*   (all three; validated on cf1b9b0)
 #
-# Deliberately not a build option, and not the environment-variable probes an
-# earlier draft carried. Both have the same cost, which the getenv() version only
-# made more obvious: production source ends up holding a second implementation of
-# its own contract whose entire purpose is to be wrong, in a change whose entire
-# purpose is correctness. Running the real pre-fix code is also better evidence,
-# because it proves the test catches the bug that existed rather than a
-# hand-written imitation of it.
-#
-# WHICH TESTS ARE DETECTORS, since it is not all of them and the difference
-# matters when one goes green. Only these fail on code missing the mechanism:
-#
-#   IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce
-#   IoFoldTest.DeadlineFiresOnTimeWhileTheIoThreadIsBusy
-#   IoFoldTest.DeadlineFiresWhileTheIoThreadIsBlockedForever
-#   PlainCompletionSubOrderTest.AConcurrentFirstCallCannotOutrunTheSubscription
-#   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
-#   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
-#   PlainSendAfterFailTest.*   (all four; validated on cf1b9b0)
-#   PlainEventSubSharingTest.ASecondHandleDoesNotStealTheFirstsCompletionChannel
-#   PlainEventSubSharingTest.TheSameTheftThroughTheRealHost
-#   PlainEventSubSharingTest.EveryHandleGetsEveryEmission
-#   PlainEventSubSharingTest.ANamedAndAWildcardSubscriberEachGetOneCopy
-#   PlainEventSubSharingTest.ReleasingOneHandleLeavesTheOtherSubscribed
-#   PlainEventSubSharingTest.SubscriptionsSurviveChurn
-#   PlainEventSubSharingTest.ACompletionThatOvertakesItsOwnResultIsStillDelivered
-#   PlainEventSubSharingTest.ANewConsumerAgainstAnOldHost
-#   PlainEventSubSharingTest.AnOldConsumersFrameSequenceAgainstTheNewHost
-#   SyncCallReleaseRaceTest.ReleaseWithASyncCallInFlightIsReportedAndFatal
-#   SyncCallReleaseRaceTest.AParkedSyncCallSurvivesReleaseFromAnotherThread
-#   SyncCallReleaseRaceTest.ReleaseDefersDestructionToTheLastCallInFlight
-#   SyncCallReleaseRaceTest.TheReleaseWakeRaceIsSafeEveryTime   (under gmalloc)
-#   SyncCallReleaseRaceTest.DeletingTheHandleWithACallInFlightIsReportedAndFatal
-#   SyncCallReleaseRaceTest.StartingACallAfterReleaseIsReportedAndFatal
-#   SyncCallReleaseRaceTest.EveryEntryPointLeavesTheCountAtZero
-#   SyncCallReleaseRaceTest.ConcurrentCallersThatHaveReturnedAreNotAccused
-#   SyncCallReleaseRaceTest.ReleaseFromInsideAnEventCallbackIsNotAccused
-#   every test in NoQtLoopTest (protocol_noqt_tests — see the second executable
-#   at the bottom of this file), including the after-main() probe whose verdict
-#   is that binary's EXIT CODE
-#
-# The release-race group is three detectors of three different things, which is
-# why all of it is listed. THE FIX: on cf1b9b0 the survival test's child dies by
-# signal ("died but not with expected exit code") and the deferred-destruction
-# test exits 139, both three runs out of three; the release-wake stress is silent
-# there without Guard Malloc and 139 with it, which is why it is marked. THE
-# REMAINING MISUSES: the two death tests fail on cf1b9b0 (no diagnostic exists to
-# match). A BROKEN DETECTOR: with the decrement removed from EntryGuard's
-# destructor the three "not accused" tests abort on a correct program, which is
-# the failure mode that would make the whole thing unshippable. Every one of
-# those was checked by running it — against the pre-fix commit for the first two
-# groups, against a throwaway local edit for the last.
-#   PlainHostEventTeardownTest.QueuedEmissionsNeverOutliveTheHost
-#
-# The last one is a detector for the HARNESS rather than for the transport, and
-# it is checked the same way: put a plain `m_host.reset()` back in its fixture
-# and it takes the process down with SIGSEGV on the first round, with or without
-# a memory detector. The backtrace it produces is recorded in the file.
-#
-# The subscription-sharing group is nine detectors of ONE mechanism: every handle
-# holding its own registration on the shared connection. All nine were run RED on
-# the pre-fix tree — where the second handle to subscribe to an event on a
-# connection silently takes the first one's channel — and green here; the tenth
-# case in that file is a pin, and is named below.
-#
-# Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
-# the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
-# deliver() once no matter what guards it — and only racing teardown against
-# replies in flight (the first entry) and the hand-built extract-then-cancel
-# interleaving (the last) actually catch a doubled callback. Do not read a green
-# per-path test as evidence the gate is there. Nor is
-# PlainEventSubSharingTest.TeardownRemovesEverySubscription, which passes on the
-# pre-fix tree: only the tests that assert a SECOND live subscriber still has its
-# channel detect the subscription clobber.
-#
-# AND DO NOT READ ReleaseRacingRepliesInFlightDeliversEachCallOnce AS COVERING
-# EVERY DOUBLE. It races teardown of the HANDLE against replies with the
-# connection still up, so it never enters sendCallAsync's stopped branch: against
-# a deliberately broken version of that branch it reports 0 doubles in 10,000
-# calls while PlainSendAfterFailTest's own 10,000-call burst — which stops the
-# CONNECTION mid-burst — reports 5 to 10. Same shape, different contended object,
-# and only the second one sees that path.
-# AND "THE CAS" IS TWO GATES, which is a correction to the paragraph above and
-# was found while re-validating this on the no-Qt binary. AsyncCall guards a
-# duplicate delivery twice: claim()'s compare-exchange, and the swap in
-# takeCallback() that leaves a second caller holding an empty std::function.
-# Removing the CAS ALONE leaves every test here green (0 doubles) because the
-# swap absorbs the duplicate; removing BOTH makes the release-race shape report
-# 22 doubled deliveries in 20 rounds x 500 calls while the per-path tests stay
-# green. Measured on the no-Qt twin
-# (NoQtLoopTest.ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop). A
-# validation that removes one of the two proves nothing.
+# The detectors of the Qt runtime's own plain transport (tcp and tcp_ssl) went
+# with it in 0.15.
 
 add_executable(protocol_tests
     test_main.cpp
@@ -154,87 +57,17 @@ add_executable(protocol_tests
     # falling out on replica-acquire timeouts.
     test_lp_client_owner_thread.cpp
     test_call_error.cpp
-    # The ASYNC half of the same channel. lp_invoke_async subscribed with the
-    # value-only transport overload and hard-coded cb(1, ...), so a failed call
-    # reached lp_result_cb as a success carrying a default value — the exact
-    # thing lp_result_cb's own doc comment (and its sync twin lp_invoke) says
-    # cannot happen. Matched pair: a failing call must report ok=0 with the
-    # canonical error object, a succeeding one must still report ok=1 with its
-    # value. Both over a real (plain TCP) transport.
-    test_lp_invoke_async_error.cpp
-    # The rest of that channel: everything the TRANSPORT learns once acquire has
-    # already succeeded — a timeout, and MODULE_NOT_LOADED against a host that is
-    # up (which is not an acquire failure on the plain transport, because
-    # requestObject never checks publication). Both were discarded by
-    # PlainLogosObject and by the hard-coded empty CallError above it, on the
-    # SYNC path as much as the async one. Matched set: the two failures must
-    # report the canonical error object, the successes must still report their
-    # value. An unknown method is a provider's unknown_method refusal, which
-    # both twins must carry intact as a RESULT, distinct from a null return.
-    test_call_error_after_acquire.cpp
-    # The same channel over the DEFAULT transport (LocalSocket/QtRO), so the fix
-    # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
-    # which needs no blocking provider and therefore no second event loop.
+    # The call-error channel over the DEFAULT transport (LocalSocket/QtRO).
+    # Exercises the deferred-completion timeout, which needs no blocking
+    # provider and therefore no second event loop, and an unknown method: the
+    # provider's unknown_method refusal, carried intact as a RESULT.
     test_call_error_qt_remote.cpp
-    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Written when
-    # in-flight calls were threads: joining them closed a use-after-free but left
-    # release() blocking for the remainder of the call's timeout, so they were
-    # asked to stop first and teardown cost one 25ms wait slice. Public API only,
-    # so the io_context fold did not touch it — but its BOUNDS are now loose
-    # rather than tight: there is no wait slice any more (0ms, measured) and no
-    # join, because nothing captures `this`. What it still pins exactly is the
-    # part that matters most: the callback fires EXACTLY ONCE on every outcome
-    # including cancellation, since a dropped one turns a stall into a hang.
-    test_plain_object_teardown.cpp
-    # The other half of the same mechanism: what a COMPLETED call leaves behind.
-    # Written for the waiter registry (a map of threads plus a publish list) and
-    # retargeted by the io_context fold at the registry that replaced it,
-    # CallState::inflight. The claims are unchanged and are why it survived the
-    # rework: retention must not grow with call count, a burst that goes idle
-    # must drain with no further call, and teardown must still deliver exactly
-    # once.
-    test_plain_waiter_reaping.cpp
-    # test_plain_waiter_publish_is_last.cpp — DELETED BY THE io_context FOLD.
-    # It pinned one rule: publishFinishedWaiter() is a waiter thread's LAST
-    # access to the object, which was the only reason stopAndJoinWaiters() could
-    # return while a reaper was still mid-join on a waiter it had already taken
-    # out of m_waiters. There are no waiter threads, no reaper and no publish
-    # list any more, so there is no ordering left to pin — the property it
-    # protected ("no handler touches the object after teardown") is structural
-    # now: handlers hold a weak_ptr to CallState and never dereference the
-    # handle. test_iofold.cpp OBSERVES that instead of pinning the protocol that
-    # used to be needed for it.
-    test_iofold.cpp
-    # The OTHER thing release() leaves behind: the deferred-completion event
-    # subscription. Its handler captured raw `this` and lives in the
-    # RpcConnection, which is shared across every handle and outlives all of
-    # them. dispatchIncoming copies the handler out under its mutex and invokes
-    # it unlocked, so the unsubscribe release() sends cannot reach one already in
-    # flight on the io thread — and nothing joins that thread. Pins the handler
-    # not reaching the object at all.
-    test_plain_completion_sub_lifetime.cpp
-    # The ORDERING half of the same subscription. ensureCompletionSub() raised
-    # its flag under the rendezvous mutex and released the mutex before
-    # subscribing, so a concurrent first caller could put a Call on the wire
-    # ahead of the Subscribe frame; a "multi" provider then completed into a
-    # subscription the host had not registered and the completion was dropped.
-    # Costs a caller its whole timeout and leaves nothing behind — see the file.
-    test_plain_completion_sub_order.cpp
-    # A THIRD thing release() and the shared RpcConnection get wrong together:
-    # m_eventCallbacks is keyed by (object, event) and ASSIGNED, so the second
-    # handle a connection hands out for the same module silently takes the
-    # first one's subscription — the completion channel included. Reachable with
-    # no concurrency at all. Covers the theft over the raw wire and through the
-    # shipping host, every-handle-gets-every-emission, one handle leaving without
-    # taking another's subscription with it, and randomized churn with a quiesced
-    # per-round audit.
-    test_plain_event_sub_sharing.cpp
     # cancelPending() and the two things it is NOT. dispatchIncoming copies a
     # handler out under the connection mutex and invokes it unlocked, so a
     # cancel arriving in that gap stops nothing — at-most-once INVOCATION is the
-    # extract-and-erase, and exactly-once DELIVERY is AsyncCall::deliver()'s CAS.
-    # Constructs the interleaving by hand rather than racing for it, and covers
-    # the OTHER handler shape (the promise sendCall registers) too.
+    # extract-and-erase, and exactly-once DELIVERY is the handler's. Constructs
+    # the interleaving by hand rather than racing for it, for the promise shape
+    # sendCall registers and over a real connection.
     test_plain_cancel_pending_race.cpp
     # The gap between sendCallAsync's stopped-check and its registration under
     # m_mu. A fail() that completes in it sweeps a map the caller has not
@@ -245,30 +78,6 @@ add_executable(protocol_tests
     # Builds the interleaving by parking the caller on the connection's own
     # mutex rather than racing for it.
     test_plain_send_after_fail.cpp
-    # release() racing a call still running on another thread — a PRE-EXISTING
-    # use-after-free (reproduced identically on master, on #45 and on #46), now
-    # FIXED by a live-reference count: release() drops the owner's reference and
-    # the last call to leave destroys the object, so a call that entered first is
-    # safe and release() still waits for nothing. This file pins the fix (the
-    # reproduction survives, destruction is deferred and happens exactly once,
-    # the tight release-wake race 400 times over), pins the two shapes that are
-    # still caller errors (`delete obj` with a call in flight, and STARTING a
-    # call after release()) as named aborts rather than a SIGSEGV elsewhere, and
-    # — the half that decides whether a diagnostic is shippable at all — pins
-    # that a correct program is never accused: every entry point, every
-    # early-return path, many threads at once, and the shipped
-    # release()-from-an-io-thread-event-callback shape.
-    test_sync_call_release_race.cpp
-    # A test of the HARNESS the five tests above run on. Each of them puts a
-    # ModuleProxy on a worker QThread and publishes it through a
-    # PlainTransportHost, and each of them used to free that host from the TEST
-    # thread — while the worker was inside the direct-connection lambda
-    # publishObject() hooked onto eventResponse, which locks the host's m_mu
-    # after converting the payload. Shared fixture code, so a fault there can
-    # corrupt any run in this binary. Pins the ordering that live_host_teardown.h
-    # now owns: the host is destroyed ON the proxy's thread, every emission
-    # queued before that runs against a live host, and none runs after.
-    test_plain_host_event_teardown.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
@@ -290,8 +99,6 @@ add_executable(protocol_tests
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
     # reapStaleSockets never touching live sockets or regular files. POSIX only.
     $<$<NOT:$<PLATFORM_ID:Windows>>:test_socket_paths.cpp>
-    # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
-    test_concurrent_dispatch.cpp
     # The token-only handshake surface published before a module's initializer.
     test_handshake_surface.cpp
     test_handshake_surface_transport.cpp
@@ -310,12 +117,6 @@ add_executable(protocol_tests
     # the io thread initiating async_write and segfaulted inside asio's
     # reactor. Also guards the fix against leaking descriptors or hanging.
     test_rpc_connection_teardown.cpp
-    # The acceptor half of the same race: RpcServer::stop() closed m_acceptor on
-    # the caller's thread while doAccept() re-armed async_accept on the io
-    # thread. Also guards that arming the first accept on the strand (rather
-    # than inline in start()) still serves a client that connects immediately.
-    test_rpc_server_teardown.cpp
-    test_rpc_server_stop_drain.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
@@ -350,12 +151,6 @@ add_executable(protocol_tests
     # Provider swapped faster than the 1 s poll. Detectors: four RED on 9e29120 (and without bindToSource), the gate one RED without
     # the helper's gate, the late-subscriber/rearm three RED on 4ceea79 (rearm also without its replay). Churn* is a control.
     test_subscription_fast_restart.cpp
-    # A provider served over plain TCP/TLS that dies and returns on its port. Seven detectors, RED on 5e7d0ec and each
-    # with its mechanism removed (isValid, the redial, its 20 ms cap, its deadline); AHealthyConnection* is a control.
-    # AFirstConnect*/AConsumer* are RED while connectToHost() is unbounded, *WhileTheIoThreadIsHeld also without its own
-    # cap; the AConnectFromAnEventHandler* control is RED if connectToHost() waits on a dial from the io thread.
-    # ACallFromAnEventHandler* is RED while requestObject() waits on a dial from the io thread (363408d, 9abb6bf).
-    test_plain_provider_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller
@@ -451,9 +246,6 @@ add_executable(protocol_tests
     # a caller's token is never filed as an outbound credential, granted or
     # not. The file names the one-line neutering that turns each case red.
     test_inbound_door.cpp
-    # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
-    # in-process Qt-event-loop deadlock between consumer + provider under
-    # nix's test sandbox; exercised cross-process by the integration matrix).
 )
 
 target_include_directories(protocol_tests PRIVATE
@@ -547,7 +339,6 @@ add_executable(qt_remote_plain_cabi_tests
     # Windows builds where LOGOS_PROTOCOL_BUILD_QT is disabled.
     test_protocol_version.cpp
     test_qt_remote_plain_cabi.cpp
-    test_plain_network_cabi.cpp
     test_plain_dispatch_gate.cpp
     test_plain_local_inproc.cpp
     test_plain_caller_resolver.cpp
@@ -606,13 +397,15 @@ target_link_libraries(qt_remote_plain_cabi_shared_tests PRIVATE
 )
 gtest_discover_tests(qt_remote_plain_cabi_shared_tests PROPERTIES TIMEOUT 8)
 
-# A process that called over TLS through the shared runtime must exit: the
-# child makes one call and returns, and the test runs it many times.
+# A process that called over a tls_tcp session through the shared runtime must
+# exit: the child makes one call and returns, and the test runs it many times.
+find_package(OpenSSL REQUIRED)
 add_executable(plain_exit_child plain_exit_child.cpp)
 target_link_libraries(plain_exit_child PRIVATE logos_protocol_plain_shared)
 add_executable(qt_remote_plain_exit_tests test_plain_exit.cpp)
 target_link_libraries(qt_remote_plain_exit_tests PRIVATE
     logos_protocol_plain_shared
+    OpenSSL::Crypto
     GTest::gtest_main
 )
 target_compile_definitions(qt_remote_plain_exit_tests PRIVATE
@@ -634,55 +427,6 @@ target_link_libraries(qt_remote_plain_qro_callback_destroy_tests PRIVATE
     Qt${QT_VERSION_MAJOR}::RemoteObjects
 )
 gtest_discover_tests(qt_remote_plain_qro_callback_destroy_tests PROPERTIES TIMEOUT 8)
-endif()
-
-# ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
-#
-# A SECOND executable, for one reason: QCoreApplication is a process-wide
-# singleton and protocol_tests' main() constructs it before the first test runs,
-# so no test in that binary can ever observe the state a Qt-free host process is
-# permanently in — instance() == nullptr. That state is where the async delivery
-# hop dropped every callback on the floor, and a test that cannot reach it
-# cannot detect it. Destroying the application partway through the main run to
-# get there would be a far worse trade than one more binary.
-#
-# Everything here links the same library and exercises the same code paths; only
-# main() differs. See test_main_noqt.cpp.
-if(LOGOS_PROTOCOL_BUILD_QT)
-add_executable(protocol_noqt_tests
-    test_main_noqt.cpp
-    # The async delivery hop, in a process with no Qt event loop. It read
-    # QCoreApplication::instance() and RETURNED when it was null, so in a
-    # Qt-free host — the deployment the plain transport exists for — every
-    # async callback was dropped: exactly-once became exactly-never, silently,
-    # on all four resolvers (reply, deferred completion, deadline,
-    # cancellation). Pins that each of them now lands, that none of them lands
-    # inline or on the io thread (which is the re-entrancy class that has
-    # already cost a SIGSEGV here, so a "just call it inline" fix would be
-    # worse than the bug), and that exactly-once survives the release-racing-
-    # replies shape against the new delivery vehicle.
-    #
-    # It also carries a probe that runs AFTER main() returns — a delivery issued
-    # from a static destructor, which is where a lazily-constructed delivery
-    # vehicle is already destroyed. Its verdict is this binary's EXIT CODE (70 on
-    # failure), because no test case runs in that window; see LateDeliveryProbe.
-    # That is also why a failure there shows up as a build-time error from
-    # gtest_discover_tests, which runs this binary to enumerate its tests.
-    test_delivery_without_qt.cpp
-)
-
-target_include_directories(protocol_noqt_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-target_link_libraries(protocol_noqt_tests PRIVATE
-    logos_protocol
-    GTest::gtest
-    Qt${QT_VERSION_MAJOR}::Core
-    Qt${QT_VERSION_MAJOR}::RemoteObjects
-)
-
-gtest_discover_tests(protocol_noqt_tests)
 endif()
 
 # Which implementation each transport resolves to. Also the Qt-configured test

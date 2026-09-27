@@ -48,10 +48,7 @@ public:
      *   - LogosMode::Remote → wire protocol picked by `transport.protocol`
      *
      * Use this overload when the caller wants a specific transport for
-     * this consumer without side-effecting the rest of the process
-     * (e.g. the logoscore CLI dialing `core_service` over tcp_ssl
-     * without also flipping the in-process LogosAPIProvider into
-     * binding TLS).
+     * this consumer without side-effecting the rest of the process.
      */
     LogosAPIConsumer(const QString& module_to_talk_to,
                      const QString& origin_module,

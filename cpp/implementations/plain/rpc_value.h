@@ -18,7 +18,7 @@ namespace logos::plain {
 // Covers the shapes we actually need (null / bool / int / double / string /
 // bytes / list / map). No Qt types. The JSON/CBOR codec converts to/from
 // `nlohmann::json`; Qt-side callers convert to/from `QVariant` at the Qt
-// boundary (see plain_logos_object.cpp, plain_transport_host.cpp).
+// boundary (qvariant_rpc_value.h).
 //
 // Uses recursive std::variant via wrapper structs so list/map can hold
 // RpcValue children without forward-declaration headaches.

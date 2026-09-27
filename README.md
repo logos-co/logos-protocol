@@ -20,11 +20,10 @@ versioned boundary instead of re-wrapping the C++/Qt SDK.
   **protocol version** (`LOGOS_PROTOCOL_VERSION_*`, `lp_protocol_version()`,
   `lp_protocol_abi_major()`). JSON-in-strings data model; bytes cross the
   boundary as `{"_bytes":"<base64url>"}` (lossless, NUL-safe).
-- **Transports** — plain TCP / TCP+TLS (Boost.Asio + OpenSSL + nlohmann,
-  Qt-free), `qt_local`, in-memory mock, Qt Remote Objects (`qt_remote`),
+- **Transports** — `qt_local`, in-memory mock, Qt Remote Objects (`qt_remote`),
   `qt_remote_plain`, a Qt-free implementation of the QtRO 2.0 wire profile used
-  by Logos modules, `inproc` for a provider in the same process, and `tls_tcp`,
-  a session between runtimes: mutual TLS 1.3 against trust anchors the embedder
+  by Logos modules, `inproc` for a provider in the same process, and `tls_tcp`
+  (Boost.Asio + OpenSSL + nlohmann, Qt-free), a session between runtimes: mutual TLS 1.3 against trust anchors the embedder
   supplies, a Hello the provider's authenticator turns into the caller, and no
   per-call tokens (`lp_provider_set_tls_credential` and the other session
   functions in `logos_protocol.h`; plain runtime only).
@@ -74,8 +73,10 @@ context, code generator, provider base classes) on top of this repo.
 This repo carries the **logos-protocol semver** — the single number that
 governs Logos load/call compatibility. Two participants (modules, hosts,
 SDKs in any language) interoperate **iff they share the same MAJOR**. MINOR
-is additive/back-compatible; PATCH never affects compatibility. SDKs must
-re-expose the version of the protocol they linked (never mint their own).
+is additive/back-compatible, with one exception: 0.15 removed the `tcp` and
+`tcp_ssl` transports, which both runtimes now refuse (runtimes reach each other
+over `tls_tcp`). PATCH never affects compatibility. SDKs must re-expose the
+version of the protocol they linked (never mint their own).
 
 ## Building
 
