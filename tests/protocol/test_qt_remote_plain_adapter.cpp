@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QUrl>
 #include <QElapsedTimer>
@@ -333,6 +334,82 @@ TEST(QtRemotePlainAdapterTest, ExistingModuleProxyCallsTokensAndEventsUseThePlai
     eventLoop.exec();
     EXPECT_TRUE(received.load());
     object->release();
+    tokens.clearAllTokens();
+}
+
+template <typename Fn>
+auto offMainThread(Fn fn) -> decltype(fn())
+{
+    auto future = std::async(std::launch::async, std::move(fn));
+    spinUntil([&] {
+        return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+    }, 5000);
+    return future.get();
+}
+
+// Detector: the Qt host answered neither revocation index over this wire, so a
+// revocation returned nothing and the token stayed live.
+TEST(QtRemotePlainAdapterTest, RevocationsReachAQtHostedModuleThroughBothObjects)
+{
+    using logos::plain::RpcList;
+    using logos::plain::RpcValue;
+    using logos::qt_remote_plain::Client;
+    using logos::qt_remote_plain::Variant;
+    qRegisterMetaType<LogosResult>("LogosResult");
+    AdapterProvider provider;
+    TokenManager& tokens = TokenManager::instance();
+    tokens.clearAllTokens();
+    tokens.adoptCredential(QStringLiteral("anchor"));
+    ModuleProxy proxy(&provider, nullptr, &tokens);
+    ModuleHandshakeProxy handshake(&proxy);
+
+    const QString url = realQroSocket();
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture"), &proxy));
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture__handshake"), &handshake));
+
+    const auto text = [](const std::string& value) { return Variant::fromRpc(RpcValue{value}); };
+    const auto digest = [](const char* token) {
+        return QCryptographicHash::hash(QByteArray(token), QCryptographicHash::Sha256)
+            .toHex().toStdString();
+    };
+    Client client;
+    ASSERT_TRUE(offMainThread([&] {
+        return client.connect(url.toStdString(), std::chrono::milliseconds(2000));
+    }));
+    const auto boolCall = [&](const std::string& object, const std::string& method,
+                              std::vector<Variant> args) {
+        return offMainThread([&] {
+            auto result = client.call(object, method, std::move(args),
+                                      std::chrono::milliseconds(2000));
+            return result && result->value.isBool() && result->value.asBool();
+        });
+    };
+    const auto echoes = [&](const char* token) {
+        return offMainThread([&] {
+            auto result = client.call("fixture", "callRemoteMethod(QString,QString,QVariantList)",
+                {text(token), text("echo"),
+                 Variant::fromRpc(RpcValue{RpcList{{RpcValue{std::string("x")}}}})},
+                std::chrono::milliseconds(2000));
+            return result && result->value.isString() && result->value.asString() == "adapter:x";
+        });
+    };
+    const std::string inform = "informModuleToken(QString,QString,QString)";
+    const std::string revoke = "revokeModuleToken(QString,QString,QString)";
+
+    ASSERT_TRUE(boolCall("fixture__handshake", inform,
+                         {text("anchor"), text("peer"), text("first-token")}));
+    ASSERT_TRUE(echoes("first-token"));
+    EXPECT_TRUE(boolCall("fixture__handshake", revoke,
+                         {text("anchor"), text("peer"), text(digest("first-token"))}));
+    EXPECT_FALSE(echoes("first-token"));
+
+    ASSERT_TRUE(boolCall("fixture", inform, {text("anchor"), text("peer"), text("second-token")}));
+    ASSERT_TRUE(echoes("second-token"));
+    EXPECT_TRUE(boolCall("fixture", revoke,
+                         {text("anchor"), text("peer"), text(digest("second-token"))}));
+    EXPECT_FALSE(echoes("second-token"));
+    offMainThread([&] { client.close(); return true; });
     tokens.clearAllTokens();
 }
 
