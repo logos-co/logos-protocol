@@ -3,6 +3,7 @@
 // installing a delegate is process-wide and one-shot, so it has one test.
 #include "logos_protocol.h"
 #include "logos_runtime_delegate.h"
+#include "session_certs.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -51,6 +52,30 @@ void onEvent(const char*, const char*, void* userData)
     auto& events = *static_cast<Events*>(userData);
     std::lock_guard<std::mutex> lock(events.mutex);
     ++events.count;
+}
+
+// A tls_tcp provider's side of a session, and the dialling client's hooks.
+char* admitAsWallet(const char*, void*)
+{
+    return copyText(R"({"caller":{"kind":"remote","peer":"peer-1","name":"wallet"},"lifetime_ms":60000})");
+}
+
+struct Dial {
+    int port = 0;
+    std::string anchors;
+    std::string pin;
+};
+
+char* dialHook(const char*, void* userData)
+{
+    const auto& d = *static_cast<Dial*>(userData);
+    return copyText(json{{"addresses", {"127.0.0.1"}}, {"port", d.port}, {"server_pin", d.pin},
+                         {"anchors", d.anchors}}.dump());
+}
+
+char* helloHook(const char*, void*)
+{
+    return copyText(R"({"ticket":"t","module":"session_target"})");
 }
 
 bool waitUntil(const std::function<bool()>& predicate)
@@ -113,6 +138,43 @@ TEST(PlainRuntimeDelegate, AModuleImageCallsAsItsIdentityUntilReleased)
         std::lock_guard<std::mutex> lock(events.mutex);
         return events.count == 1;
     }));
+
+    // A tls_tcp session (0.14): the host's runtime dials it with the image's credential
+    // and hook, and the call is bound to the caller the provider authenticated.
+    session_test::Identity server{"serverAuth"};
+    session_test::Identity peer{"clientAuth"};
+    lp_provider* remote = lp_provider_create(
+        "session_target", R"([{"protocol":"tls_tcp","host":"127.0.0.1","port":0}])");
+    ASSERT_NE(remote, nullptr);
+    ASSERT_EQ(lp_provider_set_tls_credential(remote, server.chainPem().c_str(), server.keyPem().c_str()),
+              LP_OK);
+    ASSERT_EQ(lp_provider_set_trust_anchors(remote, peer.rootPem().c_str()), LP_OK);
+    ASSERT_EQ(lp_provider_set_session_authenticator(remote, admitAsWallet, nullptr), LP_OK);
+    ASSERT_EQ(lp_provider_register(remote, whoami, noMethods, nullptr, nullptr), LP_OK);
+    Dial dial;
+    {
+        char* endpoints = lp_provider_endpoints_json(remote);
+        for (const auto& e : json::parse(endpoints))
+            if (e.value("protocol", "") == "tls_tcp") dial.port = e.value("port", 0);
+        lp_string_free(endpoints);
+    }
+    dial.anchors = server.rootPem();
+    dial.pin = server.leafPin();
+    lp_client* session = lp_client_create("session_target", "ignored", R"({"protocol":"tls_tcp"})", nullptr);
+    ASSERT_NE(session, nullptr);
+    ASSERT_EQ(lp_client_set_tls_credential(session, peer.chainPem().c_str(), peer.keyPem().c_str()), LP_OK);
+    ASSERT_EQ(lp_client_set_session_hook(session, dialHook, helloHook, &dial), LP_OK);
+    result = nullptr;
+    error = nullptr;
+    ASSERT_EQ(lp_invoke(session, "whoami", "[]", 5000, &result, &error), LP_OK) << (error ? error : "");
+    EXPECT_EQ(json::parse(result), json({{"kind", "remote"}, {"peer", "peer-1"}, {"name", "wallet"}}));
+    lp_string_free(result);
+    lp_string_free(error);
+    // Only the identity's own clients: a handle it never made is refused.
+    EXPECT_EQ(lp_client_set_tls_credential(reinterpret_cast<lp_client*>(&dial), peer.chainPem().c_str(),
+                                           peer.keyPem().c_str()), LP_ERR_INVALID_ARG);
+    lp_client_destroy(session);
+    lp_provider_destroy(remote);
 
     // The image's grant is its own: an ungranted identity cannot push even
     // though this process holds token_delivery.

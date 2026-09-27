@@ -4,9 +4,12 @@
 /* Runtime delegate (0.13): a module image loaded in a runtime host's process runs
  * its outbound client calls in the host's runtime, as the identity the host
  * admitted it as (the origin it passes is ignored). Forwarded: clients, calls,
- * subscriptions, introspection, token pushes. Image-local: versions, strings,
- * modes, the default transport, the caller document, providers and lp_token_*.
- * Strings a host entry returns are copied into the image and freed by the host. */
+ * subscriptions, introspection, token pushes, and (0.14) a client's tls_tcp
+ * session credential and hook. Image-local: versions, strings, modes, the default
+ * transport, the caller document, providers and lp_token_*.
+ * Strings a host entry returns are copied into the image and freed by the host.
+ * The table is sized: entries past string_free are used only when `size` covers
+ * them, and a host without the session entries refuses them, as before 0.14. */
 
 #include "logos_protocol.h"
 
@@ -52,6 +55,13 @@ typedef struct lp_runtime_delegate_v1 {
                                   const char* origin_module, const char* module_name,
                                   const char* token_digest, int timeout_ms);
     void (*string_free)(void* context, char* value);
+
+    /* 0.14: tls_tcp sessions, as lp_client_set_tls_credential and
+     * lp_client_set_session_hook; the hooks run on the host's threads. */
+    int (*client_set_tls_credential)(void* context, lp_client* client,
+                                     const char* cert_chain_pem, const char* key_pem);
+    int (*client_set_session_hook)(void* context, lp_client* client, lp_session_hook_cb dial,
+                                   lp_session_hook_cb hello, void* user_data);
 } lp_runtime_delegate_v1;
 
 /* HOST SIDE (shared runtime). NULL unless `identity` is isolated and holds its

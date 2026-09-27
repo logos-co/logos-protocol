@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -1245,6 +1246,17 @@ const lp_runtime_delegate_v1* activeDelegate()
     return gDelegate.load(std::memory_order_acquire);
 }
 
+// The layout every host has built: through string_free.
+constexpr unsigned kDelegateBaseSize =
+    offsetof(lp_runtime_delegate_v1, string_free) + sizeof(lp_runtime_delegate_v1::string_free);
+
+// Whether the host's table has the 0.14 session entries, its last ones, and filled them.
+bool delegateHasSessions(const lp_runtime_delegate_v1* delegate)
+{
+    return delegate->size >= sizeof(lp_runtime_delegate_v1) && delegate->client_set_tls_credential
+        && delegate->client_set_session_hook;
+}
+
 // A host-allocated string, copied into this image's allocator.
 char* adoptHostString(const lp_runtime_delegate_v1* delegate, char* value)
 {
@@ -2296,6 +2308,30 @@ static unsigned long long subscriptionGenerationLocal(lp_client* client)
     return client ? client->state->generation.load() : 0;
 }
 
+static int setTlsCredentialLocal(lp_client* client, const char* certChainPem, const char* keyPem)
+try {
+    if (!client || !certChainPem || !keyPem) return LP_ERR_INVALID_ARG;
+    const logos::plain::abi::TlsCredential credential{certChainPem, keyPem};
+    std::string error;
+    if (!logos::plain::abi::validateCredential(credential, error)) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
+    client->state->sessionCredential = credential;
+    return LP_OK;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+static int setSessionHookLocal(lp_client* client, lp_session_hook_cb dial, lp_session_hook_cb hello,
+                               void* userData)
+{
+    if (!client) return LP_ERR_INVALID_ARG;
+    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
+    client->state->sessionDial = dial;
+    client->state->sessionHello = hello;
+    client->state->sessionHookData = userData;
+    return LP_OK;
+}
+
 static int setSubscriptionOptionsLocal(lp_client* client, const char* optionsJson)
 try {
     if (!client) return 0;
@@ -3099,31 +3135,24 @@ int lp_client_set_subscription_options(lp_client* client, const char* optionsJso
     return setSubscriptionOptionsLocal(client, optionsJson);
 }
 
-// Sessions are dialled by a module host's own runtime, never through a delegate.
+// Under a delegate, a session is dialled by the host's runtime, when its table has the entry.
 int lp_client_set_tls_credential(lp_client* client, const char* certChainPem, const char* keyPem)
-try {
-    if (activeDelegate()) return LP_ERR_UNSUPPORTED;
-    if (!client || !certChainPem || !keyPem) return LP_ERR_INVALID_ARG;
-    const logos::plain::abi::TlsCredential credential{certChainPem, keyPem};
-    std::string error;
-    if (!logos::plain::abi::validateCredential(credential, error)) return LP_ERR_INVALID_ARG;
-    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
-    client->state->sessionCredential = credential;
-    return LP_OK;
-} catch (...) {
-    return LP_ERR_INTERNAL;
+{
+    if (const auto* delegate = activeDelegate()) {
+        if (!delegateHasSessions(delegate)) return LP_ERR_UNSUPPORTED;
+        return delegate->client_set_tls_credential(delegate->context, client, certChainPem, keyPem);
+    }
+    return setTlsCredentialLocal(client, certChainPem, keyPem);
 }
 
 int lp_client_set_session_hook(lp_client* client, lp_session_hook_cb dial,
                                lp_session_hook_cb hello, void* userData)
 {
-    if (activeDelegate()) return LP_ERR_UNSUPPORTED;
-    if (!client) return LP_ERR_INVALID_ARG;
-    std::lock_guard<std::timed_mutex> lock(client->state->connectionMutex);
-    client->state->sessionDial = dial;
-    client->state->sessionHello = hello;
-    client->state->sessionHookData = userData;
-    return LP_OK;
+    if (const auto* delegate = activeDelegate()) {
+        if (!delegateHasSessions(delegate)) return LP_ERR_UNSUPPORTED;
+        return delegate->client_set_session_hook(delegate->context, client, dial, hello, userData);
+    }
+    return setSessionHookLocal(client, dial, hello, userData);
 }
 
 int lp_client_rearm_subscriptions(lp_client* client)
@@ -3324,6 +3353,21 @@ unsigned long long delegateGeneration(void* context, lp_client* client)
     return subscriptionGenerationLocal(client);
 }
 
+int delegateTlsCredential(void* context, lp_client* client, const char* chain, const char* key)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return LP_ERR_INVALID_ARG;
+    return setTlsCredentialLocal(client, chain, key);
+}
+
+int delegateSessionHook(void* context, lp_client* client, lp_session_hook_cb dial,
+                        lp_session_hook_cb hello, void* userData)
+{
+    ContextCall call(context);
+    if (!call.open() || !call.owns(client)) return LP_ERR_INVALID_ARG;
+    return setSessionHookLocal(client, dial, hello, userData);
+}
+
 int delegateOptions(void* context, lp_client* client, const char* options)
 {
     ContextCall call(context);
@@ -3423,6 +3467,8 @@ try {
     table.inform_module_token_to = delegateInformTo;
     table.revoke_module_token_to = delegateRevokeTo;
     table.string_free = delegateStringFree;
+    table.client_set_tls_credential = delegateTlsCredential;
+    table.client_set_session_hook = delegateSessionHook;
     return &context->table;
 } catch (...) {
     return nullptr;
@@ -3454,7 +3500,7 @@ int lp_runtime_install_delegate(const lp_runtime_delegate_v1* delegate)
     (void)delegate;
     return LP_ERR_UNSUPPORTED;
 #else
-    if (!delegate || delegate->size < sizeof(lp_runtime_delegate_v1)
+    if (!delegate || delegate->size < kDelegateBaseSize
         || delegate->version < LP_RUNTIME_DELEGATE_VERSION)
         return LP_ERR_INVALID_ARG;
     if (gLocalClients.load() != 0) return LP_ERR_UNSUPPORTED;
