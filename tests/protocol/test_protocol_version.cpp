@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "logos_module_configuration.h"
 #include "logos_protocol.h"
 #include "logos_runtime_delegate.h"
 #include "logos_transport_config.h"
@@ -103,5 +104,14 @@ TEST(ProtocolVersion, MethodScopesHaveAFeatureMacro)
     EXPECT_EQ(LP_ERR_TARGET_UNSUPPORTED, -5);
 #else
     FAIL() << "method scopes have no feature macro";
+#endif
+}
+
+TEST(ProtocolVersion, ModuleConfigurationHasAFeatureMacro)
+{
+#if defined(LOGOS_PROTOCOL_HAS_MODULE_CONFIGURATION)
+    EXPECT_STREQ(LOGOS_MODULE_SET_CONFIGURATION_SYMBOL, "logos_module_set_configuration");
+#else
+    FAIL() << "module configuration has no feature macro";
 #endif
 }

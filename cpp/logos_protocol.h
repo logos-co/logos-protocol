@@ -286,7 +286,7 @@
 //       It also retires the token registry: "token_registry" is still accepted
 //       by lp_grant_host_services and grants nothing, and lp_token_keys always
 //       refuses. capability_module is the token authority and needs neither.
-//       Still 0.13, unreleased: method scopes (below).
+//       Still 0.13, unreleased: method scopes and module configuration (below).
 #define LOGOS_PROTOCOL_VERSION_MINOR 13
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.13.0"
@@ -331,6 +331,7 @@
 #define LOGOS_PROTOCOL_HAS_RUNTIME_DELEGATE 1  /* logos_runtime_delegate.h */
 #define LOGOS_PROTOCOL_HAS_TOKEN_REVOCATION 1  /* lp_revoke_module_token_to, revokeModuleToken */
 #define LOGOS_PROTOCOL_HAS_METHOD_SCOPES 1     /* lp_inform_scoped_module_token_to, not_authorised */
+#define LOGOS_PROTOCOL_HAS_MODULE_CONFIGURATION 1 /* logos_module_configuration.h */
 
 /* ---------------------------------------------------------------------------
  * Export marking.
