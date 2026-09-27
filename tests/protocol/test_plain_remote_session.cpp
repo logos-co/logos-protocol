@@ -582,6 +582,22 @@ TEST(RemoteSession, APortRangeIsHonoured)
     EXPECT_EQ(f.sessionPort(), port);
 }
 
+// A second listener on a port in use fails rather than sharing it (SO_REUSEADDR on Windows).
+TEST(RemoteSession, APortInUseIsNotShared)
+{
+    Fixture first;
+    first.start();
+    const int port = first.sessionPort();
+    ASSERT_NE(port, 0);
+    const std::string transport =
+        json::array({{{"protocol", "tls_tcp"}, {"host", "127.0.0.1"}, {"port", port}}}).dump();
+    Fixture second(nullptr, transport.c_str());
+    EXPECT_NE(lp_provider_register(second.provider, &dispatch, &methods, nullptr, &second.state), LP_OK);
+    json result;
+    ASSERT_EQ(first.invoke("whoami", "[]", &result), LP_OK);
+    EXPECT_EQ(result["kind"], "remote");
+}
+
 TEST(RemoteSession, OptionsAndCredentialsAreValidated)
 {
     Fixture f;

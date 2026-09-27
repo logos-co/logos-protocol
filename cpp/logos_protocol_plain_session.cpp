@@ -788,7 +788,10 @@ bool SessionEndpoint::start(std::string& error)
         boost::asio::ip::tcp::endpoint endpoint(address, port);
         impl.acceptor.open(endpoint.protocol(), ec);
         if (ec) break;
+#ifndef _WIN32
+        // Rebinding past TIME_WAIT. On Windows it would let a second listener share the port.
         impl.acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
+#endif
         impl.acceptor.bind(endpoint, ec);
         if (!ec) impl.acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
         if (!ec) {
