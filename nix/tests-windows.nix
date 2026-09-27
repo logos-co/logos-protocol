@@ -11,6 +11,7 @@ let
       { name = "cabi"; exe = "bin/qt_remote_plain_cabi_tests.exe"; timeout = 8; }
       { name = "cabi_shared"; exe = "bin/qt_remote_plain_cabi_shared_tests.exe"; timeout = 8; }
       { name = "delegate"; exe = "bin/plain_runtime_delegate_tests.exe"; timeout = 20; }
+      { name = "delegate_base"; exe = "bin/plain_runtime_delegate_base_tests.exe"; timeout = 20; }
       { name = "delegate_image"; exe = "bin/plain_runtime_delegate_image_tests.exe"; timeout = 20; }
       # 150 processes, each of which must exit; a hung one costs 10 s.
       { name = "exit"; exe = "bin/qt_remote_plain_exit_tests.exe"; timeout = 600; }
@@ -39,7 +40,7 @@ pkgs.stdenv.mkDerivation {
        protocol/qt_remote_plain_cabi_shared_tests.exe protocol/qt_remote_plain_exit_tests.exe \
        protocol/plain_exit_child.exe bin/liblogos_protocol_plain.dll $out/bin/
     cp protocol/plain_runtime_delegate_tests.exe protocol/plain_runtime_delegate_image_tests.exe \
-       protocol/plain_delegate_image.dll $out/bin/
+       protocol/plain_runtime_delegate_base_tests.exe protocol/plain_delegate_image.dll $out/bin/
     cp ${manifest} $out/share/logos-tests/protocol-plain.json
     runHook postInstall
   '';

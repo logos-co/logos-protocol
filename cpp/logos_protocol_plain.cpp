@@ -7,6 +7,7 @@
 #include "logos_protocol_plain_tokens.h"
 #include "logos_codec.h"
 #include "logos_call_error.h"
+#include "logos_method_scope.h"
 #include "logos_transport_config_json.h"
 
 #include <nlohmann/json.hpp>
@@ -340,14 +341,18 @@ void tokenSave(const std::shared_ptr<TokenStore>& store,
     }
 }
 
-bool isUnauthorized(const Variant& value)
+bool hasRpcStatus(const RpcValue& value, const char* wanted)
 {
-    if (!value.value.isMap()) return false;
-    const auto& entries = value.value.asMap().entries;
-    if (entries.size() != 1) return false;
-    const RpcValue* status = value.value.asMap().find(kStatusKey);
-    return status && status->isString() && status->asString() == "unauthorized";
+    if (!value.isMap() || value.asMap().entries.size() != 1) return false;
+    const RpcValue* status = value.asMap().find(kStatusKey);
+    return status && status->isString() && status->asString() == wanted;
 }
+
+bool isUnauthorized(const Variant& value) { return hasRpcStatus(value.value, "unauthorized"); }
+
+// Refused by the target's grant: never retried with a new token.
+constexpr const char* kNotAuthorised = "not_authorised";
+bool isNotAuthorised(const Variant& value) { return hasRpcStatus(value.value, kNotAuthorised); }
 
 bool pendingId(const Variant& value, std::string& id)
 {
@@ -1068,9 +1073,7 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         auto result = networkCall(state, state->target, method, args, token,
                                   remaining(), error, code, sent);
         auto unauthorized = [](const std::optional<RpcValue>& value) {
-            if (!value || !value->isMap()) return false;
-            const RpcValue* status = value->asMap().find(kStatusKey);
-            return status && status->isString() && status->asString() == "unauthorized";
+            return value && hasRpcStatus(*value, "unauthorized");
         };
         if (unauthorized(result) && state->target != "capability_module") {
             token = tokenFor(state, remaining(), error, token);
@@ -1111,6 +1114,11 @@ std::optional<Variant> invoke(const std::shared_ptr<ClientState>& state,
         "callRemoteMethod(QString,QString,QVariantList)",
         {Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{method}),
          std::move(arguments)}, remaining(), error, code, sent);
+    if (result && isNotAuthorised(*result)) {
+        error = "the target's grant does not cover '" + method + "'";
+        code = kNotAuthorised;
+        return std::nullopt;
+    }
     if (result && isUnauthorized(*result) && state->target != "capability_module") {
         token = tokenFor(state, remaining(), error, token);
         if (!token.empty()) {
@@ -1245,6 +1253,12 @@ private:
     DispatchGate& m_gate;
 };
 
+// A pushed token's methods; kept with the token it came with.
+struct TokenScope {
+    std::string token;
+    std::set<std::string> methods;
+};
+
 } // namespace
 
 struct lp_provider {
@@ -1265,6 +1279,8 @@ struct lp_provider {
     void* userData = nullptr;
     std::mutex mutex;
     std::map<std::string, std::string> inbound;
+    // Keys whose token authorizes only listed methods; cleared by every unscoped push.
+    std::map<std::string, TokenScope> scopes;
     std::map<std::string, std::string> returnTypes;
     // Deferred calls of LogosResult methods: call id -> declared return type.
     std::map<std::string, std::string> pendingResultTypes;
@@ -1312,16 +1328,36 @@ std::string resolvedCaller(const json& document)
     return {};
 }
 
+// Who presented `token` and what it may call. `caller` is empty when unauthorized;
+// `methods` is set for a scoped grant, and `ambiguous` when a scoped token names two keys.
+struct Authorization {
+    std::string caller;
+    std::optional<std::set<std::string>> methods;
+    bool ambiguous = false;
+};
+
+std::string withScopedMarker(const std::string& caller)
+{
+    json document = json::parse(caller, nullptr, false);
+    if (!document.is_object()) return caller;
+    document["scoped"] = true;
+    return dumpJson(document);
+}
+
 // The caller document for `token`, empty when unauthorized. As on the Qt path
 // (module_proxy.cpp), every entry is compared, an anchor key authorizes but
 // never names, and a value two callers share names neither; a token the host's
 // validator accepts is authorized too, and named by no one.
-std::string providerCaller(lp_provider* provider, const std::string& token,
-                           const char* protocol = "local",
-                           const std::string* principal = nullptr)
+Authorization providerCaller(lp_provider* provider, const std::string& token,
+                             const char* protocol = "local",
+                             const std::string* principal = nullptr)
 {
-    if (principal && isRuntimePrincipal(*principal)) return R"({"kind":"host"})";
-    if (token.empty()) return {};
+    Authorization result;
+    if (principal && isRuntimePrincipal(*principal)) {
+        result.caller = R"({"kind":"host"})";
+        return result;
+    }
+    if (token.empty()) return result;
     lp_validate_token_cb validate = nullptr;
     void* validatorData = nullptr;
     lp_caller_resolver_cb resolve = nullptr;
@@ -1331,6 +1367,7 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
         const bool host = !provider->credential.empty()
             && constantTimeEquals(provider->credential, token);
         bool anchor = false;
+        bool scopedMatch = false;
         int named = 0;
         std::string name;
         for (const auto& entry : provider->inbound) {
@@ -1341,16 +1378,35 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
                 ++named;
                 name = entry.first;
             }
+            if (match && provider->scopes.count(entry.first)) scopedMatch = true;
         }
-        if (host) return R"({"kind":"host"})";
+        if (scopedMatch && (host || anchor || named != 1)) {
+            result.ambiguous = true;
+            result.caller = R"({"kind":"unknown"})";
+            return result;
+        }
+        if (host) {
+            result.caller = R"({"kind":"host"})";
+            return result;
+        }
         if (named == 1 && !anchor) {
             // "@op:<name>" can never be a module name: an operator's pair token.
             if (name.rfind(kOperatorPrefix, 0) == 0 && name.size() > std::strlen(kOperatorPrefix))
-                return dumpJson(json{{"kind", "operator"},
-                                     {"name", name.substr(std::strlen(kOperatorPrefix))}});
-            return dumpJson(json{{"kind", "module"}, {"name", name}});
+                result.caller = dumpJson(json{{"kind", "operator"},
+                                              {"name", name.substr(std::strlen(kOperatorPrefix))}});
+            else
+                result.caller = dumpJson(json{{"kind", "module"}, {"name", name}});
+            const auto scope = provider->scopes.find(name);
+            if (scope != provider->scopes.end() && scope->second.token == token) {
+                result.methods = scope->second.methods;
+                result.caller = withScopedMarker(result.caller);
+            }
+            return result;
         }
-        if (named > 0 || anchor) return R"({"kind":"unknown"})";
+        if (named > 0 || anchor) {
+            result.caller = R"({"kind":"unknown"})";
+            return result;
+        }
         validate = provider->validateToken;
         validatorData = provider->validatorUserData;
         resolve = provider->resolveCaller;
@@ -1360,11 +1416,20 @@ std::string providerCaller(lp_provider* provider, const std::string& token,
         char* text = resolve(token.c_str(), protocol, resolverData);
         const json document = text ? json::parse(text, nullptr, false) : json();
         lp_string_free(text);
-        return resolvedCaller(document);
+        result.caller = resolvedCaller(document);
+        return result;
     }
     if (validate && validate(token.c_str(), protocol, validatorData) == LP_OK)
-        return R"({"kind":"unknown"})";
-    return {};
+        result.caller = R"({"kind":"unknown"})";
+    return result;
+}
+
+// Whether `authorization` lets `method` run: a scoped grant covers only its list.
+bool withinGrant(const Authorization& authorization, const std::string& method, bool noArguments)
+{
+    if (authorization.ambiguous) return false;
+    if (!authorization.methods || logos::isMethodScopeExempt(method, noArguments)) return true;
+    return authorization.methods->count(method) != 0;
 }
 
 json providerMetadata(lp_provider* provider, const std::string& requested)
@@ -1407,10 +1472,12 @@ std::string providerReturnType(lp_provider* provider, const std::string& method)
 }
 
 // Recorded only once the module took it: a refused push must not later
-// authorize, or name, whoever presents that token.
+// authorize, or name, whoever presents that token. An unscoped push clears the
+// key's scope; `scopeJson` (informScopedModuleToken) sets one.
 bool providerAcceptToken(lp_provider* provider, const std::string& auth,
                          const std::string& module, const std::string& token,
-                         const std::string* principal = nullptr)
+                         const std::string* principal = nullptr,
+                         const std::string* scopeJson = nullptr)
 {
     bool trusted = principal
         && (isRuntimePrincipal(*principal) || *principal == "capability_module");
@@ -1419,11 +1486,17 @@ bool providerAcceptToken(lp_provider* provider, const std::string& auth,
         trusted = !provider->credential.empty() && constantTimeEquals(provider->credential, auth);
     }
     if (!trusted) return false;
+    std::set<std::string> methods;
+    if (scopeJson && (module.empty() || token.empty() || isAnchorKey(module)
+                      || !logos::parseMethodScope(*scopeJson, &methods)))
+        return false;
     const bool accepted = !provider->onToken
         || provider->onToken(module.c_str(), token.c_str(), provider->userData) == LP_OK;
     if (accepted && !module.empty() && !token.empty()) {
         std::lock_guard<std::mutex> lock(provider->mutex);
         provider->inbound[module] = token;
+        if (scopeJson) provider->scopes[module] = TokenScope{token, std::move(methods)};
+        else provider->scopes.erase(module);
     }
     return accepted;
 }
@@ -1463,6 +1536,7 @@ bool providerRevokeToken(lp_provider* provider, const std::string& auth,
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (tokenDigest(found->second) != wanted) return false;
     provider->inbound.erase(found);
+    provider->scopes.erase(module);
     return true;
 }
 
@@ -1487,6 +1561,16 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         return Variant::fromRpc(RpcValue{providerRevokeToken(provider,
             arguments[0].value.asString(), arguments[1].value.asString(),
             arguments[2].value.asString())});
+    }
+    if (handshake && index == 2) {
+        if (arguments.size() != 4 || !arguments[0].value.isString()
+            || !arguments[1].value.isString() || !arguments[2].value.isString()
+            || !arguments[3].value.isString())
+            return Variant::fromRpc(RpcValue{false});
+        const std::string scope = arguments[3].value.asString();
+        return Variant::fromRpc(RpcValue{providerAcceptToken(provider,
+            arguments[0].value.asString(), arguments[1].value.asString(),
+            arguments[2].value.asString(), nullptr, &scope)});
     }
     if (handshake || index == 3) {
         if (arguments.size() != 3 || !arguments[0].value.isString()
@@ -1516,16 +1600,18 @@ Variant providerInvoke(lp_provider* provider, bool handshake,
         return Variant{MetaType::JsonArray, false,
                        jsonToRpc(metadata), {}};
     }
-    const std::string caller = providerCaller(provider, auth);
-    if (caller.empty())
+    const Authorization authorization = providerCaller(provider, auth);
+    if (authorization.caller.empty())
         return Variant::fromRpc(jsonToRpc(json{{kStatusKey, "unauthorized"}}));
+    if (!withinGrant(authorization, method, args.empty()))
+        return Variant::fromRpc(jsonToRpc(json{{kStatusKey, kNotAuthorised}}));
     if (!provider->dispatch) return {};
     const std::string argsText = dumpJson(args);
     char* text = nullptr;
     {
         GateEntry entry(provider->gate);
         const std::string previousCaller = std::move(gCurrentCaller);
-        gCurrentCaller = caller;
+        gCurrentCaller = authorization.caller;
         text = provider->dispatch(method.c_str(), argsText.c_str(), provider->userData);
         gCurrentCaller = previousCaller;
     }
@@ -1585,6 +1671,19 @@ ResultMessage providerNetworkCall(lp_provider* provider,
             request.args[0].asString(), request.args[1].asString(), principal)};
         return reply;
     }
+    if (request.method == "informScopedModuleToken") {
+        if (request.args.size() != 3 || !request.args[0].isString()
+            || !request.args[1].isString() || !request.args[2].isString()) {
+            reply.err = "invalid token arguments";
+            reply.errCode = "INVALID_ARGUMENT";
+            return reply;
+        }
+        reply.ok = true;
+        reply.value = RpcValue{providerAcceptToken(provider, request.authToken,
+            request.args[0].asString(), request.args[1].asString(), principal,
+            &request.args[2].asString())};
+        return reply;
+    }
     if (!provider->registered) {
         reply.err = "object not published: " + request.object;
         reply.errCode = "MODULE_NOT_LOADED";
@@ -1598,16 +1697,22 @@ ResultMessage providerNetworkCall(lp_provider* provider,
             : request.method == "getPluginEvents" ? "events" : "interface"));
         return reply;
     }
-    const std::string caller = providerCaller(provider, request.authToken, protocol, principal);
-    if (caller.empty()) {
+    const Authorization authorization =
+        providerCaller(provider, request.authToken, protocol, principal);
+    if (authorization.caller.empty()) {
         reply.ok = true;
         reply.value = jsonToRpc(json{{kStatusKey, "unauthorized"}});
         return reply;
     }
-    if (principal && bindingMismatch(caller, *principal)) {
+    if (principal && bindingMismatch(authorization.caller, *principal)) {
         // Not the unauthorized sentinel: a new token would not make it match.
         reply.err = "the token names another caller than this connection's";
         reply.errCode = "BINDING_MISMATCH";
+        return reply;
+    }
+    if (!withinGrant(authorization, request.method, request.args.empty())) {
+        reply.err = "the caller's grant does not cover '" + request.method + "'";
+        reply.errCode = "NOT_AUTHORISED";
         return reply;
     }
     json args = json::array();
@@ -1617,7 +1722,7 @@ ResultMessage providerNetworkCall(lp_provider* provider,
     {
         GateEntry entry(provider->gate);
         const std::string previousCaller = std::move(gCurrentCaller);
-        gCurrentCaller = caller;
+        gCurrentCaller = authorization.caller;
         text = provider->dispatch(request.method.c_str(), argsText.c_str(),
                                   provider->userData);
         gCurrentCaller = previousCaller;
@@ -1679,11 +1784,10 @@ logos::plain::MethodsResultMessage providerNetworkMethods(
 
 namespace {
 
-// informModuleToken or revokeModuleToken over an in-process connection bound
-// to `principal`.
+// informModuleToken, informScopedModuleToken or revokeModuleToken over an
+// in-process connection bound to `principal`.
 int pushTokenInproc(const std::string& target, const std::string& principal,
-                    const std::string& authToken, const std::string& moduleName,
-                    const std::string& token, int timeout,
+                    const std::string& authToken, std::vector<RpcValue> args, int timeout,
                     const char* method = "informModuleToken")
 {
     std::string error;
@@ -1694,7 +1798,7 @@ int pushTokenInproc(const std::string& target, const std::string& principal,
     request.authToken = authToken;
     request.object = target;
     request.method = method;
-    request.args = {RpcValue{moduleName}, RpcValue{token}};
+    request.args = std::move(args);
     auto future = wire->sendCall(std::move(request));
     const bool answered = future.wait_for(std::chrono::milliseconds(timeoutMs(timeout)))
         == std::future_status::ready;
@@ -2234,8 +2338,8 @@ try {
                             Variant::fromRpc(RpcValue{token})};
     std::string error;
     if (!isNetworkProtocol(config.protocol) && reachesInproc(config, "capability_module"))
-        return pushTokenInproc("capability_module", state->origin, authToken, moduleName, token,
-                               kDefaultTimeoutMs);
+        return pushTokenInproc("capability_module", state->origin, authToken,
+                               {RpcValue{moduleName}, RpcValue{token}}, kDefaultTimeoutMs);
     if (config.protocol == LogosProtocol::Tcp || config.protocol == LogosProtocol::TcpSsl) {
         if (own) {
             if (!ensureConnected(state, kDefaultTimeoutMs, error)) return LP_ERR_INTERNAL;
@@ -2285,7 +2389,8 @@ try {
     if (!authToken || !originModule || !*originModule || !moduleName || !digest || !*digest)
         return LP_ERR_INVALID_ARG;
     if (logos::plain::inproc::isPublished(instanceId(), originModule))
-        return pushTokenInproc(originModule, principal, authToken, moduleName, digest, timeout,
+        return pushTokenInproc(originModule, principal, authToken,
+                               {RpcValue{moduleName}, RpcValue{digest}}, timeout,
                                "revokeModuleToken");
     std::string error;
     Client target;
@@ -2314,7 +2419,8 @@ try {
     if (!authToken || !originModule || !*originModule || !moduleName || !token)
         return LP_ERR_INVALID_ARG;
     if (logos::plain::inproc::isPublished(instanceId(), originModule))
-        return pushTokenInproc(originModule, principal, authToken, moduleName, token, timeout);
+        return pushTokenInproc(originModule, principal, authToken,
+                               {RpcValue{moduleName}, RpcValue{token}}, timeout);
     std::string error;
     Client target;
     const int wait = timeoutMs(timeout);
@@ -2329,6 +2435,47 @@ try {
             {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
              Variant::fromRpc(RpcValue{token})}, std::chrono::milliseconds(wait), &error);
     }
+    return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
+} catch (...) {
+    return LP_ERR_INTERNAL;
+}
+
+// Only to a target that declares the method: its handshake object over the local
+// socket, or in-process. Nothing is sent to one that does not.
+static int informScopedModuleTokenTo(const std::string& principal, const char* authToken,
+                                     const char* originModule, const char* moduleName,
+                                     const char* token, const char* scopeJson, int timeout)
+try {
+    if (!authToken || !originModule || !*originModule || !moduleName || !*moduleName
+        || !token || !*token || !scopeJson || !logos::parseMethodScope(scopeJson))
+        return LP_ERR_INVALID_ARG;
+    if (logos::plain::inproc::isPublished(instanceId(), originModule))
+        return pushTokenInproc(originModule, principal, authToken,
+                               {RpcValue{moduleName}, RpcValue{token}, RpcValue{scopeJson}},
+                               timeout, "informScopedModuleToken");
+    static const std::string kSignature = "informScopedModuleToken(QString,QString,QString,QString)";
+    std::string error;
+    Client target;
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs(timeout));
+    const auto remaining = [&] {
+        return std::max(std::chrono::milliseconds::zero(),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            deadline - std::chrono::steady_clock::now()));
+    };
+    const std::string handshake = std::string(originModule) + "__handshake";
+    if (!target.connect(endpoint(originModule), remaining(), &error)
+        || !target.acquire(handshake, remaining(), &error))
+        return LP_ERR_INTERNAL;
+    const auto definition = target.definition(handshake);
+    if (!definition || std::none_of(definition->methodDefinitions.begin(),
+                                    definition->methodDefinitions.end(),
+                                    [](const auto& m) { return m.signature == kSignature; }))
+        return LP_ERR_TARGET_UNSUPPORTED;
+    auto result = target.call(handshake, kSignature,
+        {Variant::fromRpc(RpcValue{authToken}), Variant::fromRpc(RpcValue{moduleName}),
+         Variant::fromRpc(RpcValue{token}), Variant::fromRpc(RpcValue{scopeJson})},
+        remaining(), &error);
     return result && result->value.isBool() && result->value.asBool() ? LP_OK : LP_ERR_INTERNAL;
 } catch (...) {
     return LP_ERR_INTERNAL;
@@ -2537,6 +2684,7 @@ int lp_provider_save_token(lp_provider* provider, const char* moduleName,
         return LP_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(provider->mutex);
     provider->inbound[moduleName] = token;
+    provider->scopes.erase(moduleName);
     if (std::strcmp(moduleName, "core") == 0
         || std::strcmp(moduleName, "capability_module") == 0)
         provider->credential = token;
@@ -2708,6 +2856,24 @@ int lp_inform_module_token_to(lp_client* client, const char* authToken, const ch
     if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
     return informModuleTokenTo(client ? client->state->origin : std::string(kRuntimePrincipal),
                                authToken, originModule, moduleName, token, timeout);
+}
+
+int lp_inform_scoped_module_token_to(lp_client* client, const char* authToken,
+                                     const char* originModule, const char* moduleName,
+                                     const char* token, const char* scopeJson, int timeout)
+{
+    if (const auto* delegate = activeDelegate()) {
+        if (delegate->size < sizeof(lp_runtime_delegate_v1)
+            || !delegate->inform_scoped_module_token_to)
+            return LP_ERR_UNSUPPORTED;
+        return delegate->inform_scoped_module_token_to(delegate->context, client, authToken,
+                                                       originModule, moduleName, token,
+                                                       scopeJson, timeout);
+    }
+    if (!(gHostServices.load() & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return informScopedModuleTokenTo(client ? client->state->origin : std::string(kRuntimePrincipal),
+                                     authToken, originModule, moduleName, token, scopeJson,
+                                     timeout);
 }
 
 char* lp_token_digest(const char* token)
@@ -2912,6 +3078,17 @@ int delegateRevokeTo(void* context, lp_client*, const char* auth, const char* or
     return revokeModuleTokenTo(call.context().identity, auth, origin, module, digest, timeout);
 }
 
+int delegateInformScopedTo(void* context, lp_client*, const char* auth, const char* origin,
+                           const char* module, const char* token, const char* scope,
+                           int timeout)
+{
+    ContextCall call(context);
+    if (!call.open()) return LP_ERR_UNAVAILABLE;
+    if (!(call.context().grants & kTokenDelivery)) return LP_ERR_UNSUPPORTED;
+    return informScopedModuleTokenTo(call.context().identity, auth, origin, module, token, scope,
+                                     timeout);
+}
+
 void delegateStringFree(void*, char* value) { lp_string_free(value); }
 
 } // namespace
@@ -2956,6 +3133,7 @@ try {
     table.inform_module_token_to = delegateInformTo;
     table.revoke_module_token_to = delegateRevokeTo;
     table.string_free = delegateStringFree;
+    table.inform_scoped_module_token_to = delegateInformScopedTo;
     return &context->table;
 } catch (...) {
     return nullptr;
@@ -2987,7 +3165,7 @@ int lp_runtime_install_delegate(const lp_runtime_delegate_v1* delegate)
     (void)delegate;
     return LP_ERR_UNSUPPORTED;
 #else
-    if (!delegate || delegate->size < sizeof(lp_runtime_delegate_v1)
+    if (!delegate || delegate->size < LP_RUNTIME_DELEGATE_V1_BASE_SIZE
         || delegate->version < LP_RUNTIME_DELEGATE_VERSION)
         return LP_ERR_INVALID_ARG;
     if (gLocalClients.load() != 0) return LP_ERR_UNSUPPORTED;

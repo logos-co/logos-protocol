@@ -10,6 +10,8 @@
 
 #include "logos_protocol.h"
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,7 +54,16 @@ typedef struct lp_runtime_delegate_v1 {
                                   const char* origin_module, const char* module_name,
                                   const char* token_digest, int timeout_ms);
     void (*string_free)(void* context, char* value);
+    /* Appended: present when `size` covers it (method scopes). */
+    int (*inform_scoped_module_token_to)(void* context, lp_client* client,
+                                         const char* auth_token, const char* origin_module,
+                                         const char* module_name, const char* token,
+                                         const char* scope_json, int timeout_ms);
 } lp_runtime_delegate_v1;
+
+/* The size of the first table, which an image still installs. */
+#define LP_RUNTIME_DELEGATE_V1_BASE_SIZE \
+    ((unsigned)(offsetof(lp_runtime_delegate_v1, string_free) + sizeof(void (*)(void*, char*))))
 
 /* HOST SIDE (shared runtime). NULL unless `identity` is isolated and holds its
  * credential, so a module never runs on the host's store. `grants_json` is the

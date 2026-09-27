@@ -35,6 +35,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 
 #ifndef _WIN32
@@ -409,6 +410,52 @@ TEST(QtRemotePlainAdapterTest, RevocationsReachAQtHostedModuleThroughBothObjects
     EXPECT_TRUE(boolCall("fixture", revoke,
                          {text("anchor"), text("peer"), text(digest("second-token"))}));
     EXPECT_FALSE(echoes("second-token"));
+    offMainThread([&] { client.close(); return true; });
+    tokens.clearAllTokens();
+}
+
+// A plain pusher reaches a Qt-hosted module's scoped push at handshake index 2.
+TEST(QtRemotePlainAdapterTest, AScopedPushReachesAQtHostedModule)
+{
+    using logos::plain::RpcList;
+    using logos::plain::RpcValue;
+    using logos::qt_remote_plain::Client;
+    using logos::qt_remote_plain::Variant;
+    AdapterProvider provider;
+    TokenManager& tokens = TokenManager::instance();
+    tokens.clearAllTokens();
+    tokens.adoptCredential(QStringLiteral("anchor"));
+    ModuleProxy proxy(&provider, nullptr, &tokens);
+    ModuleHandshakeProxy handshake(&proxy);
+    const QString url = realQroSocket();
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture"), &proxy));
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture__handshake"), &handshake));
+
+    const auto text = [](const std::string& value) { return Variant::fromRpc(RpcValue{value}); };
+    Client client;
+    ASSERT_TRUE(offMainThread([&] {
+        return client.connect(url.toStdString(), std::chrono::milliseconds(2000));
+    }));
+    const bool pushed = offMainThread([&] {
+        auto result = client.call("fixture__handshake",
+            "informScopedModuleToken(QString,QString,QString,QString)",
+            {text("anchor"), text("peer"), text("scoped-token"),
+             text(R"({"methods":["other"]})")}, std::chrono::milliseconds(2000));
+        return result && result->value.isBool() && result->value.asBool();
+    });
+    ASSERT_TRUE(pushed);
+    const std::optional<Variant> refused = offMainThread([&] {
+        return client.call("fixture", "callRemoteMethod(QString,QString,QVariantList)",
+            {text("scoped-token"), text("echo"),
+             Variant::fromRpc(RpcValue{RpcList{{RpcValue{std::string("x")}}}})},
+            std::chrono::milliseconds(2000));
+    });
+    ASSERT_TRUE(refused.has_value());
+    const RpcValue* status = refused->value.isMap()
+        ? refused->value.asMap().find("__logos_rpc_status__") : nullptr;
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(status->asString(), "not_authorised");
     offMainThread([&] { client.close(); return true; });
     tokens.clearAllTokens();
 }

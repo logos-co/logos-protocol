@@ -6,6 +6,7 @@
 #include "qvariant_rpc_value.h"
 
 #include "../../logos_reserved_events.h"
+#include "../../logos_rpc_status.h"
 #include "../../module_proxy.h"
 
 #include <QDebug>
@@ -402,6 +403,16 @@ void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
         return;
     }
 
+    // Token control never reaches module code as a method name.
+    if (req.method == "informModuleToken" || req.method == "revokeModuleToken"
+        || req.method == "informScopedModuleToken") {
+        ResultMessage res; res.id = req.id; res.ok = false;
+        res.err = "token control is not served on this transport";
+        res.errCode = "INVALID_ARGUMENT";
+        reply(std::move(res));
+        return;
+    }
+
     QString   authToken  = QString::fromStdString(req.authToken);
     QString   methodName = QString::fromStdString(req.method);
     QVariantList args    = rpcListToQVariantList(req.args);
@@ -426,7 +437,11 @@ void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
                                             Q_ARG(QString, transportProtocol));
         ResultMessage res;
         res.id = id;
-        if (ok) {
+        if (ok && logos::isNotAuthorisedSentinel(ret)) {
+            res.ok = false;
+            res.err = "the caller's grant does not cover '" + methodName.toStdString() + "'";
+            res.errCode = "NOT_AUTHORISED";
+        } else if (ok) {
             res.ok = true;
             res.value = qvariantToRpcValue(ret);
         } else {

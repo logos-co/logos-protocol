@@ -223,6 +223,10 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
  *   {"kind":"module","name":"chat_module","instance":"a41f"}
  *   {"kind":"derived","parent":"wallet_module","leaf":"wallet_ui"}
  *   {"kind":"operator","name":"ops-readonly"}
+ *   {"kind":"module","name":"chat_module","scoped":true}
+ *
+ * "scoped":true means the call passed a method-list grant for exactly this method.
+ * Only the target's host runtime adds it; a caller resolver cannot.
  *
  * Rules, in the order a reader applies them:
  *

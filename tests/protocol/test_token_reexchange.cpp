@@ -74,7 +74,7 @@ public:
 // to simulate the provider rejecting a stale token.
 class SimTargetProvider : public LogosProviderObject {
 public:
-    enum Mode { RejectOnceThenOk, AlwaysReject, AlwaysEmpty };
+    enum Mode { RejectOnceThenOk, AlwaysReject, AlwaysEmpty, OutsideGrant };
     explicit SimTargetProvider(Mode m) : m_mode(m) {}
 
     QVariant callMethod(const QString& method, const QVariantList&) override {
@@ -88,6 +88,8 @@ public:
             return logos::makeUnauthorizedSentinel();
         case AlwaysEmpty:
             return QVariant();
+        case OutsideGrant:
+            return logos::makeNotAuthorisedSentinel();
         }
         return QVariant();
     }
@@ -222,6 +224,45 @@ void wireRig(LogosTransportHost& capHost, LogosTransportHost& targetHost,
     ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
 }
 } // namespace
+
+// A refusal by the target's grant is final: no re-exchange, sync or async, since
+// a new token would carry the same grant and churn the pair.
+TEST_F(TokenReexchangeTest, AGrantRefusalIsNeverReexchanged)
+{
+    auto capHost = makeLocalHost(LogosInstance::id("capability_module"));
+    auto targetHost = makeLocalHost(LogosInstance::id("target_module"));
+    SimTargetProvider targetProvider(SimTargetProvider::OutsideGrant);
+    ModuleProxy       targetProxy(&targetProvider);
+    CapabilityProvider capProvider;
+    ModuleProxy        capProxy(&capProvider);
+    wireRig(*capHost, *targetHost, capProxy, targetProxy, capProvider, targetProvider,
+            QStringLiteral("bootstrap-tok-grant"));
+    LogosAPIClient client(QStringLiteral("target_module"), QStringLiteral("test_origin"),
+                          &TokenManager::instance());
+    for (int i = 0; i < 100 && !client.isConnected(); ++i) pumpEventLoop(20);
+    ASSERT_TRUE(client.isConnected());
+
+    logos::CallError err;
+    const QVariant r = client.invokeRemoteMethod(QStringLiteral("target_module"),
+        QStringLiteral("ping"), QVariantList{}, Timeout(), &err);
+    EXPECT_FALSE(r.isValid());
+    EXPECT_EQ(err.code, "not_authorised");
+    EXPECT_EQ(targetProvider.calls(), 1);
+    EXPECT_EQ(capProvider.mintCount(), 1) << "only the first exchange, no re-exchange";
+
+    std::atomic<int> done{0};
+    logos::CallError asyncErr;
+    client.invokeRemoteMethodAsync(QStringLiteral("target_module"), QStringLiteral("ping"),
+        QVariantList{}, [&](QVariant, const logos::CallError& e) {
+            asyncErr = e;
+            done.fetch_add(1);
+        });
+    for (int i = 0; i < 400 && done.load() < 1; ++i) pumpEventLoop(20);
+    ASSERT_EQ(done.load(), 1);
+    EXPECT_EQ(asyncErr.code, "not_authorised");
+    EXPECT_EQ(targetProvider.calls(), 2);
+    EXPECT_EQ(capProvider.mintCount(), 1);
+}
 
 // ── Consumer side: a rejection triggers exactly one re-exchange + retry ───────
 TEST_F(TokenReexchangeTest, SyncRejectionReexchangesAndRetriesOnce)

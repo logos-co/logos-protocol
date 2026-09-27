@@ -557,6 +557,7 @@ install(FILES
     # Included by generated module glue and by hosts that load modules in-process.
     logos_runtime_delegate.h
     logos_module_impl.h
+    logos_method_scope.h
     # The canonical LIDL <-> JSON codec. Generated module glue includes it, so it
     # has to ship with the library's headers, not just in the source export.
     logos_codec.h

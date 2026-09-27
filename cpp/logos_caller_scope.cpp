@@ -58,6 +58,14 @@ std::string callerModuleJson(const std::string& name)
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+std::string withScopedMarker(const std::string& callerJson)
+{
+    nlohmann::json j = nlohmann::json::parse(callerJson, nullptr, false);
+    if (!j.is_object()) return callerJson;
+    j["scoped"] = true;
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 std::string currentInboundCallerJson()
 {
     return slot();

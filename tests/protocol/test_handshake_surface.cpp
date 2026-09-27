@@ -192,7 +192,8 @@ TEST_F(HandshakeSurfaceTest, HandshakeSurfaceExposesOnlyTokenDelivery)
             invokables << QString::fromUtf8(m.name());
     }
     EXPECT_EQ(invokables, (QStringList{ QStringLiteral("informModuleToken"),
-                                        QStringLiteral("revokeModuleToken") }))
+                                        QStringLiteral("revokeModuleToken"),
+                                        QStringLiteral("informScopedModuleToken") }))
         << "the early-published surface must not grow beyond token delivery";
 
     // And nothing reached the implementation as a business call.

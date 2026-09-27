@@ -20,7 +20,7 @@ namespace logos::plain::inproc {
 struct Handlers {
     // A business call from a connection bound to `principal`.
     std::function<ResultMessage(const CallMessage&, const std::string& principal)> call;
-    // informModuleToken, revokeModuleToken and metadata: never queued behind calls.
+    // Token pushes, revocations and metadata: never queued behind calls.
     std::function<ResultMessage(const CallMessage&, const std::string& principal)> control;
     std::function<MethodsResultMessage(const MethodsMessage&)> methods;
     std::function<bool(const TokenMessage&, const std::string& principal)> token;

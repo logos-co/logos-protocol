@@ -109,7 +109,12 @@ Variant invokePublishedDirect(QObject* object, bool handshake,
     const QVariantList qargs = toQVariantList(args);
     if (handshake) {
         auto* proxy = qobject_cast<ModuleHandshakeProxy*>(guarded.data());
-        if (!proxy || qargs.size() != 3) return {};
+        if (!proxy) return {};
+        if (index == 2 && qargs.size() == 4)
+            return fromQVariant(proxy->informScopedModuleToken(
+                qargs[0].toString(), qargs[1].toString(), qargs[2].toString(),
+                qargs[3].toString()));
+        if (qargs.size() != 3) return {};
         if (index == 0)
             return fromQVariant(proxy->informModuleToken(qargs[0].toString(),
                                                          qargs[1].toString(),

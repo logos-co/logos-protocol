@@ -32,6 +32,8 @@ namespace logos {
 //                          result value — see logos-cpp-sdk#129).
 //   "unauthorized"       — the provider rejected our token and the one
 //                          permitted re-exchange also failed.
+//   "not_authorised"     — the token is valid but its grant does not cover the
+//                          method. Never retried: a new token carries the same grant.
 struct CallError {
     std::string code;     // empty = no error
     std::string message;
@@ -93,6 +95,7 @@ inline CallError callErrorFromWire(const std::string& origin,
         return callErrorTransport(origin, detail);
     // A bound in-process connection presented another caller's token.
     if (wireCode == "BINDING_MISMATCH") return {"unauthorized", detail, origin};
+    if (wireCode == "NOT_AUTHORISED") return {"not_authorised", detail, origin};
     return callErrorCallFailed(origin, detail);
 }
 

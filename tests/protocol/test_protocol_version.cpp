@@ -94,3 +94,14 @@ TEST(ProtocolVersion, TheInProcessWaveHasFeatureMacros)
     FAIL() << "an addition of the 0.13 wave has no feature macro";
 #endif
 }
+
+// Method scopes arrive with their macro, in both runtimes.
+TEST(ProtocolVersion, MethodScopesHaveAFeatureMacro)
+{
+#if defined(LOGOS_PROTOCOL_HAS_METHOD_SCOPES)
+    EXPECT_NE(reinterpret_cast<const void*>(&lp_inform_scoped_module_token_to), nullptr);
+    EXPECT_EQ(LP_ERR_TARGET_UNSUPPORTED, -5);
+#else
+    FAIL() << "method scopes have no feature macro";
+#endif
+}
