@@ -30,7 +30,7 @@ public:
 
     boost::asio::io_context& ioContext() { return m_ioc; }
 
-    // Process-wide default pool. Thread-safe lazy init.
+    // Process-wide default pool: made on first use, never destroyed.
     static IoContextPool& shared();
 
 private:
