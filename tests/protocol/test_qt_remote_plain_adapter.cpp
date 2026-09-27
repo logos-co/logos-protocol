@@ -273,71 +273,6 @@ TEST(QtRemotePlainAdapterTest, ASubscriptionToAModuleThatIsNotUpNeitherBlocksNor
     LogosTransportConfigGlobal::setDefault(saved);
 }
 
-#ifndef _WIN32
-TEST(QtRemotePlainAdapterTest, ExistingModuleProxyCallsTokensAndEventsUseThePlainWire)
-{
-    qRegisterMetaType<LogosResult>("LogosResult");
-    AdapterProvider provider;
-    TokenManager& tokens = TokenManager::instance();
-    tokens.clearAllTokens();
-    tokens.adoptCredential(QStringLiteral("secret"));
-    ModuleProxy proxy(&provider, nullptr, &tokens);
-    ASSERT_TRUE(proxy.saveToken(QStringLiteral("caller"), QStringLiteral("secret")));
-
-    const QString url = QString::fromStdString(adapterSocket());
-    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
-    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture"), &proxy));
-    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(url);
-    ASSERT_TRUE(connection.connectToHost());
-    LogosObject* object = connection.requestObject(QStringLiteral("fixture"), 1000);
-    ASSERT_NE(object, nullptr);
-
-    auto calls = std::async(std::launch::async, [object] {
-        const QVariant echo = object->callMethod(
-            QStringLiteral("secret"), QStringLiteral("echo"),
-            {QStringLiteral("hello")}, 1000);
-        const bool informed = object->informModuleToken(
-            QStringLiteral("secret"), QStringLiteral("peer"),
-            QStringLiteral("peer-token"), 1000);
-        return std::make_pair(echo, informed);
-    });
-    QEventLoop callLoop;
-    QTimer callPoll;
-    callPoll.setInterval(5);
-    QObject::connect(&callPoll, &QTimer::timeout, &callLoop, [&] {
-        if (calls.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-            callLoop.quit();
-    });
-    QTimer::singleShot(3000, &callLoop, &QEventLoop::quit);
-    callPoll.start();
-    callLoop.exec();
-    callPoll.stop();
-    ASSERT_EQ(calls.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
-    const auto [echo, informed] = calls.get();
-    EXPECT_EQ(echo.toString(), QStringLiteral("adapter:hello"));
-    EXPECT_TRUE(informed);
-    EXPECT_EQ(provider.informedModule, QStringLiteral("peer"));
-    EXPECT_EQ(provider.informedToken, QStringLiteral("peer-token"));
-
-    std::atomic<bool> received{false};
-    object->onEvent(QStringLiteral("tick"), [&](const QString&, const QVariantList& data) {
-        received = data == QVariantList{QStringLiteral("payload")};
-    });
-    provider.fire(QStringLiteral("tick"), {QStringLiteral("payload")});
-    QEventLoop eventLoop;
-    QTimer eventPoll;
-    eventPoll.setInterval(5);
-    QObject::connect(&eventPoll, &QTimer::timeout, &eventLoop, [&] {
-        if (received.load()) eventLoop.quit();
-    });
-    QTimer::singleShot(1000, &eventLoop, &QEventLoop::quit);
-    eventPoll.start();
-    eventLoop.exec();
-    EXPECT_TRUE(received.load());
-    object->release();
-    tokens.clearAllTokens();
-}
-
 template <typename Fn>
 auto offMainThread(Fn fn) -> decltype(fn())
 {
@@ -457,6 +392,71 @@ TEST(QtRemotePlainAdapterTest, AScopedPushReachesAQtHostedModule)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(status->asString(), "not_authorised");
     offMainThread([&] { client.close(); return true; });
+    tokens.clearAllTokens();
+}
+
+#ifndef _WIN32
+TEST(QtRemotePlainAdapterTest, ExistingModuleProxyCallsTokensAndEventsUseThePlainWire)
+{
+    qRegisterMetaType<LogosResult>("LogosResult");
+    AdapterProvider provider;
+    TokenManager& tokens = TokenManager::instance();
+    tokens.clearAllTokens();
+    tokens.adoptCredential(QStringLiteral("secret"));
+    ModuleProxy proxy(&provider, nullptr, &tokens);
+    ASSERT_TRUE(proxy.saveToken(QStringLiteral("caller"), QStringLiteral("secret")));
+
+    const QString url = QString::fromStdString(adapterSocket());
+    logos::qt_remote_plain::QtRemotePlainTransportHost host(url);
+    ASSERT_TRUE(host.publishObject(QStringLiteral("fixture"), &proxy));
+    logos::qt_remote_plain::QtRemotePlainTransportConnection connection(url);
+    ASSERT_TRUE(connection.connectToHost());
+    LogosObject* object = connection.requestObject(QStringLiteral("fixture"), 1000);
+    ASSERT_NE(object, nullptr);
+
+    auto calls = std::async(std::launch::async, [object] {
+        const QVariant echo = object->callMethod(
+            QStringLiteral("secret"), QStringLiteral("echo"),
+            {QStringLiteral("hello")}, 1000);
+        const bool informed = object->informModuleToken(
+            QStringLiteral("secret"), QStringLiteral("peer"),
+            QStringLiteral("peer-token"), 1000);
+        return std::make_pair(echo, informed);
+    });
+    QEventLoop callLoop;
+    QTimer callPoll;
+    callPoll.setInterval(5);
+    QObject::connect(&callPoll, &QTimer::timeout, &callLoop, [&] {
+        if (calls.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+            callLoop.quit();
+    });
+    QTimer::singleShot(3000, &callLoop, &QEventLoop::quit);
+    callPoll.start();
+    callLoop.exec();
+    callPoll.stop();
+    ASSERT_EQ(calls.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
+    const auto [echo, informed] = calls.get();
+    EXPECT_EQ(echo.toString(), QStringLiteral("adapter:hello"));
+    EXPECT_TRUE(informed);
+    EXPECT_EQ(provider.informedModule, QStringLiteral("peer"));
+    EXPECT_EQ(provider.informedToken, QStringLiteral("peer-token"));
+
+    std::atomic<bool> received{false};
+    object->onEvent(QStringLiteral("tick"), [&](const QString&, const QVariantList& data) {
+        received = data == QVariantList{QStringLiteral("payload")};
+    });
+    provider.fire(QStringLiteral("tick"), {QStringLiteral("payload")});
+    QEventLoop eventLoop;
+    QTimer eventPoll;
+    eventPoll.setInterval(5);
+    QObject::connect(&eventPoll, &QTimer::timeout, &eventLoop, [&] {
+        if (received.load()) eventLoop.quit();
+    });
+    QTimer::singleShot(1000, &eventLoop, &QEventLoop::quit);
+    eventPoll.start();
+    eventLoop.exec();
+    EXPECT_TRUE(received.load());
+    object->release();
     tokens.clearAllTokens();
 }
 
