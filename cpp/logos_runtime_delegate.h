@@ -8,8 +8,9 @@
  * session credential and hook. Image-local: versions, strings, modes, the default
  * transport, the caller document, providers and lp_token_*.
  * Strings a host entry returns are copied into the image and freed by the host.
- * The table is sized: entries past string_free are used only when `size` covers
- * them, and a host without the session entries refuses them, as before 0.14. */
+ * The table is sized: an entry past string_free is used only when `size` reaches
+ * that entry's own end, and a host without the session entries refuses them, as
+ * before 0.14. */
 
 #include "logos_protocol.h"
 

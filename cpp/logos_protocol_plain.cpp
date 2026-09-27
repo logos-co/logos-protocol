@@ -1250,10 +1250,14 @@ const lp_runtime_delegate_v1* activeDelegate()
 constexpr unsigned kDelegateBaseSize =
     offsetof(lp_runtime_delegate_v1, string_free) + sizeof(lp_runtime_delegate_v1::string_free);
 
-// Whether the host's table has the 0.14 session entries, its last ones, and filled them.
+// Whether the host's table reaches the end of the 0.14 session entries (not the struct's,
+// which a later layer may extend) and filled them.
+constexpr std::size_t kSessionEntriesEnd =
+    offsetof(lp_runtime_delegate_v1, client_set_session_hook) + sizeof(lp_runtime_delegate_v1::client_set_session_hook);
+
 bool delegateHasSessions(const lp_runtime_delegate_v1* delegate)
 {
-    return delegate->size >= sizeof(lp_runtime_delegate_v1) && delegate->client_set_tls_credential
+    return delegate->size >= kSessionEntriesEnd && delegate->client_set_tls_credential
         && delegate->client_set_session_hook;
 }
 
