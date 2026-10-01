@@ -1,4 +1,5 @@
 #include "module_proxy.h"
+#include "logos_logging.h"
 #include "logos_caller_scope.h"
 #include "logos_provider_interface.h"
 #include "token_manager.h"
@@ -20,7 +21,7 @@ ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent,
 {
     if (m_provider) {
         m_provider->setEventListener([this](const QString& eventName, const QVariantList& data) {
-            qDebug() << "[LogosProviderObject] ModuleProxy: forwarding event" << eventName << "as Qt signal";
+            qCDebug(lcLogosProtocolEvents) << "[LogosProviderObject] ModuleProxy: forwarding event" << eventName << "as Qt signal";
             // Events may be fired from any thread (e.g. a module's worker/FFI
             // thread), but this object is the QtRemoteObjects source and must be
             // driven from its own thread. Emitting directly from a foreign
@@ -66,7 +67,7 @@ bool ModuleProxy::saveToken(const QString& from_module_name, const QString& toke
     }
 
     m_tokens[from_module_name] = token;
-    qDebug() << "ModuleProxy: Token saved for module:" << from_module_name;
+    qCDebug(lcLogosProtocolTokens) << "ModuleProxy: Token saved for module:" << from_module_name;
     return true;
 }
 
@@ -127,7 +128,7 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // SECURITY: never log call arguments — they routinely carry secrets
     // (mnemonics, passwords, tokens, key material). Log only the method name and
     // the argument count, matching the other transport call sites.
-    qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
+    qCDebug(lcLogosProtocolCalls) << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
 
     // WHO IS CALLING, for the duration of this dispatch and no longer.
     //
@@ -595,7 +596,7 @@ QJsonArray ModuleProxy::getPluginInterface()
 {
     if (!m_provider) return QJsonArray();
 
-    qDebug() << "[LogosProviderObject] ModuleProxy: calling LogosProviderObject::getMethods()";
+    qCDebug(lcLogosProtocolCalls) << "[LogosProviderObject] ModuleProxy: calling LogosProviderObject::getMethods()";
     QJsonArray iface = m_provider->getMethods();
 
     // Advertise module identity for a provider that does not list it itself.

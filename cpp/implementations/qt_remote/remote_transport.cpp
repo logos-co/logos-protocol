@@ -1,4 +1,5 @@
 #include "remote_transport.h"
+#include "../../logos_logging.h"
 #include "../../logos_async_dispatch.h"
 #include "../../logos_object_source_watch.h"
 #include "../../logos_socket_paths.h"
@@ -12,7 +13,6 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QDebug>
-#include <QLoggingCategory>
 #include <QUrl>
 #include <QLocalSocket>
 #include <QMetaObject>
@@ -27,8 +27,6 @@
 static std::atomic<long> g_acquireCount{0};
 
 using logos::qtremote::localSocketFilePath;
-
-Q_DECLARE_LOGGING_CATEGORY(lcLogosProtocolCalls)
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 
@@ -65,7 +63,7 @@ public slots:
         auto cbs = m_callbacks.value(eventName);
         if (!reserved) cbs.append(m_callbacks.value(QString()));
         if (!cbs.isEmpty() && !reserved) {
-            qDebug() << "[LogosObject] Remote EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s) (via IPC)";
+            qCDebug(lcLogosProtocolEvents) << "[LogosObject] Remote EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s) (via IPC)";
         }
         for (const auto& cb : cbs) {
             try { cb(eventName, data); } catch (...) {}
@@ -172,7 +170,7 @@ public:
                             " or transport dropped)");
             return QVariant();
         }
-        qDebug() << "[LogosObject] RemoteLogosObject::callMethod" << methodName << "args:" << args.size();
+        qCDebug(lcLogosProtocolCalls) << "[LogosObject] RemoteLogosObject::callMethod" << methodName << "args:" << args.size();
 
         QRemoteObjectPendingCall pendingCall;
         bool success = QMetaObject::invokeMethod(
@@ -401,12 +399,12 @@ public:
             return;
         }
 
-        qDebug() << "[LogosObject] RemoteLogosObject::onEvent subscribing to event:" << eventName;
+        qCDebug(lcLogosProtocolEvents) << "[LogosObject] RemoteLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {
             m_helper = new RemoteEventHelper(m_watch);
             QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
-            qDebug() << "[LogosObject] RemoteLogosObject: connected EventHelper to QRemoteObjectReplica signals (IPC)";
+            qCDebug(lcLogosProtocolEvents) << "[LogosObject] RemoteLogosObject: connected EventHelper to QRemoteObjectReplica signals (IPC)";
         }
         m_helper->addCallback(eventName, std::move(callback));
     }
@@ -439,7 +437,7 @@ public:
     void emitEvent(const QString& eventName, const QVariantList& data) override
     {
         if (!m_replica) return;
-        qDebug() << "[LogosObject] RemoteLogosObject::emitEvent" << eventName << "data:" << data.size() << "items (via IPC)";
+        qCDebug(lcLogosProtocolEvents) << "[LogosObject] RemoteLogosObject::emitEvent" << eventName << "data:" << data.size() << "items (via IPC)";
         QMetaObject::invokeMethod(m_replica, "eventResponse",
                                   Qt::QueuedConnection,
                                   Q_ARG(QString, eventName),

@@ -1,4 +1,5 @@
 #include "logos_api_client.h"
+#include "logos_logging.h"
 #include "logos_api_consumer.h"
 #include "logos_object.h"
 #include "logos_types.h"
@@ -119,7 +120,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     // owner thread so a worker thread (e.g. an HTTP handler) can call other
     // modules. Same-thread callers run directly. See logos_thread_marshal.h.
     return logos::runOnOwnerThread(this, [&]() -> QVariant {
-    qDebug() << "LogosAPIClient: invoking remote method" << objectName << methodName << "args_count:" << args.size();
+    qCDebug(lcLogosProtocolCalls) << "LogosAPIClient: invoking remote method" << objectName << methodName << "args_count:" << args.size();
 
     const bool eligible = objectName != QStringLiteral("capability_module") && m_capability_consumer;
 
@@ -193,7 +194,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
 
 QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout timeout)
 {
-    qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIClient: calling requestModule for" << objectName;
     const QString capabilityToken = getToken(QStringLiteral("capability_module"));
 
     // A NAMED DIAGNOSTIC for the one way this whole path fails silently.
@@ -225,7 +226,7 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
                                              m_origin_module.toStdString(),
                                              objectName.toStdString(),
                                              timeout.ms));
-    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIClient: requestModule result for" << objectName << "token received:" << !token.isEmpty();
     // Cache the minted token so subsequent calls skip the handshake — closes the
     // token-rotation race where overlapping requestModule calls mint fresh tokens
     // that overwrite each other at the target (e.g. QtRO's sync wait reentering
@@ -626,7 +627,7 @@ QStringList LogosAPIClient::pendingEventSubscriptions() const
 
 void LogosAPIClient::onEventResponse(LogosObject* object, const QString& eventName, const QVariantList& data)
 {
-    qDebug() << "[LogosObject] LogosAPIClient::onEventResponse" << eventName << "-> LogosObject::emitEvent";
+    qCDebug(lcLogosProtocolEvents) << "[LogosObject] LogosAPIClient::onEventResponse" << eventName << "-> LogosObject::emitEvent";
 
     if (eventName.isEmpty()) {
         qWarning() << "LogosAPIClient: Event name cannot be empty";
@@ -643,7 +644,7 @@ void LogosAPIClient::onEventResponse(LogosObject* object, const QString& eventNa
 
 void LogosAPIClient::onEventResponse(QObject* object, const QString& eventName, const QVariantList& data)
 {
-    qDebug() << "[LogosObject] LogosAPIClient::onEventResponse (QObject* compat)" << eventName;
+    qCDebug(lcLogosProtocolEvents) << "[LogosObject] LogosAPIClient::onEventResponse (QObject* compat)" << eventName;
 
     if (eventName.isEmpty()) {
         qWarning() << "LogosAPIClient: Event name cannot be empty";
@@ -695,15 +696,15 @@ TokenManager* LogosAPIClient::getTokenManager() const
 
 QString LogosAPIClient::getToken(const QString& module_name)
 {
-    qDebug() << "LogosAPIClient: getToken for module:" << module_name;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIClient: getToken for module:" << module_name;
 
     QString token = m_token_manager->getToken(module_name);
     if (!token.isEmpty()) {
-        qDebug() << "LogosAPIClient: Found token for module:" << module_name;
+        qCDebug(lcLogosProtocolTokens) << "LogosAPIClient: Found token for module:" << module_name;
         return token;
     }
 
-    qDebug() << "LogosAPIClient: No token found for module:" << module_name;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIClient: No token found for module:" << module_name;
     return "";
 }
 

@@ -1,4 +1,5 @@
 #include "local_transport.h"
+#include "../../logos_logging.h"
 #include "../../plugin_registry.h"
 #include "../../module_proxy.h"
 #include "../../logos_async_dispatch.h"
@@ -27,7 +28,7 @@ public slots:
         const bool reserved = logos::isReservedEventName(eventName);
         if (!reserved) cbs.append(m_callbacks.value(QString()));
         if (!cbs.isEmpty() && !reserved) {
-            qDebug() << "[LogosObject] Local EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s)";
+            qCDebug(lcLogosProtocolEvents) << "[LogosObject] Local EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s)";
         }
         for (const auto& cb : cbs) {
             try { cb(eventName, data); } catch (...) {}
@@ -91,7 +92,7 @@ public:
             if (err) *err = proxyGoneError();
             return QVariant();
         }
-        qDebug() << "[LogosObject] LocalLogosObject::callMethod" << methodName << "args:" << args.size();
+        qCDebug(lcLogosProtocolCalls) << "[LogosObject] LocalLogosObject::callMethod" << methodName << "args:" << args.size();
         return m_proxy->callRemoteMethod(authToken, methodName, args);
     }
 
@@ -131,12 +132,12 @@ public:
             return;
         }
 
-        qDebug() << "[LogosObject] LocalLogosObject::onEvent subscribing to event:" << eventName;
+        qCDebug(lcLogosProtocolEvents) << "[LogosObject] LocalLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {
             m_helper = new EventHelper();
             QObject::connect(m_proxy, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
-            qDebug() << "[LogosObject] LocalLogosObject: connected EventHelper to ModuleProxy signals";
+            qCDebug(lcLogosProtocolEvents) << "[LogosObject] LocalLogosObject: connected EventHelper to ModuleProxy signals";
         }
         m_helper->addCallback(eventName, std::move(callback));
     }
@@ -150,7 +151,7 @@ public:
     void emitEvent(const QString& eventName, const QVariantList& data) override
     {
         if (!m_proxy) return;
-        qDebug() << "[LogosObject] LocalLogosObject::emitEvent" << eventName << "data:" << data.size() << "items";
+        qCDebug(lcLogosProtocolEvents) << "[LogosObject] LocalLogosObject::emitEvent" << eventName << "data:" << data.size() << "items";
         QMetaObject::invokeMethod(m_proxy, "eventResponse",
                                   Qt::QueuedConnection,
                                   Q_ARG(QString, eventName),

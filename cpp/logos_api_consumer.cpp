@@ -1,4 +1,5 @@
 #include "logos_api_consumer.h"
+#include "logos_logging.h"
 #include "logos_async_dispatch.h"
 #include "logos_object.h"
 #include "logos_object_source_watch.h"
@@ -11,7 +12,6 @@
 #include <chrono>
 #include <thread>
 #include <QDebug>
-#include <QLoggingCategory>
 #include <QUrl>
 #include <QMetaObject>
 #include <QTimer>
@@ -23,6 +23,8 @@
 #include <QVector>
 
 Q_LOGGING_CATEGORY(lcLogosProtocolCalls, "logos.protocol.calls", QtInfoMsg)
+Q_LOGGING_CATEGORY(lcLogosProtocolEvents, "logos.protocol.events", QtInfoMsg)
+Q_LOGGING_CATEGORY(lcLogosProtocolTokens, "logos.protocol.tokens", QtInfoMsg)
 
 // ── LogosPendingSubscriptions ────────────────────────────────────────────────
 //
@@ -71,7 +73,7 @@ public:
         if (beginAcquire(objectName))
             return id;                                 // armed synchronously
 
-        qDebug().nospace() << "LogosAPIConsumer: '" << objectName << "::" << eventName
+        qCDebug(lcLogosProtocolEvents).nospace() << "LogosAPIConsumer: '" << objectName << "::" << eventName
                            << "' deferred pending the module becoming reachable";
         ensureTimer();
         return id;
@@ -613,7 +615,7 @@ private:
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
                     << "' subscription ARMED after " << e.since.elapsed() << " ms";
             else
-                qDebug().nospace()
+                qCDebug(lcLogosProtocolEvents).nospace()
                     << "LogosAPIConsumer: '" << e.objectName << "::" << e.eventName
                     << "' subscription armed after " << e.since.elapsed() << " ms";
             if (e.onArmed) e.onArmed(true);
@@ -1042,7 +1044,7 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
                                    const QVariantList& args, Timeout timeout, logos::CallError* err)
 {
     if (err) err->clear();
-    qDebug() << "LogosAPIConsumer: Calling invokeRemoteMethod:" << objectName << methodName << "args_count:" << args.size() << "timeout:" << timeout.ms;
+    qCDebug(lcLogosProtocolCalls) << "LogosAPIConsumer: Calling invokeRemoteMethod:" << objectName << methodName << "args_count:" << args.size() << "timeout:" << timeout.ms;
 
     // Reuse a cached handle across calls. Acquiring a QtRO replica per call
     // (acquireDynamic + waitForSource) is expensive — under a tight loop (e.g. a
@@ -1062,7 +1064,7 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
         return QVariant();
     }
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: calling via LogosObject::callMethod" << methodName;
+    qCDebug(lcLogosProtocolCalls) << "[LogosObject] LogosAPIConsumer: calling via LogosObject::callMethod" << methodName;
     // No release() here: the handle stays cached for the next call. Released in
     // clearObjectCache() (destructor / reconnect) or evicted when stale.
     //
@@ -1190,7 +1192,7 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
 
 void LogosAPIConsumer::onEvent(LogosObject* originObject, const QString& eventName, std::function<void(const QString&, const QVariantList&)> callback)
 {
-    qDebug() << "[LogosObject] LogosAPIConsumer::onEvent registering for:" << eventName << "on LogosObject id:" << originObject;
+    qCDebug(lcLogosProtocolEvents) << "[LogosObject] LogosAPIConsumer::onEvent registering for:" << eventName << "on LogosObject id:" << originObject;
 
     if (!originObject) {
         qWarning() << "LogosAPIConsumer: Cannot register event on null object";
@@ -1199,12 +1201,12 @@ void LogosAPIConsumer::onEvent(LogosObject* originObject, const QString& eventNa
 
     originObject->onEvent(eventName, std::move(callback));
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: event callback registered for:" << eventName;
+    qCDebug(lcLogosProtocolEvents) << "[LogosObject] LogosAPIConsumer: event callback registered for:" << eventName;
 }
 
 bool LogosAPIConsumer::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
-    qDebug() << "LogosAPIConsumer: Informing module token for module:" << moduleName << "with token:" << redactToken(token);
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: Informing module token for module:" << moduleName << "with token:" << redactToken(token);
 
     LogosObject* plugin = m_transport->requestObject("capability_module", 20000);
     if (!plugin) {
@@ -1212,9 +1214,9 @@ bool LogosAPIConsumer::informModuleToken(const QString& authToken, const QString
         return false;
     }
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: calling LogosObject::informModuleToken for" << moduleName;
+    qCDebug(lcLogosProtocolTokens) << "[LogosObject] LogosAPIConsumer: calling LogosObject::informModuleToken for" << moduleName;
     bool result = plugin->informModuleToken(authToken, moduleName, token, 20000);
-    qDebug() << "LogosAPIConsumer: informModuleToken completed with result:" << result;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: informModuleToken completed with result:" << result;
     plugin->release();
     return result;
 }
@@ -1233,7 +1235,7 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
     if (timeoutMs <= 0) {
         timeoutMs = 20000;
     }
-    qDebug() << "LogosAPIConsumer: Informing module token for module:" << moduleName << "with token:" << redactToken(token);
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: Informing module token for module:" << moduleName << "with token:" << redactToken(token);
 
     // Prefer the handshake surface. It is published before the target's
     // initializer runs, so it is reachable even while the target is still
@@ -1262,10 +1264,10 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
     }
     LogosObject* early = acquireCachedObject(handshake, kHandshakeProbeTimeoutMs);
     if (early) {
-        qDebug() << "[LogosObject] LogosAPIConsumer: delivering token for" << moduleName
+        qCDebug(lcLogosProtocolTokens) << "[LogosObject] LogosAPIConsumer: delivering token for" << moduleName
                  << "via the handshake surface of" << originModule;
         if (early->informModuleToken(authToken, moduleName, token, timeoutMs)) {
-            qDebug() << "LogosAPIConsumer: informModuleToken completed with result: true";
+            qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: informModuleToken completed with result: true";
             return true;
         }
         // A refusal HERE is not authoritative, so do not report it as the answer.
@@ -1294,7 +1296,7 @@ bool LogosAPIConsumer::informModuleToken_module(const QString& authToken, const 
         // The module answered on its business object and still had no handshake surface, so
         // the absence is real rather than a race. Now it is worth not probing again.
         m_noHandshakeSurface.insert(handshake);
-        qDebug() << "LogosAPIConsumer:" << originModule << "publishes no handshake surface"
+        qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer:" << originModule << "publishes no handshake surface"
                  << "- not probing again until the handle cache is cleared";
     }
     return delivered;
@@ -1315,9 +1317,9 @@ bool LogosAPIConsumer::informModuleTokenViaBusinessObject(const QString& authTok
     }
     if (reachedModule) *reachedModule = true;
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: calling LogosObject::informModuleToken for" << moduleName << "on" << originModule;
+    qCDebug(lcLogosProtocolTokens) << "[LogosObject] LogosAPIConsumer: calling LogosObject::informModuleToken for" << moduleName << "on" << originModule;
     bool result = plugin->informModuleToken(authToken, moduleName, token, timeoutMs);
-    qDebug() << "LogosAPIConsumer: informModuleToken completed with result:" << result;
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: informModuleToken completed with result:" << result;
     // The cache owns the handle now, so it is not released here.
     return result;
 }
@@ -1338,7 +1340,7 @@ std::string LogosAPIConsumer::requestModule(const std::string& authToken, const 
 {
     const QString qOrigin = QString::fromStdString(originModule);
     const QString qTarget = QString::fromStdString(targetModule);
-    qDebug() << "LogosAPIConsumer: requestModule for origin:" << qOrigin << "target:" << qTarget
+    qCDebug(lcLogosProtocolTokens) << "LogosAPIConsumer: requestModule for origin:" << qOrigin << "target:" << qTarget
              << "budget:" << timeoutMs << "ms";
 
     QElapsedTimer budget;
