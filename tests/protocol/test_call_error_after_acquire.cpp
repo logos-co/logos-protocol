@@ -53,6 +53,7 @@
 #include <QThread>
 #include <QVariant>
 #include <QVariantList>
+#include <QVariantMap>
 
 #include <nlohmann/json.hpp>
 
@@ -69,9 +70,8 @@ using namespace logos::plain;
 namespace {
 
 // A provider faithful to the real ones: compute() answers 7, slow() blocks
-// past any sane deadline, and an UNKNOWN method answers a bare QVariant() —
-// which is exactly what logos-qt-sdk's QtProviderObject and every generated
-// provider dispatch do for a name they don't recognise.
+// past any sane deadline, and an UNKNOWN method is refused with the canonical
+// unknown_method object, as QtProviderObject and every generated dispatch do.
 class SlowProvider : public LogosProviderObject {
 public:
     QVariant callMethod(const QString& method, const QVariantList& args) override
@@ -82,7 +82,11 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(3000));
             return QVariant(1);
         }
-        return QVariant();   // unknown method — indistinguishable from null
+        QVariantMap unknown;
+        unknown.insert(QStringLiteral("code"), QStringLiteral("unknown_method"));
+        unknown.insert(QStringLiteral("message"), QStringLiteral("unknown method '%1'").arg(method));
+        unknown.insert(QStringLiteral("origin"), QStringLiteral("slow"));
+        return unknown;
     }
     QJsonArray getMethods() override { return QJsonArray{}; }
     bool informModuleToken(const QString&, const QString&) override { return true; }
@@ -374,21 +378,23 @@ TEST_F(CallErrorAfterAcquireTest, SyncModuleNotLoadedOnALiveHostReportsTheError)
     destroyClient(client);
 }
 
-// ── the residual gap, pinned deliberately ───────────────────────────────────
+// ── an unknown method NAME, and the null it must not be confused with ────────
 //
-// An UNKNOWN METHOD is NOT fixed here and cannot be at this layer: every
-// provider flavour answers a bare null for a name it doesn't recognise
-// (logos-qt-sdk QtProviderObject's `return QVariant()`, the generated Qt and
-// cdylib dispatches' `unknown method` fall-through, the Rust provider's), which
-// is byte-identical to a method that legitimately returns null. The transport
-// sees ok=true with a null value and MUST report success — reporting failure
-// would break every method whose return really is null. Closing it needs the
-// PROVIDER contract to answer a rejection object for an unknown name, in every
-// SDK, and mirrored into lp_invoke so the twins stay identical.
-//
-// This test asserts today's behaviour so the boundary is explicit rather than
-// assumed, and so it fails loudly if a provider ever starts distinguishing.
-TEST_F(CallErrorAfterAcquireTest, UnknownMethodStaysIndistinguishableFromANullReturn)
+// It used to be a bare null, byte-identical to a method returning null, so both
+// twins reported success with nothing to fold. The provider now refuses it, and
+// the transport carries the refusal as a RESULT, intact, on BOTH twins: the
+// generated wrappers fold it into their error channel, as for dispatch_failed.
+static void expectUnknownMethodRefusal(const std::string& json)
+{
+    const nlohmann::json v = nlohmann::json::parse(json, nullptr, false);
+    ASSERT_TRUE(v.is_object()) << json;
+    EXPECT_EQ(v.size(), 3u) << json;
+    EXPECT_EQ(v.value("code", std::string{}), "unknown_method") << json;
+    EXPECT_EQ(v.value("message", std::string{}), "unknown method 'noSuchMethod'") << json;
+    EXPECT_EQ(v.value("origin", std::string{}), "slow") << json;
+}
+
+TEST_F(CallErrorAfterAcquireTest, AsyncUnknownMethodArrivesAsTheProvidersRefusal)
 {
     LiveHost host;
     ASSERT_TRUE(host.ok());
@@ -400,9 +406,54 @@ TEST_F(CallErrorAfterAcquireTest, UnknownMethodStaysIndistinguishableFromANullRe
     ASSERT_EQ(lp_invoke_async(client, "noSuchMethod", "[]", 5000, &captureCb, &c), LP_OK);
     ASSERT_TRUE(pumpUntilFired(c, 15000)) << "async callback never fired";
 
-    std::cout << "  ASYNC unknown method -> ok=" << c.ok << " json=" << c.json
-              << "   (residual gap: the provider itself answers a bare null)"
-              << std::endl;
+    std::cout << "  ASYNC unknown method -> ok=" << c.ok << " json=" << c.json << std::endl;
+
+    EXPECT_EQ(c.ok, 1) << "a provider's refusal is a result, not a transport failure";
+    expectUnknownMethodRefusal(c.json);
+
+    destroyClient(client);
+}
+
+TEST_F(CallErrorAfterAcquireTest, SyncUnknownMethodArrivesAsTheProvidersRefusal)
+{
+    LiveHost host;
+    ASSERT_TRUE(host.ok());
+
+    lp_client* client = clientFor("slow_module", host.target());
+    ASSERT_NE(client, nullptr);
+
+    char* result = nullptr;
+    char* error = nullptr;
+    const int rc = lp_invoke(client, "noSuchMethod", "[]", 5000, &result, &error);
+
+    std::cout << "  SYNC  unknown method -> rc=" << rc
+              << " result=" << (result ? result : "(null)")
+              << " error=" << (error ? error : "(null)") << std::endl;
+
+    EXPECT_EQ(rc, LP_OK) << "a provider's refusal is a result, not a transport failure";
+    EXPECT_EQ(error, nullptr);
+    ASSERT_NE(result, nullptr);
+    expectUnknownMethodRefusal(result);
+
+    lp_string_free(result);
+    lp_string_free(error);
+    destroyClient(client);
+}
+
+// The twin it must stay distinct from: a method that legitimately returns null.
+TEST_F(CallErrorAfterAcquireTest, ALegitimateNullReturnIsStillANullResult)
+{
+    LiveHost host;
+    ASSERT_TRUE(host.ok());
+
+    lp_client* client = clientFor("slow_module", host.target());
+    ASSERT_NE(client, nullptr);
+
+    Capture c;
+    ASSERT_EQ(lp_invoke_async(client, "echo", "[]", 5000, &captureCb, &c), LP_OK);
+    ASSERT_TRUE(pumpUntilFired(c, 15000)) << "async callback never fired";
+
+    std::cout << "  ASYNC null return    -> ok=" << c.ok << " json=" << c.json << std::endl;
 
     EXPECT_EQ(c.ok, 1);
     EXPECT_EQ(c.json, "null");

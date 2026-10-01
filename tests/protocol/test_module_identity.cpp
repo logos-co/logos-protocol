@@ -25,6 +25,7 @@
 #include <QJsonObject>
 #include <QString>
 #include <QVariantList>
+#include <QVariantMap>
 
 namespace {
 
@@ -80,6 +81,23 @@ public:
         name["description"] = QStringLiteral("hand-written");
         return QJsonArray{ name };
     }
+};
+
+// A provider on the current contract: an unknown NAME is refused as
+// unknown_method rather than answered with an empty QVariant.
+class RefusingProvider : public LegacyProvider {
+public:
+    QVariant callMethod(const QString& method, const QVariantList& args) override {
+        const QVariant answer = LegacyProvider::callMethod(method, args);
+        if (answer.isValid()) return answer;
+        QVariantMap refusal;
+        refusal.insert(QStringLiteral("code"), QStringLiteral("unknown_method"));
+        refusal.insert(QStringLiteral("message"), QStringLiteral("unknown method '%1'").arg(method));
+        refusal.insert(QStringLiteral("origin"), providerName());
+        if (extraKey) refusal.insert(QStringLiteral("extra"), true);
+        return refusal;
+    }
+    bool extraKey = false;
 };
 
 // A token this proxy has actually issued, so calls are authorized. Mirrors what
@@ -198,4 +216,45 @@ TEST(ModuleIdentity, IdentityIsStillGatedOnAuthorization)
         proxy.callRemoteMethod(QStringLiteral("not-a-token"), QStringLiteral("name"), {});
     EXPECT_NE(r.toString(), QStringLiteral("legacy_module"));
     EXPECT_EQ(provider.calls, 0);
+}
+
+TEST(ModuleIdentity, AProviderThatRefusesUnknownNamesStillGetsIdentity)
+{
+    // Refusing an unknown name with unknown_method is the provider contract now,
+    // and it must not cost a legacy-shaped module its name() and version().
+    ensureIdentityApp();
+    RefusingProvider provider;
+    ModuleProxy proxy(&provider);
+    const QString token = authorize(proxy);
+
+    EXPECT_EQ(proxy.callRemoteMethod(token, QStringLiteral("name"), {}).toString(),
+              QStringLiteral("legacy_module"));
+    EXPECT_EQ(proxy.callRemoteMethod(token, QStringLiteral("version"), {}).toString(),
+              QStringLiteral("3.2.1"));
+
+    // Any other unknown name keeps the provider's refusal.
+    const QVariantMap refused =
+        proxy.callRemoteMethod(token, QStringLiteral("nope"), {}).toMap();
+    EXPECT_EQ(refused.value(QStringLiteral("code")).toString(), QStringLiteral("unknown_method"));
+    EXPECT_EQ(refused.value(QStringLiteral("origin")).toString(), QStringLiteral("legacy_module"));
+}
+
+TEST(ModuleIdentity, OnlyTheCanonicalRefusalTriggersTheFallback)
+{
+    // name("which") is not the identity call, and a four-key map is a VALUE: in
+    // both cases the provider's own answer reaches the caller untouched.
+    ensureIdentityApp();
+    RefusingProvider provider;
+    ModuleProxy proxy(&provider);
+    const QString token = authorize(proxy);
+
+    const QVariantMap withArgs = proxy.callRemoteMethod(
+        token, QStringLiteral("name"), QVariantList{ QStringLiteral("which") }).toMap();
+    EXPECT_EQ(withArgs.value(QStringLiteral("code")).toString(), QStringLiteral("unknown_method"));
+
+    provider.extraKey = true;
+    const QVariantMap notCanonical =
+        proxy.callRemoteMethod(token, QStringLiteral("name"), {}).toMap();
+    EXPECT_EQ(notCanonical.size(), 4);
+    EXPECT_EQ(notCanonical.value(QStringLiteral("code")).toString(), QStringLiteral("unknown_method"));
 }

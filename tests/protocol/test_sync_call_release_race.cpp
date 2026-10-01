@@ -722,8 +722,8 @@ TEST_F(SyncCallReleaseRaceTest, EveryEntryPointLeavesTheCountAtZero)
     EXPECT_TRUE(err.ok());
 
     // A WIRE ERROR: an object nobody published, which the host answers with
-    // MODULE_NOT_LOADED. (An unknown METHOD is not usable here — every provider
-    // answers that with a bare null, which is indistinguishable from success.)
+    // MODULE_NOT_LOADED. (An unknown METHOD is not usable here: the provider
+    // refuses it as a RESULT, which is not a wire error.)
     LogosObject* missing = conn->requestObject(QStringLiteral("no_such_module"), 5000);
     ASSERT_NE(missing, nullptr);
     auto* missingCh = channelFor(missing);
