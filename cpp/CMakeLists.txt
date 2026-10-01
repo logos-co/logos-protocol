@@ -43,6 +43,7 @@ set(PROTOCOL_SOURCES
     logos_api_client.h
     logos_api_consumer.cpp
     logos_api_consumer.h
+    logos_logging.h
     logos_subscription_state.h
     module_proxy.cpp
     module_proxy.h

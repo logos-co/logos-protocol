@@ -1,4 +1,5 @@
 #include "mock_store.h"
+#include "../../logos_logging.h"
 #include "../../token_manager.h"
 
 #include <QDebug>
@@ -151,7 +152,7 @@ QVariant MockStore::recordAndReturn(const QString& module, const QString& method
         const MockExpectation& exp = m_expectations.at(i);
         if (exp.module != module || exp.method != method) continue;
         if (!exp.matchAnyArgs && exp.expectedArgs != args) continue;
-        qDebug() << "MockStore: matched expectation for" << module << "::" << method
+        qCDebug(lcLogosProtocolCalls) << "MockStore: matched expectation for" << module << "::" << method
                  << "-> returning" << exp.returnValue;
         return exp.returnValue;
     }
