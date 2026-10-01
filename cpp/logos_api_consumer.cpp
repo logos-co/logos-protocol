@@ -11,6 +11,7 @@
 #include <chrono>
 #include <thread>
 #include <QDebug>
+#include <QLoggingCategory>
 #include <QUrl>
 #include <QMetaObject>
 #include <QTimer>
@@ -20,6 +21,8 @@
 #include <QElapsedTimer>
 #include <QSet>
 #include <QVector>
+
+Q_LOGGING_CATEGORY(lcLogosProtocolCalls, "logos.protocol.calls", QtInfoMsg)
 
 // ── LogosPendingSubscriptions ────────────────────────────────────────────────
 //
@@ -1155,7 +1158,7 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
         return;
     }
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: async calling via LogosObject::callMethodAsync" << methodName;
+    qCDebug(lcLogosProtocolCalls) << "[LogosObject] LogosAPIConsumer: async calling via LogosObject::callMethodAsync" << methodName;
     // QPointer guards against use-after-free: if the consumer is destroyed
     // before the transport callback fires, the callback is silently dropped and
     // the handle is released by the destructor's clearObjectCache(), not here.
