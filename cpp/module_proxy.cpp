@@ -76,6 +76,21 @@ void ModuleProxy::setTokenValidator(TokenValidator validator)
     m_validator = std::move(validator);
 }
 
+namespace {
+
+// The canonical {code, message, origin} refusal a provider answers for a method
+// name it does not have; exactly three keys, like every consumer-side detector.
+bool isUnknownMethodRejection(const QVariant& v)
+{
+    if (v.userType() != QMetaType::QVariantMap) return false;
+    const QVariantMap m = v.toMap();
+    return m.size() == 3
+        && m.value(QStringLiteral("code")).toString() == QLatin1String("unknown_method")
+        && m.contains(QStringLiteral("message")) && m.contains(QStringLiteral("origin"));
+}
+
+} // namespace
+
 // QtRO / local path: RemoteTransportHost only ever serves a local socket, so
 // the wire is "local". Forwards to the transport-aware overload.
 QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args)
@@ -167,7 +182,8 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // "unknown method" answer, so a provider that DOES implement name() keeps
     // its own result and nothing existing changes behaviour. Gated on an empty
     // argument list so a same-named method taking arguments is untouched.
-    if (!result.isValid() && args.isEmpty()) {
+    // A provider may also refuse the name outright, as unknown_method.
+    if (args.isEmpty() && (!result.isValid() || isUnknownMethodRejection(result))) {
         if (methodName == QLatin1String("name"))
             return QVariant(m_provider->providerName());
         if (methodName == QLatin1String("version"))

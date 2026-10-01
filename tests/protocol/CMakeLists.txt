@@ -159,8 +159,8 @@ add_executable(protocol_tests
     # PlainLogosObject and by the hard-coded empty CallError above it, on the
     # SYNC path as much as the async one. Matched set: the two failures must
     # report the canonical error object, the successes must still report their
-    # value, and the one case that genuinely cannot be fixed here (an unknown
-    # method, which every provider answers with a bare null) is pinned as-is.
+    # value. An unknown method is a provider's unknown_method refusal, which
+    # both twins must carry intact as a RESULT, distinct from a null return.
     test_call_error_after_acquire.cpp
     # The same channel over the DEFAULT transport (LocalSocket/QtRO), so the fix
     # is not silently plain-TCP-only. Exercises the deferred-completion timeout,

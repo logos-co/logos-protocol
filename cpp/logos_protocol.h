@@ -487,13 +487,12 @@ LP_API int lp_invoke(lp_client* client,
  * a rejected auth token, and MODULE_NOT_LOADED from a host that is up. Both
  * twins report all four; neither did before.
  *
- * NOT reported, and it is not an oversight: an unknown method name. Every
- * provider flavour answers one with a bare null, byte-identical to a method
- * that legitimately returns null, so the distinction does not exist on the
- * wire to be reported. Closing it needs a provider-contract change across the
- * SDKs, not a transport change here. A provider's own rejection of well-formed
- * arguments ("dispatch_failed") is likewise NOT folded in by either twin — it
- * arrives as a result, and the generated wrappers fold it.
+ * NOT reported, by design: a provider's own refusal. An unknown method name
+ * ("unknown_method"), a wrong argument count ("invalid_args") and arguments it
+ * cannot decode ("dispatch_failed") all arrive as a RESULT, the canonical
+ * {code, message, origin} object, on both twins alike; the generated wrappers
+ * fold it. (An unknown name used to be a bare null, the same bytes as a
+ * method that legitimately returns null.)
  *
  * Argument/handle validation still fails synchronously with
  * LP_ERR_INVALID_ARG and `cb` is NOT called in that case.

@@ -16,9 +16,10 @@
  *   - method args / event payloads: JSON array (UTF-8 const char*)
  *   - results: JSON value
  *   - bytes: the canonical {"_bytes":"<base64url>"} tagged form
- *   - errors from dispatch: NULL return, or a canonical error object
- *     {"code","message","origin"} returned as the result of a failed call
- *     when the implementation prefers structured errors.
+ *   - errors from dispatch: a canonical error object {"code","message","origin"}
+ *     returned as the result of a refused call — "unknown_method" for a name
+ *     the module does not have, "invalid_args" / "dispatch_failed" for
+ *     arguments it refuses. NULL is a structural failure.
  *
  * Ownership: every char* RETURNED by the module is heap-allocated and the
  * CALLER frees it with logos_module_string_free (exported by the module so
@@ -58,8 +59,9 @@ typedef void (*logos_module_emit_cb)(const char* event_name,
  * ------------------------------------------------------------------------- */
 
 /* Dispatch a method call. Returns the result JSON value as a heap string
- * (free with logos_module_string_free), or NULL when the method is unknown
- * or dispatch failed structurally. */
+ * (free with logos_module_string_free); an unknown method answers the
+ * "unknown_method" error object. NULL means dispatch failed structurally (a
+ * NULL from a backend predating unknown_method may also mean an unknown name). */
 LOGOS_MODULE_IMPL_EXPORT char* logos_module_dispatch(const char* method,
                                                      const char* args_json);
 
