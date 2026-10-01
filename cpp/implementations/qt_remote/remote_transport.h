@@ -55,8 +55,13 @@ public:
     // down must park ONE facade, not one per attempt.
     int parkedCount(const QString& objectName) const;
 
+    // How long requestObject() waits for a listener at an endpoint nobody listens on.
+    // A host publishes before it reports a module loaded, so this only covers one that is starting.
+    static constexpr int kNoListenerGraceMs = 1000;
+
 private:
     bool connectToRegistry();
+    bool waitForStartingSource(QRemoteObjectReplica* replica, int timeoutMs);
 
     // The two halves of "never free a facade QtRO still lists raw": park the
     // one a timeout gave up on, and hand it to the next wait for that name.

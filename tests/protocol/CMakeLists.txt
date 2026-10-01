@@ -359,6 +359,9 @@ add_executable(protocol_tests
     # ORDER (wait, then mint) and both ways of getting it wrong: minting early costs a
     # wasted unauthorized round, waiting twice is a fleet-wide latency regression.
     test_readiness_gated_exchange.cpp
+    # A blocking acquire for a module nothing listens for fails within a short grace instead of
+    # spending the caller's whole budget; a module that is listening keeps the full budget.
+    test_absent_target_fails_fast.cpp
     # The handshake negative cache: an absence is remembered only once the business object
     # has PROVEN the module is up. A probe also misses when the module has not published
     # yet, and nothing re-probes an entry — so caching that reason writes a merely-late
