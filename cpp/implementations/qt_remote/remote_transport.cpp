@@ -12,6 +12,7 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QDebug>
+#include <QLoggingCategory>
 #include <QUrl>
 #include <QLocalSocket>
 #include <QMetaObject>
@@ -26,6 +27,8 @@
 static std::atomic<long> g_acquireCount{0};
 
 using logos::qtremote::localSocketFilePath;
+
+Q_DECLARE_LOGGING_CATEGORY(lcLogosProtocolCalls)
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 
@@ -250,7 +253,7 @@ public:
             return;
         }
 
-        qDebug() << "[LogosObject] RemoteLogosObject::callMethodAsync" << methodName << "args:" << args.size();
+        qCDebug(lcLogosProtocolCalls) << "[LogosObject] RemoteLogosObject::callMethodAsync" << methodName << "args:" << args.size();
 
         QRemoteObjectPendingCall pendingCall;
         bool success = QMetaObject::invokeMethod(

@@ -85,6 +85,14 @@ nix build
 nix build .#tests
 ```
 
+## Call tracing
+
+Per-call async transport messages are disabled by default in Basecamp and
+`logosctl`. Enable them when diagnosing a call with
+`QT_LOGGING_RULES='logos.protocol.calls.debug=true'` in the environment of the
+process making the call. This includes the `LogosAPIConsumer` dispatch and the
+Qt Remote Objects dispatch messages. Warnings remain visible by default.
+
 ## Layering invariant
 
 `logos-protocol` depends only on Qt / Boost / OpenSSL / nlohmann_json — it
