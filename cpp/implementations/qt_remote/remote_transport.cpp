@@ -9,6 +9,7 @@
 #include <QRemoteObjectPendingCall>
 #include <QRemoteObjectPendingCallWatcher>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QDebug>
 #include <QUrl>
@@ -833,13 +834,12 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
         return nullptr;
     }
 
-    // Warn BEFORE a doomed wait rather than after it. Without this the log went
-    // silent for the full timeout and then reported failure, which reads as a
-    // hang with no cause attached.
-    if (!endpointHasListener()) {
+    // Nothing listening means the module is not running, so the full budget would be a doomed wait.
+    const bool listening = endpointHasListener();
+    if (!listening) {
         qWarning() << "RemoteTransportConnection: no listener at" << m_registryUrl
-                   << "-- request for" << objectName << "will block up to" << timeoutMs
-                   << "ms and then fail. Is the module loaded?";
+                   << "-- request for" << objectName << "fails unless the module starts within"
+                   << kNoListenerGraceMs << "ms. Is the module loaded?";
     }
 
     qDebug() << "RemoteTransportConnection: Requesting object:" << objectName
@@ -854,7 +854,9 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
         return nullptr;
     }
 
-    if (!replica->waitForSource(timeoutMs)) {
+    const bool ready = listening ? replica->waitForSource(timeoutMs)
+                                 : waitForStartingSource(replica, timeoutMs);
+    if (!ready) {
         qWarning() << "RemoteTransportConnection: Timeout waiting for replica:" << objectName;
         // PARK it; do NOT free it. A timeout means the class definition never
         // arrived, so this facade is still listed RAW in the implementation's
@@ -870,6 +872,28 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     qDebug() << "[LogosObject] RemoteTransportConnection: returning RemoteLogosObject for:" << objectName;
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);
+}
+
+// Waits in short slices while nothing listens; once something does, the rest of the budget applies.
+bool RemoteTransportConnection::waitForStartingSource(QRemoteObjectReplica* replica, int timeoutMs)
+{
+    constexpr int kProbeIntervalMs = 100;
+    QElapsedTimer clock;
+    clock.start();
+    // Negative is QtRO's "no limit".
+    const auto remaining = [&]() {
+        return timeoutMs < 0 ? -1 : qMax(0, timeoutMs - int(clock.elapsed()));
+    };
+    while (clock.elapsed() < kNoListenerGraceMs) {
+        const int left = remaining();
+        if (left == 0)
+            return false;
+        if (replica->waitForSource(left < 0 ? kProbeIntervalMs : qMin(left, kProbeIntervalMs)))
+            return true;
+        if (endpointHasListener())
+            return replica->waitForSource(remaining());
+    }
+    return false;
 }
 
 bool RemoteTransportConnection::requestObjectWhenAvailable(const QString& objectName,
