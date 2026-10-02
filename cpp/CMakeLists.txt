@@ -193,6 +193,10 @@ install(TARGETS logos_protocol
 # singleton. Staying static also keeps a .lgx self-contained -- a .lgx records
 # an empty nix closure, so a shared library would not travel with it -- and
 # keeps those plugins immune to ABI skew against a separately-updated .so.
+# Static-only hosts (iOS: Qt is static, a dylib is a second Qt) build only
+# the archive above.
+option(LOGOS_PROTOCOL_BUILD_SHARED "Also build liblogos_protocol as a shared library" ON)
+if(LOGOS_PROTOCOL_BUILD_SHARED)
 add_library(logos_protocol_shared SHARED ${PROTOCOL_SOURCES})
 
 target_link_libraries(logos_protocol_shared PUBLIC
@@ -290,6 +294,7 @@ install(TARGETS logos_protocol_shared
     RUNTIME DESTINATION bin
     INCLUDES DESTINATION include
 )
+endif() # LOGOS_PROTOCOL_BUILD_SHARED
 
 install(EXPORT logos-protocolTargets
     FILE logos-protocolTargets.cmake
