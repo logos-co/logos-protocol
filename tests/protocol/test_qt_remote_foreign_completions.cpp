@@ -15,6 +15,7 @@
 
 #include <QCoreApplication>
 #include <QJsonArray>
+#include <QObject>
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
@@ -37,9 +38,12 @@ QCoreApplication* ensureApp() {
 // argument, as a module that reuses ids across instances would.
 class SameIdProvider : public LogosProviderObject {
 public:
-    QVariant callMethod(const QString&, const QVariantList& args) override {
+    QVariant callMethod(const QString& method, const QVariantList& args) override {
+        if (method != QLatin1String("value")) return QVariant();
         const QVariant value = args.value(0);
-        QTimer::singleShot(20, [this, value]() {
+        // m_timers dies with the provider, so a pending completion cannot fire
+        // into a later test sharing this process.
+        QTimer::singleShot(20, &m_timers, [this, value]() {
             if (m_eventCb)
                 m_eventCb(logos::callCompleteEvent(), QVariantList{ QStringLiteral("lc-0"), value });
         });
@@ -56,6 +60,7 @@ public:
 
 private:
     EventCallback m_eventCb;
+    QObject m_timers;
 };
 
 void pump(int ms) {
