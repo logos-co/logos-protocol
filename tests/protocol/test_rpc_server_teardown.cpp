@@ -98,12 +98,15 @@ int openFdCount()
 // Clients are dropped mid-conversation all through the loop, so a server-side
 // write can land on a socket whose peer is already gone. Ignore SIGPIPE for the
 // duration and restore the previous disposition so no other test inherits it.
+// Windows has no SIGPIPE: the write fails with an error instead.
 class SigPipeGuard {
+#ifdef SIGPIPE
 public:
     SigPipeGuard()  : m_prev(std::signal(SIGPIPE, SIG_IGN)) {}
     ~SigPipeGuard() { std::signal(SIGPIPE, m_prev); }
 private:
     void (*m_prev)(int);
+#endif
 };
 
 // Minimal provider: answers Call with the method name it was given. Enough to

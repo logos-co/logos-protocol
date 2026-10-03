@@ -99,15 +99,16 @@
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/local/connect_pair.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
+#include "connected_pair.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QVariant>
 #include <QVariantList>
 
+#ifndef _WIN32
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -127,7 +128,7 @@ using namespace logos::plain;
 
 namespace {
 
-using LocalSocket = boost::asio::local::stream_protocol::socket;
+using LocalSocket = PairSocket;
 using LocalConn   = RpcConnection<LocalSocket>;
 
 // Reads the connection's own mutex and pending maps through the
@@ -264,7 +265,7 @@ Wire makeWire(boost::asio::io_context& ioc, IncomingCallHandler* handler)
 {
     LocalSocket a(ioc), b(ioc);
     boost::system::error_code ec;
-    boost::asio::local::connect_pair(a, b, ec);
+    connectPair(a, b, ec);
     if (ec) return {};
     suppressSigpipe(a);
     suppressSigpipe(b);

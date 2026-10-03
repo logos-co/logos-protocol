@@ -70,8 +70,7 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/local/connect_pair.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
+#include "connected_pair.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -97,7 +96,7 @@ using namespace logos::plain;
 
 namespace {
 
-using LocalSocket     = boost::asio::local::stream_protocol::socket;
+using LocalSocket     = PairSocket;
 using LocalConnection = RpcConnection<LocalSocket>;
 
 // An io_context with its own thread, so both ends of the socketpair really run
@@ -326,7 +325,7 @@ struct WirePair {
         LocalSocket clientSock(clientIo.ctx());
         LocalSocket serverSock(serverIo.ctx());
         boost::system::error_code ec;
-        boost::asio::local::connect_pair(clientSock, serverSock, ec);
+        connectPair(clientSock, serverSock, ec);
         if (ec) throw std::runtime_error("connect_pair: " + ec.message());
         server = std::make_shared<LocalConnection>(std::move(serverSock), codec, provider);
         client = std::make_shared<LocalConnection>(std::move(clientSock), codec, nullptr);
