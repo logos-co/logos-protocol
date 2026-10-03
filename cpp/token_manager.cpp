@@ -1,4 +1,5 @@
 #include "token_manager.h"
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QMutexLocker>
 #include <QSet>
@@ -389,6 +390,19 @@ bool TokenManager::saveInboundToken(const std::string& caller, const std::string
 {
     return saveInboundToken(QString::fromStdString(caller),
                             QString::fromStdString(token));
+}
+
+bool TokenManager::removeInboundToken(const QString& caller, const QString& tokenDigest)
+{
+    if (caller.isEmpty() || tokenDigest.isEmpty() || isReservedKey(caller)) return false;
+    QMutexLocker locker(&m_mutex);
+    const auto found = m_tokens.find(inboundKey(caller));
+    if (found == m_tokens.end()) return false;
+    const QString digest = QString::fromLatin1(
+        QCryptographicHash::hash(found.value().toUtf8(), QCryptographicHash::Sha256).toHex());
+    if (digest != tokenDigest.toLower()) return false;
+    m_tokens.erase(found);
+    return true;
 }
 
 QString TokenManager::credential() const

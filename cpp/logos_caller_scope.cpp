@@ -45,6 +45,11 @@ std::string callerModuleJson(const std::string& name)
     nlohmann::json j;
     j["kind"] = "module";
     j["name"] = name;
+    // "@op:<name>" can never be a module name: an operator's pair token.
+    if (name.rfind("@op:", 0) == 0 && name.size() > 4) {
+        j["kind"] = "operator";
+        j["name"] = name.substr(4);
+    }
     // `replace` rather than the default throwing handler. A store key is a
     // module name and is UTF-8 in every path that exists today, but this runs
     // on the authorization path of every inbound call: a throw here would turn

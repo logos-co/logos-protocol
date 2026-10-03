@@ -96,6 +96,9 @@ public:
         std::string name;
         ClassDefinition definition;
         InvokeHandler invoke;
+        // Methods answered on the connection's reader, ahead of its later frames
+        // and never queued behind the call pool: token delivery and metadata.
+        std::function<bool(std::int32_t methodIndex)> runsInline;
     };
 
     Server();

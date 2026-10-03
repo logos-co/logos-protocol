@@ -15,6 +15,7 @@ const char* protocolToString(LogosProtocol p)
     case LogosProtocol::QtRemotePlain: return "qt_remote_plain";
     case LogosProtocol::Tcp:         return "tcp";
     case LogosProtocol::TcpSsl:      return "tcp_ssl";
+    case LogosProtocol::Inproc:      return "inproc";
     }
     return "local";
 }
@@ -24,6 +25,7 @@ LogosProtocol protocolFromString(const std::string& s)
     if (s == "qt_remote_plain") return LogosProtocol::QtRemotePlain;
     if (s == "tcp")     return LogosProtocol::Tcp;
     if (s == "tcp_ssl") return LogosProtocol::TcpSsl;
+    if (s == "inproc")  return LogosProtocol::Inproc;
     return LogosProtocol::LocalSocket;
 }
 
@@ -92,7 +94,7 @@ bool parseTransportSet(const std::string& jsonStr, LogosTransportSet* out, std::
                 return fail("transport port is not 0..65535: " + o["port"].dump());
             const std::string protocol = o.value("protocol", std::string{"local"});
             if (protocol != "local" && protocol != "qt_remote_plain" && protocol != "tcp"
-                && protocol != "tcp_ssl")
+                && protocol != "tcp_ssl" && protocol != "inproc")
                 return fail("unknown transport protocol '" + protocol + "'");
             const std::string codec = o.value("codec", std::string{"json"});
             if (codec != "json" && codec != "cbor")
