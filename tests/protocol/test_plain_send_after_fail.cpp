@@ -703,8 +703,9 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
     constexpr int kWarm     = 40;
     constexpr int kThreads  = 4;
     constexpr int kPer      = 240;
-    constexpr int kPerRound = kWarm + kThreads * kPer;   // 1,000
-    constexpr int kTotal    = kRounds * kPerRound;       // 10,000
+    constexpr int kAfter    = 4;
+    constexpr int kPerRound = kWarm + kThreads * kPer + kAfter;   // 1,004
+    constexpr int kTotal    = kRounds * kPerRound;                // 10,040
 
     int doubled  = 0;
     int dropped  = 0;
@@ -780,10 +781,11 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
         }
 
         // And the stop is triggered by a COUNT of registrations rather than a
-        // clock, so calls are still being issued when it lands however slow the
-        // box is — which is what makes a reclaim-resolved call certain. The
-        // trigger sweeps across rounds and stays far below the 960 the burst
-        // will issue.
+        // clock, so calls are usually still being issued when it lands. Not
+        // always: a starved main thread let the callers finish first in all ten
+        // rounds on macOS CI. The kAfter calls below make a reclaim-resolved call
+        // certain. The trigger sweeps across rounds and stays far below the 960
+        // the burst will issue.
         const int trigger = 80 + r * 60;
         {
             QElapsedTimer t; t.start();
@@ -791,6 +793,9 @@ TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallE
                 std::this_thread::yield();
         }
         client->stop("peer vanished mid-burst");
+        // Sent after stop() returned: the stopped path, even if the burst
+        // finished first.
+        for (int i = 0; i < kAfter; ++i) send(kWarm + kThreads * kPer + i);
 
         for (auto& th : callers) th.join();
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
