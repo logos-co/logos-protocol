@@ -54,6 +54,8 @@
 
           logos-protocol = protocol;
           default = protocol;
+        } // pkgs.lib.optionalAttrs common.isWindows {
+          tests-qt = import ./nix/tests-windows-qt.nix { inherit pkgs common src; };
         }
       );
 

@@ -1,0 +1,21 @@
+name: Windows
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: tests-qt
+      # Every suite the targets declare, one case per process; see nix/tests-windows*.nix.
+      tests: true
+      tests-timeout-minutes: 60
