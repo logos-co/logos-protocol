@@ -166,6 +166,9 @@ add_executable(protocol_tests
     # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
     # which needs no blocking provider and therefore no second event loop.
     test_call_error_qt_remote.cpp
+    # On the same transport, a completion of another replica's call must not be
+    # kept for this one: a reloaded "multi" module repeats its call ids.
+    test_qt_remote_foreign_completions.cpp
     # Teardown of a PlainLogosObject with a call still IN FLIGHT. Written when
     # in-flight calls were threads: joining them closed a use-after-free but left
     # release() blocking for the remainder of the call's timeout, so they were
