@@ -1,6 +1,7 @@
 #include "module_proxy.h"
 #include "logos_logging.h"
 #include "logos_caller_scope.h"
+#include "logos_method_scope.h"
 #include <QCryptographicHash>
 #include "logos_provider_interface.h"
 #include "token_manager.h"
@@ -68,6 +69,11 @@ bool ModuleProxy::saveToken(const QString& from_module_name, const QString& toke
     }
 
     m_tokens[from_module_name] = token;
+    m_scopes.erase(std::remove_if(m_scopes.begin(), m_scopes.end(),
+                                  [&](const MethodScope& scope) {
+                                      return scope.caller == from_module_name;
+                                  }),
+                   m_scopes.end());
     qCDebug(lcLogosProtocolTokens) << "ModuleProxy: Token saved for module:" << from_module_name;
     return true;
 }
@@ -130,7 +136,8 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // business-method dispatch and MUST be authorized.
 
     std::string callerJson;
-    if (!authorize(authToken, transportProtocol, &callerJson)) {
+    Grant grant;
+    if (!authorize(authToken, transportProtocol, &callerJson, &grant)) {
         qWarning() << "ModuleProxy: rejecting unauthorized call to" << methodName
                    << "- auth token not recognized";
         // Structured rejection instead of a bare QVariant() so a NEW consumer can
@@ -139,6 +146,12 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
         // same empty/default they already got from QVariant(), so it's backward
         // compatible.
         return logos::makeUnauthorizedSentinel();
+    }
+    if (grant.ambiguous
+        || (grant.methods && !grant.methods->contains(methodName)
+            && !logos::isMethodScopeExempt(methodName.toStdString(), args.isEmpty()))) {
+        qWarning() << "ModuleProxy: refusing" << methodName << "- outside the caller's grant";
+        return logos::makeNotAuthorisedSentinel();
     }
 
     // SECURITY: never log call arguments — they routinely carry secrets
@@ -390,6 +403,27 @@ unsigned long long tokenComparisonCount()
 
 bool ModuleProxy::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
+    return acceptToken(authToken, moduleName, token, nullptr);
+}
+
+bool ModuleProxy::informScopedModuleToken(const QString& authToken, const QString& moduleName,
+                                          const QString& token, const QString& scope)
+{
+    std::set<std::string> parsed;
+    if (!logos::parseMethodScope(scope.toStdString(), &parsed)
+        || TokenManager::bootstrapKeys().contains(moduleName)) {
+        qWarning() << "ModuleProxy: rejecting a scoped token for" << moduleName
+                   << "- the scope is malformed or names an anchor";
+        return false;
+    }
+    QSet<QString> methods;
+    for (const std::string& method : parsed) methods.insert(QString::fromStdString(method));
+    return acceptToken(authToken, moduleName, token, &methods);
+}
+
+bool ModuleProxy::acceptToken(const QString& authToken, const QString& moduleName,
+                              const QString& token, const QSet<QString>* methods)
+{
     if (!m_provider) {
         qWarning() << "ModuleProxy: Cannot inform token on null provider";
         return false;
@@ -480,6 +514,7 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     // host store already holding the token. All this ordering guarantees is that
     // the proxy adds no grant of its own to a push the provider rejected.
     saveToken(moduleName, token);
+    if (methods) m_scopes.push_back(MethodScope{moduleName, token, *methods});
     return true;
 }
 
@@ -496,13 +531,21 @@ bool ModuleProxy::revokeModuleToken(const QString& authToken, const QString& mod
     // Both inbound records, each only while it still holds the named token.
     bool removed = m_store->removeInboundToken(moduleName, tokenDigest);
     const auto found = m_tokens.find(moduleName);
-    if (found != m_tokens.end()
-        && QString::fromLatin1(QCryptographicHash::hash(found.value().toUtf8(),
-                                                        QCryptographicHash::Sha256).toHex())
-            == tokenDigest.toLower()) {
+    const auto digestOf = [](const QString& token) {
+        return QString::fromLatin1(QCryptographicHash::hash(token.toUtf8(),
+                                                            QCryptographicHash::Sha256).toHex());
+    };
+    if (found != m_tokens.end() && digestOf(found.value()) == tokenDigest.toLower()) {
         m_tokens.erase(found);
         removed = true;
     }
+    // A scope goes with its token, and only with it.
+    m_scopes.erase(std::remove_if(m_scopes.begin(), m_scopes.end(),
+                                  [&](const MethodScope& scope) {
+                                      return scope.caller == moduleName
+                                          && digestOf(scope.token) == tokenDigest.toLower();
+                                  }),
+                   m_scopes.end());
     return removed;
 }
 
@@ -512,7 +555,7 @@ bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transpor
 }
 
 bool ModuleProxy::authorize(const QString& authToken, const QString& transportProtocol,
-                            std::string* callerJson) const
+                            std::string* callerJson, Grant* grant) const
 {
     // Unknown is SPELLED before anything else can go wrong, so every early
     // return below leaves a valid document behind rather than an empty string
@@ -571,6 +614,16 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
     const unsigned moduleHits = scan.moduleHits;   // matches in the INBOUND record
     const unsigned anchorHits = scan.anchorHits;   // matches on our own credential
 
+    // Every scoped grant is compared too, and the match is selected by mask. A scope
+    // only narrows a token that authorized above; it never authorizes by itself.
+    unsigned scopeHits = 0;
+    std::size_t scopeIndex = 0;
+    for (std::size_t i = 0; i < m_scopes.size(); ++i) {
+        const std::size_t match = constantTimeEquals(authToken, m_scopes[i].token) ? 1 : 0;
+        scopeHits += static_cast<unsigned>(match);
+        scopeIndex = (scopeIndex & ~(std::size_t{0} - match)) | (i & (std::size_t{0} - match));
+    }
+
     // Not one of our own issued tokens — give a host-installed validator the
     // chance to accept it for this transport. This is how operator-issued named
     // tokens (validated against the daemon's TokenStore, with expiry and
@@ -585,6 +638,18 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
     }
     if (!authorized) {
         return false;
+    }
+    bool scoped = false;
+    if (scopeHits > 0) {
+        const MethodScope& scope = m_scopes[scopeIndex];
+        const bool sameKey = moduleHits == 0
+            || (moduleHits == 1 && m_tokens.value(scope.caller) == authToken);
+        const bool ambiguous = scopeHits > 1 || anchorHits > 0 || !sameKey;
+        scoped = !ambiguous;
+        if (grant) {
+            grant->ambiguous = ambiguous;
+            if (scoped) grant->methods = scope.methods;
+        }
     }
 
     // Decided AFTER the scan, on counters, in O(1).
@@ -611,6 +676,7 @@ bool ModuleProxy::authorize(const QString& authToken, const QString& transportPr
         //     Impossible with UUIDs, but if it ever happens we do not get to
         //     pick one.
         //   * keyLen == 0 — the matched key is longer than kCallerKeyMax.
+        if (scoped) *callerJson = logos::withScopedMarker(*callerJson);
     }
     return true;
 }
@@ -717,4 +783,13 @@ bool ModuleHandshakeProxy::revokeModuleToken(const QString& authToken,
 {
     if (!m_proxy) return false;
     return m_proxy->revokeModuleToken(authToken, moduleName, tokenDigest);
+}
+
+bool ModuleHandshakeProxy::informScopedModuleToken(const QString& authToken,
+                                                   const QString& moduleName,
+                                                   const QString& token,
+                                                   const QString& scope)
+{
+    if (!m_proxy) return false;
+    return m_proxy->informScopedModuleToken(authToken, moduleName, token, scope);
 }

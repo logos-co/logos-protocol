@@ -286,6 +286,7 @@
 //       It also retires the token registry: "token_registry" is still accepted
 //       by lp_grant_host_services and grants nothing, and lp_token_keys always
 //       refuses. capability_module is the token authority and needs neither.
+//       Still 0.13, unreleased: method scopes and module configuration (below).
 #define LOGOS_PROTOCOL_VERSION_MINOR 13
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.13.0"
@@ -329,6 +330,8 @@
 #define LOGOS_PROTOCOL_HAS_CALLER_RESOLVER 1   /* lp_provider_set_caller_resolver */
 #define LOGOS_PROTOCOL_HAS_RUNTIME_DELEGATE 1  /* logos_runtime_delegate.h */
 #define LOGOS_PROTOCOL_HAS_TOKEN_REVOCATION 1  /* lp_revoke_module_token_to, revokeModuleToken */
+#define LOGOS_PROTOCOL_HAS_METHOD_SCOPES 1     /* lp_inform_scoped_module_token_to, not_authorised */
+#define LOGOS_PROTOCOL_HAS_MODULE_CONFIGURATION 1 /* logos_module_configuration.h */
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -369,6 +372,7 @@ extern "C" {
 #define LP_ERR_UNSUPPORTED (-2) /* provider surface: exercised in a later phase */
 #define LP_ERR_INTERNAL (-3)
 #define LP_ERR_UNAVAILABLE (-4) /* target module/object could not be acquired */
+#define LP_ERR_TARGET_UNSUPPORTED (-5) /* the target cannot take this push; nothing was sent */
 
 /* ---------------------------------------------------------------------------
  * Version
@@ -902,11 +906,25 @@ LP_API int lp_revoke_module_token_to(lp_client* client,
                               const char* token_digest,
                               int timeout_ms);
 
+/** lp_inform_module_token_to, but the token authorizes only the methods `scope_json`
+ *  names: exactly {"methods":[...]}, refused otherwise. Sent to the handshake object
+ *  (local socket) or in-process, never over tcp. LP_ERR_TARGET_UNSUPPORTED, with
+ *  nothing sent, when the target lacks informScopedModuleToken; the Qt runtime
+ *  returns LP_ERR_UNSUPPORTED. */
+LP_API int lp_inform_scoped_module_token_to(lp_client* client,
+                              const char* auth_token,
+                              const char* origin_module,
+                              const char* module_name,
+                              const char* token,
+                              const char* scope_json,
+                              int timeout_ms);
+
 /* ---------------------------------------------------------------------------
  * Host services — the privileged surface a trust-root module is granted
  *
- * Two functions above are closed by default and opened only by an explicit
- * "token_delivery" grant: lp_inform_module_token_to and lp_revoke_module_token_to.
+ * Three functions above are closed by default and opened only by an explicit
+ * "token_delivery" grant: lp_inform_module_token_to, lp_inform_scoped_module_token_to
+ * and lp_revoke_module_token_to.
  * They are what a capability/trust-root module needs and what an ordinary
  * module must not have. ("token_registry", which gated lp_token_keys, is
  * retired: see 0.13.)

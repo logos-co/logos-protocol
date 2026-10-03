@@ -236,6 +236,27 @@ TEST(QtRemotePlainCompatTest, QJsonValuesConsumeCompletePacketsAndNestedContaine
     EXPECT_EQ(resultReader.remaining(), 0u);
 }
 
+// The handshake's methods, in index order, are what Qt publishes for the class, so a
+// plain pusher and a Qt-plugin host agree on index 2.
+TEST(QtRemotePlainCompatTest, FixedHandshakeDefinitionMatchesItsMetaObject)
+{
+    const auto fixed = moduleHandshakeProxyDefinition();
+    const QMetaObject& meta = ModuleHandshakeProxy::staticMetaObject;
+    std::vector<MethodDefinition> actualMethods;
+    for (int i = meta.methodOffset(); i < meta.methodCount(); ++i) {
+        const QMetaMethod method = meta.method(i);
+        std::vector<std::string> parameterNames;
+        for (const auto& name : method.parameterNames())
+            parameterNames.push_back(name.toStdString());
+        ASSERT_NE(method.methodType(), QMetaMethod::Signal);
+        actualMethods.push_back({method.methodSignature().toStdString(),
+                                 method.typeName() ? method.typeName() : "",
+                                 std::move(parameterNames)});
+    }
+    EXPECT_TRUE(fixed.signalDefinitions.empty());
+    EXPECT_EQ(fixed.methodDefinitions, actualMethods);
+}
+
 TEST(QtRemotePlainCompatTest, FixedModuleProxyDefinitionMatchesItsMetaObject)
 {
     const auto fixed = moduleProxyDefinition();
@@ -275,13 +296,16 @@ TEST(QtRemotePlainCompatTest, DynamicDefinitionBytesMatchQt692QDataStream)
     stream << QString::fromStdString(definition.typeName);
     stream << quint32(0) << quint32(0) << quint32(0);
     stream << quint32(0);
-    stream << quint32(2);
+    stream << quint32(3);
     stream << QByteArray("informModuleToken(QString,QString,QString)")
            << QByteArray("bool")
            << names({"authToken", "moduleName", "token"});
     stream << QByteArray("revokeModuleToken(QString,QString,QString)")
            << QByteArray("bool")
            << names({"authToken", "moduleName", "tokenDigest"});
+    stream << QByteArray("informScopedModuleToken(QString,QString,QString,QString)")
+           << QByteArray("bool")
+           << names({"authToken", "moduleName", "token", "scope"});
     stream << quint32(0);
 
     EXPECT_EQ(plain.data(), stdBytes(qt));

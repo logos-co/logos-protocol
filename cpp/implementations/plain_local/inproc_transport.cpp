@@ -34,7 +34,7 @@ ResultMessage closedResult(std::uint64_t id, const std::string& reason)
 bool isControlMethod(const std::string& method)
 {
     return method == "informModuleToken" || method == "revokeModuleToken"
-        || method == "getPluginMethods" || method == "getPluginEvents"
+        || method == "informScopedModuleToken" || method == "getPluginMethods" || method == "getPluginEvents"
         || method == "getPluginInterface";
 }
 

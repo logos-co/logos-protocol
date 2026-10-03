@@ -447,6 +447,8 @@ add_executable(protocol_tests
     # is now a KEY NAMESPACE inside the original single QHash; these tests are
     # what keep it that way, and they are RED on e514c53.
     test_token_manager_abi.cpp
+    # Scoped tokens in the Qt runtime: kept with their token, refused not_authorised.
+    test_module_proxy_scopes.cpp
     # THE INBOUND DOOR across the C ABI (lp_token_save_inbound, protocol 0.8):
     # a caller's token is never filed as an outbound credential, granted or
     # not. The file names the one-line neutering that turns each case red.
@@ -552,6 +554,8 @@ add_executable(qt_remote_plain_cabi_tests
     test_plain_local_inproc.cpp
     test_plain_caller_resolver.cpp
     test_plain_token_revocation.cpp
+    # Scoped pushes: a token limited to listed methods, refused not_authorised past them.
+    test_method_scopes.cpp
 )
 target_link_libraries(qt_remote_plain_cabi_tests PRIVATE
     logos_protocol_plain
@@ -566,6 +570,12 @@ target_link_libraries(plain_runtime_delegate_tests PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(plain_runtime_delegate_tests PROPERTIES TIMEOUT 20)
+add_executable(plain_runtime_delegate_base_tests test_plain_runtime_delegate_base.cpp)
+target_link_libraries(plain_runtime_delegate_base_tests PRIVATE
+    logos_protocol_plain
+    GTest::gtest_main
+)
+gtest_discover_tests(plain_runtime_delegate_base_tests PROPERTIES TIMEOUT 20)
 
 # A host on the shared runtime and a module image with its own hidden static runtime.
 add_library(plain_delegate_image MODULE plain_delegate_image.cpp)

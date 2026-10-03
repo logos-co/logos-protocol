@@ -135,6 +135,10 @@ std::string callerHostAnchorJson();
  * field is nonetheless part of the shape from day one. */
 std::string callerModuleJson(const std::string& name);
 
+// `callerJson` with "scoped":true: the call passed a method-list grant. Only the
+// target's host runtime adds it.
+std::string withScopedMarker(const std::string& callerJson);
+
 /* ---------------------------------------------------------------------------
  * The per-thread stack.
  * ------------------------------------------------------------------------- */

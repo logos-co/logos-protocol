@@ -1004,6 +1004,12 @@ int lp_revoke_module_token_to(lp_client*, const char*, const char*, const char*,
     return LP_ERR_UNSUPPORTED;
 }
 
+int lp_inform_scoped_module_token_to(lp_client*, const char*, const char*, const char*,
+                                     const char*, const char*, int)
+{
+    return LP_ERR_UNSUPPORTED;
+}
+
 char* lp_token_digest(const char* token)
 {
     if (!token) return nullptr;

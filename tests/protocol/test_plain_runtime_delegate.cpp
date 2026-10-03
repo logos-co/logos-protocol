@@ -88,6 +88,8 @@ TEST(PlainRuntimeDelegate, AModuleImageCallsAsItsIdentityUntilReleased)
     const lp_runtime_delegate_v1* delegate = lp_runtime_delegate_create("mod_a", "[]");
     ASSERT_NE(delegate, nullptr);
     EXPECT_EQ(delegate->version, static_cast<unsigned>(LP_RUNTIME_DELEGATE_VERSION));
+    EXPECT_EQ(delegate->size, static_cast<unsigned>(sizeof(lp_runtime_delegate_v1)));
+    EXPECT_NE(delegate->inform_scoped_module_token_to, nullptr);
 
     // Image side: install once, before any client of the image's own.
     ASSERT_EQ(lp_runtime_install_delegate(delegate), LP_OK);
@@ -118,6 +120,9 @@ TEST(PlainRuntimeDelegate, AModuleImageCallsAsItsIdentityUntilReleased)
     // though this process holds token_delivery.
     ASSERT_EQ(lp_grant_host_services(R"(["token_delivery"])"), LP_OK);
     EXPECT_EQ(lp_inform_module_token_to(client, "", "delegate_target", "peer", "t", 1000),
+              LP_ERR_UNSUPPORTED);
+    EXPECT_EQ(lp_inform_scoped_module_token_to(client, "", "delegate_target", "peer", "t",
+                                               R"({"methods":["a"]})", 1000),
               LP_ERR_UNSUPPORTED);
 
     // Released: every handle is dead and nothing new is created.

@@ -109,10 +109,21 @@ Variant invokePublishedDirect(QObject* object, bool handshake,
     const QVariantList qargs = toQVariantList(args);
     if (handshake) {
         auto* proxy = qobject_cast<ModuleHandshakeProxy*>(guarded.data());
-        if (!proxy || index != 0 || qargs.size() != 3) return {};
-        return fromQVariant(proxy->informModuleToken(qargs[0].toString(),
-                                                     qargs[1].toString(),
-                                                     qargs[2].toString()));
+        if (!proxy) return {};
+        if (index == 2 && qargs.size() == 4)
+            return fromQVariant(proxy->informScopedModuleToken(
+                qargs[0].toString(), qargs[1].toString(), qargs[2].toString(),
+                qargs[3].toString()));
+        if (qargs.size() != 3) return {};
+        if (index == 0)
+            return fromQVariant(proxy->informModuleToken(qargs[0].toString(),
+                                                         qargs[1].toString(),
+                                                         qargs[2].toString()));
+        if (index == 1)
+            return fromQVariant(proxy->revokeModuleToken(qargs[0].toString(),
+                                                         qargs[1].toString(),
+                                                         qargs[2].toString()));
+        return {};
     }
     auto* proxy = qobject_cast<ModuleProxy*>(guarded.data());
     if (!proxy) return {};
@@ -135,6 +146,10 @@ Variant invokePublishedDirect(QObject* object, bool handshake,
     case 4: return fromQVariant(proxy->getPluginMethods());
     case 5: return fromQVariant(proxy->getPluginEvents());
     case 6: return fromQVariant(proxy->getPluginInterface());
+    case 7:
+        if (qargs.size() != 3) return {};
+        return fromQVariant(proxy->revokeModuleToken(
+            qargs[0].toString(), qargs[1].toString(), qargs[2].toString()));
     default: return {};
     }
 }

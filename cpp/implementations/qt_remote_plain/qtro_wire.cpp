@@ -1335,7 +1335,9 @@ ClassDefinition moduleHandshakeProxyDefinition()
         "ModuleHandshakeProxy",
         {},
         {{"informModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "token"}},
-         {"revokeModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "tokenDigest"}}},
+         {"revokeModuleToken(QString,QString,QString)", "bool", {"authToken", "moduleName", "tokenDigest"}},
+         {"informScopedModuleToken(QString,QString,QString,QString)", "bool",
+          {"authToken", "moduleName", "token", "scope"}}},
         {},
     };
 }

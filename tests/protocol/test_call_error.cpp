@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "logos_call_error.h"
 #include "logos_protocol.h"
 
 #include <nlohmann/json.hpp>
@@ -39,4 +40,15 @@ TEST(CallErrorChannel, UnreachableTargetYieldsCanonicalError)
 
     lp_string_free(error);
     lp_client_destroy(client);
+}
+
+// A grant refusal on the RPC wire keeps its own code; it is not a failed call.
+TEST(CallErrorChannel, AGrantRefusalOnTheWireIsNotAuthorised)
+{
+    const logos::CallError refused =
+        logos::callErrorFromWire("target", "NOT_AUTHORISED", "outside the grant");
+    EXPECT_EQ(refused.code, "not_authorised");
+    EXPECT_EQ(refused.origin, "target");
+    EXPECT_EQ(refused.message, "outside the grant");
+    EXPECT_EQ(logos::callErrorFromWire("target", "SOMETHING_NEW", "").code, "call_failed");
 }

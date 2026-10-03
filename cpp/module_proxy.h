@@ -5,13 +5,16 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QHash>
+#include <QSet>
 #include <QString>
 #include <QJsonArray>
 #include <QPointer>
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "token_manager.h"
 
@@ -116,6 +119,11 @@ public:
     Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList());
     Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args, const QString& transportProtocol);
     Q_INVOKABLE bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
+    // informModuleToken, but the token reaches only the methods `scope` lists
+    // ({"methods":[...]}). Not invokable: the business object's definition is fixed.
+    bool informScopedModuleToken(const QString& authToken, const QString& moduleName,
+                                 const QString& token, const QString& scope);
+    // Also clears the key's scope, as every unscoped push does.
     bool saveToken(const QString& from_module_name, const QString& token);
     // getPluginInterface() returns the module's whole interface (methods AND
     // events, each tagged with a "type"); getPluginMethods()/getPluginEvents()
@@ -163,8 +171,16 @@ private:
     // Unknown where the caller cannot be named honestly. Untouched on `false`
     // beyond the Unknown it is initialised to: an unauthorized call has no
     // caller because it has no dispatch.
+    // What an authorized token may call: every method, or a scoped list. A scoped
+    // token that also matches another key is ambiguous and refused.
+    struct Grant {
+        bool ambiguous = false;
+        std::optional<QSet<QString>> methods;
+    };
     bool authorize(const QString& authToken, const QString& transportProtocol,
-                   std::string* callerJson) const;
+                   std::string* callerJson, Grant* grant = nullptr) const;
+    bool acceptToken(const QString& authToken, const QString& moduleName,
+                     const QString& token, const QSet<QString>* methods);
 
     LogosProviderObject* m_provider;
     // THE INBOUND STORE: caller name -> the token that caller may present to us.
@@ -195,6 +211,14 @@ private:
     // untouched.
     TokenManager* m_store;
     TokenValidator m_validator;
+    // Scoped grants, matched by token value so a key the fold cannot name (a long
+    // operator key, a token only the store holds) is still covered.
+    struct MethodScope {
+        QString caller;
+        QString token;
+        QSet<QString> methods;
+    };
+    std::vector<MethodScope> m_scopes;
 };
 
 /**
@@ -219,6 +243,11 @@ public:
     Q_INVOKABLE bool revokeModuleToken(const QString& authToken,
                                        const QString& moduleName,
                                        const QString& tokenDigest);
+    // Index 2 of this object's definition (moduleHandshakeProxyDefinition).
+    Q_INVOKABLE bool informScopedModuleToken(const QString& authToken,
+                                             const QString& moduleName,
+                                             const QString& token,
+                                             const QString& scope);
 
 private:
     QPointer<ModuleProxy> m_proxy;

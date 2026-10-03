@@ -29,6 +29,8 @@ namespace logos {
 
 inline constexpr char kRpcStatusKey[]          = "__logos_rpc_status__";
 inline constexpr char kRpcStatusUnauthorized[] = "unauthorized";
+// The token is valid but its grant does not cover the method: never re-exchanged.
+inline constexpr char kRpcStatusNotAuthorised[] = "not_authorised";
 
 // The provider-side rejection value. QVariantMap round-trips faithfully on all
 // three transports (qt_local pass-through; qt_remote QtRO-serialized; plain via
@@ -41,13 +43,20 @@ inline QVariant makeUnauthorizedSentinel()
     return m;
 }
 
-// True only for the exact rejection sentinel. Handles QVariantMap (the normal
+inline QVariant makeNotAuthorisedSentinel()
+{
+    QVariantMap m;
+    m.insert(QString::fromLatin1(kRpcStatusKey), QString::fromLatin1(kRpcStatusNotAuthorised));
+    return m;
+}
+
+// True only for the exact status sentinel `status`. Handles QVariantMap (the normal
 // case on every transport) and QJsonObject (defensive: some json_convert paths
 // historically produced QJsonObject). Never matches a normal empty result.
-inline bool isUnauthorizedSentinel(const QVariant& v)
+inline bool isRpcStatusSentinel(const QVariant& v, const char* status)
 {
     const QString key  = QString::fromLatin1(kRpcStatusKey);
-    const QString want = QString::fromLatin1(kRpcStatusUnauthorized);
+    const QString want = QString::fromLatin1(status);
     switch (v.userType()) {
     case QMetaType::QVariantMap: {
         const QVariantMap m = v.toMap();
@@ -60,6 +69,16 @@ inline bool isUnauthorizedSentinel(const QVariant& v)
     default:
         return false;
     }
+}
+
+inline bool isUnauthorizedSentinel(const QVariant& v)
+{
+    return isRpcStatusSentinel(v, kRpcStatusUnauthorized);
+}
+
+inline bool isNotAuthorisedSentinel(const QVariant& v)
+{
+    return isRpcStatusSentinel(v, kRpcStatusNotAuthorised);
 }
 
 } // namespace logos

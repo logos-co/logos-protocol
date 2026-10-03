@@ -176,6 +176,17 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
             result = m_consumer->invokeRemoteMethod(fresh, objectName, methodName, args, timeout, err);
     }
 
+    // Refused by the target's grant: a new token would carry the same grant.
+    if (logos::isNotAuthorisedSentinel(result)) {
+        if (err) {
+            err->code    = logos::kRpcStatusNotAuthorised;
+            err->message = "call to '" + objectName.toStdString() + "." + methodName.toStdString()
+                         + "' is outside this caller's grant";
+            err->origin  = objectName.toStdString();
+        }
+        return QVariant();
+    }
+
     // Never surface the sentinel to the typed wrapper. If we still hold it the
     // retry failed (capability down / provider truly gone): collapse to today's
     // empty result, and for NEW callers set a distinguishable CallError.
@@ -335,6 +346,15 @@ void LogosAPIClient::invokeRemoteMethodAsyncImpl(const QString& objectName, cons
                 // rejections doesn't restorm capability_module with N handshakes.
                 invokeRemoteMethodAsyncImpl(objectName, methodName, args,
                                             std::move(cb), timeout, retriesLeft - 1);
+                return;
+            }
+            if (logos::isNotAuthorisedSentinel(result)) {
+                logos::CallError e;
+                e.code    = logos::kRpcStatusNotAuthorised;
+                e.message = "call to '" + objectName.toStdString() + "." + methodName.toStdString()
+                          + "' is outside this caller's grant";
+                e.origin  = objectName.toStdString();
+                cb(QVariant(), e);
                 return;
             }
             if (logos::isUnauthorizedSentinel(result)) {
