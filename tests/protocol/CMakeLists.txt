@@ -278,8 +278,8 @@ add_executable(protocol_tests
     test_plain_uint64.cpp
     # Qt-free socket-access + stale-socket reaper helpers (multi-user local
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
-    # reapStaleSockets never touching live sockets or regular files.
-    test_socket_paths.cpp
+    # reapStaleSockets never touching live sockets or regular files. POSIX only.
+    $<$<NOT:$<PLATFORM_ID:Windows>>:test_socket_paths.cpp>
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
     # The token-only handshake surface published before a module's initializer.

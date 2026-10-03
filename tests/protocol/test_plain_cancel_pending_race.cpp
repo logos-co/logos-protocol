@@ -38,8 +38,7 @@
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/local/connect_pair.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
+#include "connected_pair.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -319,7 +318,7 @@ TEST(PlainCancelPendingRaceTest, ThePromiseShapedHandlerSurvivesTheSameGap)
 // which must find no registration and drop it in silence.
 TEST(PlainCancelPendingRaceTest, ARealConnectionDropsAReplyThatArrivesAfterCancel)
 {
-    using LocalSocket     = boost::asio::local::stream_protocol::socket;
+    using LocalSocket     = PairSocket;
     using LocalConnection = RpcConnection<LocalSocket>;
 
     // A provider that answers nothing until told to.
@@ -369,7 +368,7 @@ TEST(PlainCancelPendingRaceTest, ARealConnectionDropsAReplyThatArrivesAfterCance
 
     LocalSocket a(ioc), b(ioc);
     boost::system::error_code ec;
-    boost::asio::local::connect_pair(a, b, ec);
+    connectPair(a, b, ec);
     ASSERT_FALSE(ec) << ec.message();
 
     HeldReplyProvider provider;
