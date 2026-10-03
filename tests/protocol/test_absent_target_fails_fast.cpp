@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include "implementations/qt_remote_plain/qt_remote_plain_transport.h"
 #include "logos_api_client.h"
 #include "logos_call_error.h"
 #include "logos_instance.h"
@@ -52,6 +53,20 @@ TEST_F(AbsentTargetTest, ARequestForAModuleNothingListensForFailsWithinTheGrace)
     t.start();
     EXPECT_EQ(nullptr, conn.requestObject("absent_target", 20000));
     EXPECT_LT(t.elapsed(), kGraceMs + kSlackMs)
+        << "a module that is not running cost the whole 20 s budget";
+}
+
+// The plain transport keeps the same contract; on Windows every local transport resolves to it.
+TEST_F(AbsentTargetTest, APlainRequestForAModuleNothingListensForFailsWithinTheGrace)
+{
+    using logos::qt_remote_plain::QtRemotePlainTransportConnection;
+    QtRemotePlainTransportConnection conn(LogosInstance::id("absent_plain_target"));
+    ASSERT_TRUE(conn.connectToHost());
+
+    QElapsedTimer t;
+    t.start();
+    EXPECT_EQ(nullptr, conn.requestObject("absent_plain_target", 20000));
+    EXPECT_LT(t.elapsed(), QtRemotePlainTransportConnection::kNoListenerGraceMs + kSlackMs)
         << "a module that is not running cost the whole 20 s budget";
 }
 

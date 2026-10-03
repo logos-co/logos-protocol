@@ -597,13 +597,16 @@ bool QtRemotePlainTransportConnection::reconnect()
 }
 
 // timeoutMs bounds the dial and the acquire together; 0 waits for nothing that
-// is not there already, as the consumer's retry tick requires.
+// is not there already, as the consumer's retry tick requires. Nothing listening
+// means the module is not running, so the dial waits the grace, not the budget.
 LogosObject* QtRemotePlainTransportConnection::requestObject(const QString& objectName,
                                                              int timeoutMs)
 {
     const auto budget = timeoutMs > 0 ? std::chrono::milliseconds(timeoutMs) : kImmediateWait;
     const auto deadline = std::chrono::steady_clock::now() + budget;
-    const auto listenerWait = timeoutMs > 0 ? budget : std::chrono::milliseconds(0);
+    const auto listenerWait = timeoutMs > 0
+        ? std::min(budget, std::chrono::milliseconds(kNoListenerGraceMs))
+        : std::chrono::milliseconds(0);
     const std::string object = objectName.toStdString();
     const auto acquire = [&] {
         if (!dial(*m_shared, m_url, listenerWait, budget)) return false;

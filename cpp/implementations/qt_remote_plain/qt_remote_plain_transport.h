@@ -46,6 +46,10 @@ public:
     bool reconnect() override;
     LogosObject* requestObject(const QString& objectName, int timeoutMs) override;
 
+    // How long requestObject() waits for a listener at an endpoint nobody listens on,
+    // as qt_remote's: a host listens before it reports a module loaded.
+    static constexpr int kNoListenerGraceMs = 1000;
+
 private:
     std::shared_ptr<Shared> m_shared;
     std::string m_url;

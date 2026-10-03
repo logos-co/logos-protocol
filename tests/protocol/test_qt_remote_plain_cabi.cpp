@@ -751,7 +751,7 @@ TEST(QtRemotePlainCabiTest, AsyncCallsShareABoundedSetOfThreads)
 }
 
 // Detector: lp_invoke failed at once when the provider was not listening yet;
-// the Qt C ABI waits for it within the call's timeout.
+// the Qt C ABI waits for it within the no-listener grace.
 TEST(QtRemotePlainCabiTest, ACallReachesAProviderThatStartsWithinItsTimeout)
 {
     setInstanceId("qtro_cabi_late_provider_");
