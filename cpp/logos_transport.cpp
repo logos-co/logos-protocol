@@ -3,8 +3,7 @@
 #include "logos_instance.h"
 
 // Default URL generators for the Qt local-socket / QRO-based backends.
-// They match today's deterministic scheme in LogosInstance::id(moduleName);
-// network backends (plain_transport_host, plain_transport_connection) override.
+// They match today's deterministic scheme in LogosInstance::id(moduleName).
 
 QString LogosTransportHost::bindUrl(const QString& /*instanceId*/,
                                     const QString& moduleName)

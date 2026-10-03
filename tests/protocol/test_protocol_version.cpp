@@ -61,6 +61,7 @@ TEST(ProtocolVersion, TransportProtocolsKeepTheirNumbers)
     EXPECT_EQ(static_cast<int>(LogosProtocol::TcpSsl), 2);
     EXPECT_EQ(static_cast<int>(LogosProtocol::QtRemotePlain), 3);
     EXPECT_EQ(static_cast<int>(LogosProtocol::Inproc), 4);
+    EXPECT_EQ(static_cast<int>(LogosProtocol::TlsTcp), 5);
 }
 
 // MINORs 10 and 11 were reused (see logos_protocol.h), so each addition of the
@@ -113,5 +114,15 @@ TEST(ProtocolVersion, TheSessionWaveHasFeatureMacros)
     EXPECT_GE(LOGOS_PROTOCOL_VERSION_MINOR, 14);
 #else
     FAIL() << "an addition of the 0.14 wave has no feature macro";
+#endif
+}
+
+// 0.15 took tcp and tcp_ssl away; their numbers above stay reserved.
+TEST(ProtocolVersion, TheRemovalOfTcpHasAFeatureMacro)
+{
+#if defined(LOGOS_PROTOCOL_REFUSES_TCP)
+    EXPECT_GE(LOGOS_PROTOCOL_VERSION_MINOR, 15);
+#else
+    FAIL() << "0.15 removed tcp and tcp_ssl without a feature macro";
 #endif
 }

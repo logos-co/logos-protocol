@@ -83,15 +83,14 @@ TEST_F(TransportFactoryTest, NeedsQtEventLoopFollowsTheResolutionRule)
     EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(localSocket))
         << "qt_remote owns a QRemoteObjectNode + QLocalSocket";
 #endif
-    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcp))
-        << "the plain transport is Qt-free by design";
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcp)) << "refused: it never connects";
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(qtRemotePlain))
         << "qt_remote_plain owns no Qt socket or QtRO object";
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcpSsl));
 
     // Mode wins over cfg.protocol, exactly as in createConnection.
     LogosModeConfig::setMode(LogosMode::Local);
-    EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(tcp))
+    EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(qtRemotePlain))
         << "local mode invokes in-process QObjects owned by the main thread";
 
     LogosModeConfig::setMode(LogosMode::Mock);
@@ -140,4 +139,20 @@ TEST_F(TransportFactoryTest, TheQtRuntimeRefusesTlsTcp)
     ASSERT_NE(conn, nullptr);
     EXPECT_FALSE(conn->connectToHost());
     EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(session));
+}
+
+// tcp and tcp_ssl, removed in 0.15: refused the same way, on every platform.
+TEST_F(TransportFactoryTest, TheQtRuntimeRefusesTheRemovedTcpTransports)
+{
+    LogosModeConfig::setMode(LogosMode::Remote);
+    for (LogosProtocol protocol : {LogosProtocol::Tcp, LogosProtocol::TcpSsl}) {
+        LogosTransportConfig removed;
+        removed.protocol = protocol;
+        EXPECT_EQ(LogosTransportFactory::createHost(removed, "local:tcp_refused"), nullptr);
+        auto conn = LogosTransportFactory::createConnection(removed, "local:tcp_refused");
+        ASSERT_NE(conn, nullptr);
+        EXPECT_FALSE(conn->connectToHost());
+        EXPECT_FALSE(conn->isConnected());
+        EXPECT_EQ(conn->requestObject("any", 100), nullptr);
+    }
 }

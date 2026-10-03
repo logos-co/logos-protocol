@@ -7,25 +7,18 @@
 
 // JSON (de)serialization for LogosTransportSet — used to pass per-module
 // transport configuration across the parent → child subprocess boundary
-// when the daemon launches `logos_host_qt` for capability_module (and
-// any other module that needs a non-default transport set). Kept
-// separate from logos_transport_config.h so consumers that only want
-// the value type don't pay for the JSON parse / nlohmann include.
+// when a runtime launches a module host. Kept separate from
+// logos_transport_config.h so consumers that only want the value type don't
+// pay for the JSON parse / nlohmann include.
 //
-// Wire shape mirrors daemon.json's per-module transport list:
+// Wire shape:
 //   [
-//     {"protocol": "local"},
-//     {"protocol": "tcp", "host": "127.0.0.1", "port": 6001, "codec": "json"},
-//     {"protocol": "tcp_ssl", "host": "0.0.0.0", "port": 6443,
-//      "codec": "cbor", "ca_file": "/p/ca", "cert_file": "/p/c",
-//      "key_file": "/p/k", "verify_peer": true}
+//     {"protocol": "qt_remote_plain"},
+//     {"protocol": "tls_tcp", "host": "0.0.0.0", "port": 0, "codec": "json"}
 //   ]
 //
-// Cert/key paths *are* included on the wire here (unlike the on-disk
-// daemon.json connection file): this serialization is for the parent
-// telling the child "here's the cert you should bind your TLS
-// listener with", which is the one place those paths legitimately
-// need to flow over IPC.
+// "tcp" and "tcp_ssl" were removed in 0.15: parseTransportSet refuses them,
+// and both runtimes refuse a set that names them.
 
 namespace logos {
 
@@ -41,8 +34,9 @@ LogosTransportSet transportSetFromJsonString(const std::string& json);
 
 // The same, refusing what transportSetFromJsonString drops or guesses at:
 // text that is not a JSON array, an entry that is not an object, a field of
-// the wrong type, a port out of range, an unknown protocol or codec. Empty
-// text is the empty set. On failure `error` says what was wrong.
+// the wrong type, a port out of range, an unknown protocol or codec, and the
+// removed "tcp" and "tcp_ssl". Empty text is the empty set. On failure `error`
+// says what was wrong.
 bool parseTransportSet(const std::string& json, LogosTransportSet* out,
                        std::string* error = nullptr);
 

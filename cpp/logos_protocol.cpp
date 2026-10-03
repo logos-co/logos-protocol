@@ -291,9 +291,8 @@ lp_client* lp_client_create(const char* target_module,
     // the LogosAPI's thread, which is the main thread. This gives the lp path
     // the same anchor.
     //
-    // Plain (Tcp/TcpSsl) and mock transports are Qt-free and thread-agnostic —
-    // they keep the calling thread, so a worker-thread consumer stays off the
-    // main thread's back.
+    // Mock and the refused transports are Qt-free and thread-agnostic — they
+    // keep the calling thread.
     const bool qtAffine = LogosTransportFactory::needsQtEventLoop(targetCfg)
                        || LogosTransportFactory::needsQtEventLoop(capabilityCfg);
     // forIdentity(origin), not instance(). This is the whole answer to the
@@ -312,8 +311,7 @@ lp_client* lp_client_create(const char* target_module,
         qWarning() << "lp_client_create: creating a Qt-affine client for"
                    << handle->target
                    << "with no QCoreApplication — the QtRO transport needs a "
-                      "Qt event loop; use a plain (tcp) transport in Qt-free "
-                      "hosts";
+                      "Qt event loop; Qt-free hosts use liblogos_protocol_plain";
     }
     handle->client = qtAffine ? logos::runOnQtMainThread(construct) : construct();
 

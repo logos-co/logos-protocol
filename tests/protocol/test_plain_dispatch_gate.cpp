@@ -4,9 +4,6 @@
 
 #include <gtest/gtest.h>
 
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -43,14 +40,6 @@ void useInstance(const std::string& prefix)
     const std::string instance = prefix + std::to_string(::getpid());
     ASSERT_EQ(::setenv("LOGOS_INSTANCE_ID", instance.c_str(), 1), 0);
 #endif
-}
-
-std::uint16_t freePort()
-{
-    boost::asio::io_context io;
-    boost::asio::ip::tcp::acceptor reservation(
-        io, {boost::asio::ip::make_address("127.0.0.1"), 0});
-    return reservation.local_endpoint().port();
 }
 
 struct Overlap {
@@ -111,16 +100,15 @@ void callRepeatedly(const char* target, const char* transport, int calls,
 }
 
 // Detector: each listener ran its own worker, so a module limited to one call
-// ran one over the local socket and another over tcp at the same time (peak 2 on 7b5adc1).
+// ran one over the local socket and another over a second listener at the same
+// time (peak 2 on 7b5adc1, with tcp as the second listener then).
 TEST(PlainDispatchGate, ASingleProviderNeverOverlapsCallsAcrossListeners)
 {
     useInstance("gate_single_");
-    const std::uint16_t port = freePort();
-    const std::string tcp = R"({"protocol":"tcp","host":"127.0.0.1","port":)"
-        + std::to_string(port) + "}";
+    const std::string inproc = R"({"protocol":"inproc"})";
     Overlap overlap;
     lp_provider* provider = lp_provider_create(
-        "gate_single", (R"([{"protocol":"qt_remote_plain"},)" + tcp + "]").c_str());
+        "gate_single", (R"([{"protocol":"qt_remote_plain"},)" + inproc + "]").c_str());
     ASSERT_NE(provider, nullptr);
     ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 1), LP_OK);
     ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
@@ -134,7 +122,7 @@ TEST(PlainDispatchGate, ASingleProviderNeverOverlapsCallsAcrossListeners)
         callers.emplace_back([&] {
             callRepeatedly("gate_single", R"({"protocol":"qt_remote_plain"})", 5, succeeded);
         });
-        callers.emplace_back([&] { callRepeatedly("gate_single", tcp.c_str(), 5, succeeded); });
+        callers.emplace_back([&] { callRepeatedly("gate_single", inproc.c_str(), 5, succeeded); });
     }
     for (auto& caller : callers) caller.join();
     lp_provider_destroy(provider);
@@ -147,12 +135,10 @@ TEST(PlainDispatchGate, ASingleProviderNeverOverlapsCallsAcrossListeners)
 TEST(PlainDispatchGate, AMultiProviderIsBoundedAcrossListeners)
 {
     useInstance("gate_multi_");
-    const std::uint16_t port = freePort();
-    const std::string tcp = R"({"protocol":"tcp","host":"127.0.0.1","port":)"
-        + std::to_string(port) + "}";
+    const std::string inproc = R"({"protocol":"inproc"})";
     Overlap overlap;
     lp_provider* provider = lp_provider_create(
-        "gate_multi", (R"([{"protocol":"qt_remote_plain"},)" + tcp + "]").c_str());
+        "gate_multi", (R"([{"protocol":"qt_remote_plain"},)" + inproc + "]").c_str());
     ASSERT_NE(provider, nullptr);
     ASSERT_EQ(lp_provider_set_max_concurrent_calls(provider, 2), LP_OK);
     ASSERT_EQ(lp_provider_save_token(provider, "caller", "secret"), LP_OK);
@@ -166,7 +152,7 @@ TEST(PlainDispatchGate, AMultiProviderIsBoundedAcrossListeners)
         callers.emplace_back([&] {
             callRepeatedly("gate_multi", R"({"protocol":"qt_remote_plain"})", 5, succeeded);
         });
-        callers.emplace_back([&] { callRepeatedly("gate_multi", tcp.c_str(), 5, succeeded); });
+        callers.emplace_back([&] { callRepeatedly("gate_multi", inproc.c_str(), 5, succeeded); });
     }
     for (auto& caller : callers) caller.join();
     lp_provider_destroy(provider);

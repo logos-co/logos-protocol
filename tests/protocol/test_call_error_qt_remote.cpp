@@ -2,9 +2,8 @@
 //
 // LogosProtocol::LocalSocket (qt_remote / QtRO) is the default in
 // LogosTransportConfig, so it is what an in-process module host actually uses.
-// test_call_error_after_acquire.cpp proves the channel over plain TCP; if the
-// fix stopped there, the transport most calls go over would still be reporting
-// a timed-out call as a method that returned null.
+// A fix that stopped at the plain runtime would leave the transport most calls
+// go over reporting a timed-out call as a method that returned null.
 //
 // The failure exercised here is a DEFERRED ("multi") call whose completion
 // event never arrives: RemoteLogosObject answers the pending sentinel, arms its
@@ -16,13 +15,17 @@
 //
 // The assertions are made at LogosAPIConsumer::invokeRemoteMethodAsync, which
 // is the site that used to hard-code `logos::CallError{}` next to every result.
-// lp_invoke_async is a thin renderer over that CallError (proved end-to-end in
-// test_call_error_after_acquire.cpp), so pinning it here pins the C ABI too.
+// lp_invoke_async is a thin renderer over that CallError, so pinning it here
+// pins the C ABI too.
+//
+// An unknown method NAME is the provider's unknown_method refusal, which both
+// C ABI entry points must carry intact as a RESULT, distinct from a null return.
 
 #include <gtest/gtest.h>
 
 #include "local_host.h"
 #include "logos_api_consumer.h"
+#include "logos_protocol.h"
 #include "logos_async_dispatch.h"
 #include "logos_instance.h"
 #include "logos_object.h"
@@ -33,14 +36,20 @@
 #include "token_manager.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QString>
 #include <QVariantList>
 #include <QVariantMap>
 
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <string>
 #include <thread>
 
 namespace {
@@ -55,17 +64,23 @@ QCoreApplication* ensureApp() {
 
 // compute() answers straight away; stall() answers the pending sentinel and
 // then never pushes the completion event, so the consumer's bounded wait is
-// the only thing that ends the call.
+// the only thing that ends the call. echo() returns null, and any other name
+// is refused with the canonical unknown_method object, as every provider does.
 class StallProvider : public LogosProviderObject {
 public:
     QVariant callMethod(const QString& method, const QVariantList& /*args*/) override {
         if (method == QLatin1String("compute")) return QVariant(7);
+        if (method == QLatin1String("echo")) return QVariant();
         if (method == QLatin1String("stall")) {
             QVariantMap sentinel;
             sentinel[logos::pendingCallKey()] = QStringLiteral("never-completes");
             return sentinel;
         }
-        return QVariant();
+        QVariantMap unknown;
+        unknown.insert(QStringLiteral("code"), QStringLiteral("unknown_method"));
+        unknown.insert(QStringLiteral("message"), QStringLiteral("unknown method '%1'").arg(method));
+        unknown.insert(QStringLiteral("origin"), QStringLiteral("qtro_module"));
+        return unknown;
     }
     bool informModuleToken(const QString&, const QString&) override { return true; }
     QJsonArray getMethods() override { return QJsonArray{}; }
@@ -170,4 +185,122 @@ TEST_F(QtRemoteCallErrorTest, AsyncTimeoutCarriesTheCanonicalError)
     EXPECT_EQ(err.origin, "qtro_stall_module");
     EXPECT_FALSE(err.message.empty());
     EXPECT_FALSE(got.isValid());
+}
+
+// ── an unknown method NAME, and the null it must not be confused with ────────
+//
+// Over the C ABI, against a module published on the local transport. Both
+// entry points must carry the provider's refusal as a RESULT, intact, and a
+// method that legitimately returns null must stay a null result.
+namespace {
+
+struct Capture {
+    std::atomic<bool> fired{false};
+    int ok = -1;
+    std::string json;
+};
+
+void captureCb(int ok, const char* json, void* userData)
+{
+    auto* c = static_cast<Capture*>(userData);
+    c->ok = ok;
+    c->json = json ? json : "";
+    c->fired = true;
+}
+
+bool pumpUntil(const std::function<bool()>& done, int budgetMs)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (!done() && timer.elapsed() < budgetMs)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    return done();
+}
+
+// StallProvider published as `name` on the local transport, its token saved on both sides.
+struct LocalModule {
+    explicit LocalModule(const char* name)
+        : host(makeLocalHost(LogosInstance::id(QString::fromLatin1(name)))), proxy(&provider)
+    {
+        proxy.saveToken(QStringLiteral("origin"), QStringLiteral("tok-unknown"));
+        published = host && host->publishObject(QString::fromLatin1(name), &proxy);
+        lp_token_save(name, "tok-unknown");
+        client = lp_client_create(name, "origin", nullptr, nullptr);
+    }
+    ~LocalModule()
+    {
+        lp_client_destroy(client);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
+    std::unique_ptr<LogosTransportHost> host;
+    StallProvider provider;
+    ModuleProxy proxy;
+    bool published = false;
+    lp_client* client = nullptr;
+};
+
+void expectUnknownMethodRefusal(const std::string& json)
+{
+    const nlohmann::json v = nlohmann::json::parse(json, nullptr, false);
+    ASSERT_TRUE(v.is_object()) << json;
+    EXPECT_EQ(v.size(), 3u) << json;
+    EXPECT_EQ(v.value("code", std::string{}), "unknown_method") << json;
+    EXPECT_EQ(v.value("message", std::string{}), "unknown method 'noSuchMethod'") << json;
+    EXPECT_EQ(v.value("origin", std::string{}), "qtro_module") << json;
+}
+
+} // namespace
+
+TEST_F(QtRemoteCallErrorTest, AsyncUnknownMethodArrivesAsTheProvidersRefusal)
+{
+    LocalModule module("qtro_unknown_async_module");
+    ASSERT_TRUE(module.published);
+    ASSERT_NE(module.client, nullptr);
+
+    Capture c;
+    ASSERT_EQ(lp_invoke_async(module.client, "noSuchMethod", "[]", 5000, &captureCb, &c), LP_OK);
+    ASSERT_TRUE(pumpUntil([&] { return c.fired.load(); }, 15000)) << "async callback never fired";
+
+    EXPECT_EQ(c.ok, 1) << "a provider's refusal is a result, not a transport failure";
+    expectUnknownMethodRefusal(c.json);
+}
+
+// From another thread, so this one keeps the loop running for the host and the client.
+TEST_F(QtRemoteCallErrorTest, SyncUnknownMethodArrivesAsTheProvidersRefusal)
+{
+    LocalModule module("qtro_unknown_sync_module");
+    ASSERT_TRUE(module.published);
+    ASSERT_NE(module.client, nullptr);
+
+    char* result = nullptr;
+    char* error = nullptr;
+    int rc = -1;
+    std::atomic<bool> done{false};
+    std::thread caller([&] {
+        rc = lp_invoke(module.client, "noSuchMethod", "[]", 5000, &result, &error);
+        done = true;
+    });
+    pumpUntil([&] { return done.load(); }, 15000);
+    caller.join();
+
+    EXPECT_EQ(rc, LP_OK) << "a provider's refusal is a result, not a transport failure";
+    EXPECT_EQ(error, nullptr);
+    ASSERT_NE(result, nullptr);
+    expectUnknownMethodRefusal(result);
+    lp_string_free(result);
+    lp_string_free(error);
+}
+
+TEST_F(QtRemoteCallErrorTest, ALegitimateNullReturnIsStillANullResult)
+{
+    LocalModule module("qtro_null_module");
+    ASSERT_TRUE(module.published);
+    ASSERT_NE(module.client, nullptr);
+
+    Capture c;
+    ASSERT_EQ(lp_invoke_async(module.client, "echo", "[]", 5000, &captureCb, &c), LP_OK);
+    ASSERT_TRUE(pumpUntil([&] { return c.fired.load(); }, 15000)) << "async callback never fired";
+
+    EXPECT_EQ(c.ok, 1);
+    EXPECT_EQ(c.json, "null");
 }

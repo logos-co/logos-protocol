@@ -29,13 +29,13 @@
  *   - Handles are thread-safe per-handle: calls on one handle may be made
  *     from any thread; the library marshals to the handle's owner thread
  *     internally where required.
- *   - Qt-free transports (plain tcp/tcp_ssl, qt_remote_plain, mock) are
+ *   - Qt-free transports (qt_remote_plain, inproc, tls_tcp, mock) are
  *     serviced by the library's own workers — no caller event loop is needed.
  *   - The Qt Remote Objects transport (the current default inside module
  *     processes) ADDITIONALLY requires a running Qt event loop in the
  *     process. Every Logos module process has one (logos_host runs it).
  *     Standalone non-Qt consumers can use qt_remote_plain for QtRO wire
- *     compatibility, or the independent plain TCP transports.
+ *     compatibility.
  *     A client on that transport is created on — and owned by — the Qt main
  *     thread no matter which thread calls lp_client_create(), because its
  *     node and socket are only serviced by that thread's loop. Calls from
@@ -56,7 +56,8 @@
  * Versioning: this library carries the logos-protocol semantic version —
  * the single number that governs Logos load/call compatibility. Two
  * participants interoperate iff they share the same MAJOR. MINOR is
- * additive/back-compatible; PATCH never affects compatibility.
+ * additive/back-compatible, except 0.15, which removed the tcp and tcp_ssl
+ * transports (see there); PATCH never affects compatibility.
  * =========================================================================== */
 
 // HOW TO GUARD A CONDITIONAL SURFACE, and it is not what it looks like.
@@ -293,9 +294,15 @@
 // endpoints, close/extend, add_endpoint) and the client's credential and
 // session hook. Network endpoints gain a control lane and run business calls
 // on as many threads as the dispatch gate allows.
-#define LOGOS_PROTOCOL_VERSION_MINOR 14
+// 0.15: the tcp and tcp_ssl transports are removed, the one MINOR that takes
+// something away. Both runtimes refuse them wherever a transport is named;
+// runtimes reach each other over tls_tcp (peering). The C ABI is unchanged:
+// LogosProtocol keeps Tcp and TcpSsl as reserved values, LogosTransportConfig
+// keeps its TLS file fields (unused), and a validator's transport label is
+// always "local".
+#define LOGOS_PROTOCOL_VERSION_MINOR 15
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.14.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.15.0"
 
 // FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
 // cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
@@ -340,6 +347,9 @@
 // FEATURE MACRO for 0.14: the tls_tcp transport and the session functions
 // below. The Qt runtime declares them and returns LP_ERR_UNSUPPORTED.
 #define LOGOS_PROTOCOL_HAS_REMOTE_SESSIONS 1
+
+// FEATURE MACRO for 0.15: "tcp" and "tcp_ssl" are refused (see the version above).
+#define LOGOS_PROTOCOL_REFUSES_TCP 1
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -422,13 +432,12 @@ LP_API const char* lp_get_mode(void);
 
 /** Set the process-global default transport from a JSON object, e.g.
  *    {"protocol":"local"}
- *    {"protocol":"tcp","host":"127.0.0.1","port":6001,"codec":"json"}
- *    {"protocol":"tcp_ssl","host":"...","port":6443,"codec":"cbor",
- *     "ca_file":"...","cert_file":"...","key_file":"...","verify_peer":true}
- *  "protocol" is one of "local", "qt_remote_plain", "tcp", "tcp_ssl", "inproc"
- *  or "tls_tcp" (plain runtime only; see the session functions). Returns
+ *    {"protocol":"tls_tcp","host":"127.0.0.1","port":7443,"codec":"json"}
+ *  "protocol" is one of "local", "qt_remote_plain", "inproc" or "tls_tcp"
+ *  (the last two plain runtime only; see the session functions). Returns
  *  LP_OK, or LP_ERR_INVALID_ARG for malformed JSON, an unknown protocol or
- *  codec, or a mistyped field. lp_client_create refuses the same inputs. */
+ *  codec, a mistyped field, or "tcp" / "tcp_ssl" (removed in 0.15).
+ *  lp_client_create refuses the same inputs. */
 LP_API int lp_set_default_transport(const char* transport_json);
 
 /* ---------------------------------------------------------------------------
@@ -497,7 +506,7 @@ typedef void (*lp_subscription_status_cb)(int state, unsigned long long generati
  * Owner thread: for a Qt-affine transport (Qt Remote Objects / local mode) the
  * client is constructed on the Qt main thread — blocking this call until that
  * thread runs it — because its node and socket are only serviced there. Any
- * thread may call this. Qt-free transports (qt_remote_plain / tcp / tcp_ssl /
+ * thread may call this. Qt-free transports (qt_remote_plain / inproc / tls_tcp /
  * mock) own their protocol workers and require no caller event loop.
  *
  * Returns NULL on invalid arguments.
@@ -968,7 +977,7 @@ typedef int (*lp_token_cb)(const char* module_name, const char* token,
                            void* user_data);
 
 /** Validate a credential not present in the provider's in-memory token map.
- *  `transport_protocol` uses the public names "local", "tcp", or "tcp_ssl".
+ *  `transport_protocol` is always "local" since 0.15 (tcp and tcp_ssl went).
  *  Return LP_OK to accept it. The callback may read persistent state and is
  *  evaluated for every otherwise-unknown token, so revocation takes effect
  *  without restarting the provider. */
@@ -1087,8 +1096,8 @@ LP_API int lp_provider_close_sessions(lp_provider* provider, const char* filter_
  *  how many, or a negative error. */
 LP_API int lp_provider_extend_sessions(lp_provider* provider, const char* filter_json,
                            long long lifetime_ms);
-/** Starts one more network listener (tcp, tcp_ssl or tls_tcp) on a provider
- *  already prepared or registered. */
+/** Starts one more tls_tcp listener on a provider already prepared or
+ *  registered. */
 LP_API int lp_provider_add_endpoint(lp_provider* provider, const char* transport_json);
 
 /** Client side of a session: the embedder's hooks, called on the calling

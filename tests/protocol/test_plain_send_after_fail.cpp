@@ -93,7 +93,6 @@
 #include "incoming_call_handler.h"
 #include "json_codec.h"
 #include "logos_call_error.h"
-#include "plain_logos_object.h"
 #include "rpc_connection.h"
 #include "rpc_message.h"
 
@@ -162,8 +161,6 @@ struct PendingMethodsTag {
 template struct Rob<PendingMethodsTag, &LocalConn::m_pendingMethods>;
 
 // A provider on the far end of the socketpair that answers everything at once.
-// It exists so the warm-up call in the object-level test completes for real;
-// the racing call never reaches it, because the connection dies first.
 //
 // It can also be told to HOLD its replies. That is what lets the volume test
 // below guarantee — rather than hope — that fail()'s sweep has something to
@@ -360,7 +357,7 @@ protected:
 
 // ── 1. the transport-level claim: the handler is invoked, once, always ───────
 //
-// Straight at RpcConnection, with no PlainLogosObject above it, so what is
+// Straight at RpcConnection, with nothing above it, so what is
 // measured is the registration itself rather than anything the handle does to
 // compensate for it.
 //
@@ -439,164 +436,7 @@ TEST_F(PlainSendAfterFailTest, ACallRegisteredAsTheConnectionFailsIsStillAnswere
            "this run proved nothing. It is not evidence of a fix.";
 }
 
-// ── 2. what the CALLER is told, and how long it waits to hear it ────────────
-//
-// The same interleaving one layer up, through callMethodAsyncWithError, which
-// is where the cost actually lands: the deadline is the only thing left that
-// can resolve the call, so the caller waits it out in full and is then told
-// "timeout" — a diagnosis that is not merely imprecise but names the wrong
-// party, since the transport knew the connection was gone before the call was
-// ever written.
-//
-// PRE-FIX (cf1b9b0), 40 rounds: all 40 were answered only by the deadline —
-// worst 828ms, against the 800ms deadline that validation run used — with code
-// "timeout". POST-FIX: 0 reported as a timeout, worst latency 183ms on the
-// macos-latest runner and 35ms on an idle local box, which is this test's own
-// 30ms parking sleep plus the hop through the Qt loop.
-//
-// ── WHERE THE BARS ARE SET, after this failed once on a shared CI runner ─────
-//
-// Run 33637026342 (macos-latest) failed this test on a commit ubuntu-latest
-// passed, and four consecutive local runs passed 559/559; nothing on that
-// branch touches this path. The bars below are set for a contended runner
-// WITHOUT moving the property, which is that the reclaim answers the call and
-// the deadline does not:
-//
-//   * The DEADLINE is 2000ms, not 800ms. Post-fix no round reaches it — the
-//     answer arrives ~35ms in — so its size is free, and only a run that is
-//     already failing pays for it. What it buys is that a runner must stall for
-//     two seconds, not eight hundred milliseconds, to manufacture the "timeout"
-//     verdict this test exists to forbid. Pre-fix every round still burns it in
-//     full, so re-validating against cf1b9b0 now costs ~80s here, not ~33s.
-//   * PROMPTNESS is an absolute 800ms, set off what the mechanism costs on the
-//     SLOWEST box measured — worst 183ms on macos-latest, against 35ms locally
-//     — and not off the deadline, which has no bearing on it. A fraction of the
-//     deadline tracks the wrong quantity: the old kTimeoutMs / 2 left a healthy
-//     macos run only 2.2x of headroom, which is the likeliest thing that tripped,
-//     and raising the deadline would have loosened the bar for free.
-//   * Both bars tolerate 2 of 40 rounds, so one descheduled round is not a red
-//     suite. Pre-fix 38-40 of 40 miss them, a ~19x margin. Zero tolerance is
-//     kept where it costs nothing: tests 1 and 4 assert unanswered/dropped == 0
-//     on counts with no clock in them, and they are the detectors of the drop
-//     itself.
-//
-// Measured under 8x local oversubscription, none of the above is what moves:
-// worst latency held at 36-52ms and timedOut at 0, while answered-by-reclaim
-// fell from 40 to 18-31 as the mutex handoff lost more often. That counter is
-// asserted only to be non-zero — the weakest form that is still not vacuous.
-TEST_F(PlainSendAfterFailTest,
-       TheCallerIsToldTheTransportClosedInsteadOfWaitingOutItsDeadline)
-{
-    IoWorker io;
-    EagerProvider provider;
-
-    constexpr int kRounds         = 40;
-    constexpr int kTimeoutMs      = 2000;   // see WHERE THE BARS ARE SET, above
-    constexpr int kPromptMs       = 800;    // answered by the transport, not the clock
-    constexpr int kStallTolerance = 2;      // rounds a contended runner may stall
-
-    int reached  = 0;
-    int timedOut = 0;
-    int missing  = 0;
-    int doubled  = 0;
-    std::vector<qint64> latencies;
-
-    for (int r = 0; r < kRounds; ++r) {
-        Wire w = makeWire(io.ioc(), &provider);
-        ASSERT_NE(w.client, nullptr);
-
-        auto* obj = new PlainLogosObject("probe_module", w.client);
-
-        // ONE COMPLETED CALL FIRST, and it is load-bearing rather than tidy:
-        // the first callMethodAsyncWithError on a handle also runs
-        // ensureCompletionSub(), whose Subscribe takes the connection mutex.
-        // Without the warm-up the racing caller would park on that mutex —
-        // BEFORE its m_stopped check rather than after it — and the round would
-        // exercise the pre-existing already-stopped early-out instead of the gap.
-        {
-            auto warm = std::make_shared<Outcome>();
-            obj->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
-                                          QVariantList{}, 5000,
-                                          [warm](QVariant, const logos::CallError&) {
-                                              warm->calls.fetch_add(1);
-                                          });
-            pumpUntil(warm->calls, 1, 5000);
-            ASSERT_EQ(warm->calls.load(), 1) << "the warm-up call was not answered";
-        }
-
-        auto out = std::make_shared<Outcome>();
-        QElapsedTimer clock;
-        clock.start();
-        raceRegistrationAgainstFail(w.client, [obj, out] {
-            obj->callMethodAsyncWithError(kToken, QStringLiteral("ping"),
-                                          QVariantList{}, kTimeoutMs,
-                                          [out](QVariant, const logos::CallError& e) {
-                                              {
-                                                  std::lock_guard<std::mutex> g(out->mu);
-                                                  out->err = e;
-                                              }
-                                              out->calls.fetch_add(1);
-                                          });
-        });
-
-        // Generous: pre-fix this needs the whole deadline plus the hop through
-        // the Qt loop, and the test has to OBSERVE that rather than give up on it.
-        pumpUntil(out->calls, 1, kTimeoutMs + 4000);
-        const qint64 elapsed = clock.elapsed();
-        pump(60);   // a second delivery would land here
-
-        logos::CallError seen;
-        { std::lock_guard<std::mutex> g(out->mu); seen = out->err; }
-
-        if (out->calls.load() == 0)     ++missing;
-        else if (out->calls.load() > 1) ++doubled;
-        if (seen.code == "timeout") ++timedOut;
-        // "connection stopped" is the reclaim's own wording; fail()'s sweep
-        // reports its reason instead. Either is a prompt, honest answer — this
-        // only distinguishes which half of the race ran.
-        if (seen.message.find("connection stopped") != std::string::npos) ++reached;
-        if (out->calls.load() == 1) latencies.push_back(elapsed);
-
-        obj->release();
-        w.provider->stop();
-        pump(20);
-    }
-
-    std::sort(latencies.begin(), latencies.end());
-    const qint64 worst  = latencies.empty() ? -1 : latencies.back();
-    const qint64 median = latencies.empty() ? -1 : latencies[latencies.size() / 2];
-    const int    slow   = static_cast<int>(std::count_if(
-        latencies.begin(), latencies.end(),
-        [](qint64 ms) { return ms >= kPromptMs; }));
-
-    std::cout << "  " << kRounds << " rounds, " << kTimeoutMs
-              << "ms deadline -> answered-by-reclaim=" << reached
-              << " reported-as-TIMEOUT=" << timedOut
-              << " never-delivered=" << missing << " doubled=" << doubled
-              << " latency median=" << median << "ms worst=" << worst
-              << "ms over-" << kPromptMs << "ms=" << slow << "/" << kRounds
-              << std::endl;
-
-    EXPECT_EQ(missing, 0);
-    EXPECT_EQ(doubled, 0);
-    EXPECT_LE(timedOut, kStallTolerance)
-        << timedOut << " of " << kRounds << " calls waited out their entire "
-        << kTimeoutMs << "ms deadline and were then reported as a TIMEOUT. The "
-           "connection was already torn down when the call was made; the honest "
-           "code is transport_error, and it was available immediately.";
-    ASSERT_FALSE(latencies.empty());
-    EXPECT_LE(slow, kStallTolerance)
-        << slow << " of " << kRounds << " calls needed " << kPromptMs
-        << "ms or more to be told the transport was gone (median " << median
-        << "ms, worst " << worst << "ms). A healthy round is answered by the "
-           "reclaim in about the 30ms this test parks the caller for, and the "
-           "deadline plays no part in it.";
-    EXPECT_GT(reached, 0)
-        << "the interleaving this test exists for was never reached in "
-        << kRounds << " rounds — this run proved nothing";
-}
-
-// ── 3. the same gap on the methods map, where there is no caller timeout ─────
+// ── 2. the same gap on the methods map, where there is no caller timeout ─────
 //
 // sendMethods() has the identical shape, and getMethods() above it waits on a
 // hard-coded five-second future. A caller cannot shorten that, so the cost of
@@ -660,7 +500,7 @@ TEST_F(PlainSendAfterFailTest,
     EXPECT_GT(reached, 0) << "the interleaving was never reached; nothing proved";
 }
 
-// ── 4. exactly-once, at volume, on the path the fix adds ────────────────────
+// ── 3. exactly-once, at volume, on the path the fix adds ────────────────────
 //
 // THE THREE TESTS ABOVE ARE NOT DETECTORS OF EXACTLY-ONCE. Each resolves one
 // call once, so each stays green whatever guards the handler — the same trap
@@ -683,16 +523,9 @@ TEST_F(PlainSendAfterFailTest,
 // It reports 4, 6, 7 and 8 doubles per 10,000 over four runs. Thrown away with
 // the checkout; nothing in this tree switches it on.
 //
-// AND WHY IT IS NEEDED AT ALL, given the suite already has a 10,000-call
-// release-race: IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce is
-// BLIND to this path — measured, 0 doubles against the same broken reclaim —
-// because it races teardown of the HANDLE against replies while the connection
-// stays up, so sendCallAsync's stopped branch is never taken. The contended
-// object has to be the connection.
-//
 // PRE-FIX (cf1b9b0): 14 of the 10,000 calls dropped, and 14 registrations left
 // on dead connections — a real but weak signal, since the unaided window is only
-// a few instructions wide (tests 1-3 are the wide detectors of the drop).
+// a few instructions wide (tests 1-2 are the wide detectors of the drop).
 // POST-FIX: 0 dropped, 0 doubled, over 8 runs.
 TEST_F(PlainSendAfterFailTest, AStopRacingABurstOfRegistrationsAnswersEveryCallExactlyOnce)
 {

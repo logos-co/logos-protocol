@@ -4,8 +4,8 @@
 // three separate times, each time in a cell nothing covered: a one-shot
 // subscription that refused a module which was merely not up YET; a deferred
 // subscription that never armed on the three transports whose tests were all
-// written in Remote mode; a plain-transport host that accepted a Subscribe for
-// an unpublished object and dropped it on the floor. Every one of them looked
+// written in Remote mode; a host that accepted a Subscribe for an unpublished
+// object and dropped it on the floor. Every one of them looked
 // like success from the caller's side. A single happy-path test per layer
 // cannot catch that class of defect, because the defect IS the happy path
 // reporting success.
@@ -16,7 +16,7 @@
 //   ---------      --------         --------                 ------
 //   qt_remote      Qt-native        onEventWhenAvailable     publish-then-subscribe
 //   qt_local       universal/std    lp_subscribe (C ABI)     subscribe-then-publish
-//   plain (TCP)                                              unload -> reload
+//   qt_remote_plain                                          unload -> reload
 //                                                            reconnect
 //                                                            unsubscribe
 //
@@ -51,7 +51,6 @@
 #include "logos_provider_interface.h"
 #include "logos_transport_config.h"
 #include "module_proxy.h"
-#include "plain_transport_host.h"
 #include "local_transport.h"
 #include "remote_transport.h"
 #include "token_manager.h"
@@ -129,28 +128,9 @@ public:
 
 enum class ProviderKind { Qt, Universal };
 // QtRemotePlain is the local transport Windows resolves every local connection to.
-enum class TransportKind { QtRemote, QtLocal, Plain, QtRemotePlain };
+enum class TransportKind { QtRemote, QtLocal, QtRemotePlain };
 
 const char* nameOf(ProviderKind p) { return p == ProviderKind::Qt ? "QtProvider" : "UniversalProvider"; }
-
-// Does a subscription to an ABSENT module sit in the consumer's pending set?
-//
-// Stated per transport rather than discovered at runtime, because the whole
-// point is to catch a change in it. The two answers are both correct and they
-// arm the subscription in genuinely different places:
-//
-//   qt_remote  DEFERS. No listener on the socket, so there is no handle to
-//              attach to; the consumer holds the subscription and the QtRO
-//              replica arms it when the peer appears.
-//   qt_local   DEFERS. The module is not in the in-process PluginRegistry, so
-//              requestObject() returns null and the retry tick owns the arm.
-//   plain      DOES NOT. requestObject() hands back a handle for any name over
-//              a live connection, so the subscription arms immediately and the
-//              waiting happens one layer down: PlainTransportHost keeps the
-//              sink until the object is published. If this ever flips to true,
-//              that host-side hold has been lost and subscribe-before-publish
-//              is silently broken again on TCP/TLS.
-bool defersWhenModuleAbsent(TransportKind t) { return t != TransportKind::Plain; }
 
 // Does a subscription to a module that is ALREADY up arm before the call
 // returns? Everywhere except qt_remote, yes — and it has to.
@@ -164,21 +144,10 @@ bool defersWhenModuleAbsent(TransportKind t) { return t != TransportKind::Plain;
 // stack, which is a documented crash in this codebase, not a style preference.
 bool armsSynchronouslyWhenPresent(TransportKind t) { return t != TransportKind::QtRemote; }
 
-// Is a subscription live the instant it is made, on a module that is already
-// reachable? Only where registering it is LOCAL to this process:
-//   qt_remote  attaches a callback to a replica this node already holds
-//   qt_local   connects to the provider's Qt signal, in-process
-//   plain      NO -- onSubscribe travels to the host as a wire frame, so an
-//              event emitted before that frame lands reaches nobody. That is
-//              inherent to a network transport and predates deferral: the old
-//              path sent the identical frame. Delivery must still HAPPEN, just
-//              not instantly, which is what the plain leg below asserts.
-bool subscriptionIsLocallyRegistered(TransportKind t) { return t != TransportKind::Plain; }
 const char* nameOf(TransportKind t) {
     switch (t) {
     case TransportKind::QtRemote: return "qt_remote";
     case TransportKind::QtLocal:  return "qt_local";
-    case TransportKind::Plain:    return "plain_tcp";
     case TransportKind::QtRemotePlain: return "qt_remote_plain";
     }
     return "?";
@@ -191,9 +160,6 @@ const char* nameOf(TransportKind t) {
 // where it differs:
 //   qt_remote  no host listening on the module's socket at all
 //   qt_local   not registered in the in-process PluginRegistry
-//   plain      host listening, object not published (the realistic case: a
-//              host process serves several modules and publishes them as they
-//              finish initialising)
 class Module {
 public:
     Module(TransportKind transport, ProviderKind provider, QString name)
@@ -207,24 +173,10 @@ public:
             m_proxy = std::make_unique<ModuleProxy>(m_universal.get());
         }
         m_proxy->saveToken(QStringLiteral("caller"), QStringLiteral("tok"));
-
-        if (m_transport == TransportKind::Plain) {
-            LogosTransportConfig cfg;
-            cfg.protocol = LogosProtocol::Tcp;
-            cfg.host = "127.0.0.1";
-            cfg.port = 0;                       // ephemeral
-            m_plainHost = std::make_unique<logos::plain::PlainTransportHost>(cfg);
-            m_plainStarted = m_plainHost->start();
-            const QString endpoint = m_plainHost->endpoint();
-            m_port = endpoint.mid(endpoint.lastIndexOf(':') + 1).toUShort();
-        }
     }
 
     ~Module() { takeDown(); }
 
-    bool hostReady() const {
-        return m_transport != TransportKind::Plain || (m_plainStarted && m_port != 0);
-    }
 
     void bringUp()
     {
@@ -237,9 +189,6 @@ public:
         case TransportKind::QtLocal:
             m_localHost = std::make_unique<LocalTransportHost>();
             m_localHost->publishObject(m_name, m_proxy.get());
-            break;
-        case TransportKind::Plain:
-            m_plainHost->publishObject(m_name, m_proxy.get());
             break;
         case TransportKind::QtRemotePlain:
             m_plainLocalHost = std::make_unique<logos::qt_remote_plain::QtRemotePlainTransportHost>(
@@ -256,7 +205,6 @@ public:
         switch (m_transport) {
         case TransportKind::QtRemote: m_remoteHost.reset(); break;
         case TransportKind::QtLocal:  m_localHost->unpublishObject(m_name); m_localHost.reset(); break;
-        case TransportKind::Plain:    m_plainHost->unpublishObject(m_name); break;
         case TransportKind::QtRemotePlain: m_plainLocalHost.reset(); break;
         }
         m_up = false;
@@ -280,29 +228,21 @@ public:
         else      m_universal->stdEmitFn(ev.toStdString(), "[" + std::to_string(payload) + "]");
     }
 
-    // The transport config a consumer needs to reach this module. Empty (the
-    // process default) for everything but plain, whose port is ephemeral.
+    // The transport config a consumer needs to reach this module: the process
+    // default, except qt_remote_plain.
     LogosTransportConfig clientConfig() const
     {
         LogosTransportConfig cfg;
-        if (m_transport == TransportKind::Plain) {
-            cfg.protocol = LogosProtocol::Tcp;
-            cfg.host = "127.0.0.1";
-            cfg.port = m_port;
-        } else if (m_transport == TransportKind::QtRemotePlain) {
-            cfg.protocol = LogosProtocol::QtRemotePlain;
-        }
+        if (m_transport == TransportKind::QtRemotePlain) cfg.protocol = LogosProtocol::QtRemotePlain;
         return cfg;
     }
 
-    // The same thing in the JSON form lp_client_create takes; nullptr means
-    // "process default", which is right for everything but plain.
+    // The same thing in the JSON form lp_client_create takes; empty means
+    // "process default".
     std::string lpEndpoint() const
     {
         if (m_transport == TransportKind::QtRemotePlain) return "{\"protocol\":\"qt_remote_plain\"}";
-        if (m_transport != TransportKind::Plain) return std::string();
-        return "{\"protocol\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":"
-             + std::to_string(m_port) + "}";
+        return std::string();
     }
 
     const QString& name() const { return m_name; }
@@ -318,10 +258,7 @@ private:
 
     std::unique_ptr<RemoteTransportHost> m_remoteHost;
     std::unique_ptr<LocalTransportHost> m_localHost;
-    std::unique_ptr<logos::plain::PlainTransportHost> m_plainHost;
     std::unique_ptr<logos::qt_remote_plain::QtRemotePlainTransportHost> m_plainLocalHost;
-    bool m_plainStarted = false;
-    uint16_t m_port = 0;
 };
 
 // Re-fire on a cadence rather than once. NO transport here buffers events, so a
@@ -419,7 +356,6 @@ protected:
 TEST_P(EventDeliveryMatrix, PublishThenSubscribe_Delivers)
 {
     Module mod = makeModule("ctl");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -453,7 +389,6 @@ TEST_P(EventDeliveryMatrix, PublishThenSubscribe_Delivers)
 TEST_P(EventDeliveryMatrix, SubscribeThenPublish_Delivers)
 {
     Module mod = makeModule("late");
-    ASSERT_TRUE(mod.hostReady());
     // NOT brought up yet.
 
     auto client = makeClient(mod);
@@ -484,7 +419,6 @@ TEST_P(EventDeliveryMatrix, SubscribeThenPublish_Delivers)
 TEST_P(EventDeliveryMatrix, LpSubscribe_PublishThenSubscribe_Control)
 {
     Module mod = makeModule("lpctl");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     lp_client* client = makeLpClient(mod);
@@ -506,7 +440,6 @@ TEST_P(EventDeliveryMatrix, LpSubscribe_PublishThenSubscribe_Control)
 TEST_P(EventDeliveryMatrix, LpSubscribe_SubscribeThenPublish_Delivers)
 {
     Module mod = makeModule("lplate");
-    ASSERT_TRUE(mod.hostReady());
 
     lp_client* client = makeLpClient(mod);
     ASSERT_NE(client, nullptr);
@@ -536,7 +469,6 @@ TEST_P(EventDeliveryMatrix, LpSubscribe_SubscribeThenPublish_Delivers)
 TEST_P(EventDeliveryMatrix, SubscriptionSurvivesUnloadAndReload)
 {
     Module mod = makeModule("reload");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -578,7 +510,6 @@ TEST_P(EventDeliveryMatrix, SubscriptionSurvivesUnloadAndReload)
 TEST_P(EventDeliveryMatrix, CancelWhilePending_LeavesTheRegistry)
 {
     Module mod = makeModule("cancel");
-    ASSERT_TRUE(mod.hostReady());
     // Never brought up: the subscription stays pending.
 
     auto client = makeClient(mod);
@@ -586,15 +517,12 @@ TEST_P(EventDeliveryMatrix, CancelWhilePending_LeavesTheRegistry)
     const quint64 id = client->onEventWhenAvailable(mod.name(), QStringLiteral("ev"),
         [&](const QString&, const QVariantList&) { got.fetch_add(1); });
     ASSERT_NE(id, 0u);
-    // Control: it has to be TRACKED for un-tracking it to mean anything. Which
-    // of the two live states it is in is a property of the transport, pinned
-    // here so a change to it is a test failure rather than a surprise.
-    const LogosSubscriptionState expected = defersWhenModuleAbsent(GetParam().transport)
-                                                ? LogosSubscriptionState::Pending
-                                                : LogosSubscriptionState::Armed;
+    // Control: it has to be TRACKED for un-tracking it to mean anything. On
+    // every transport here a subscription to an absent module waits, pending,
+    // for the module to appear.
+    const LogosSubscriptionState expected = LogosSubscriptionState::Pending;
     ASSERT_EQ(client->eventSubscriptionState(id), expected);
-    ASSERT_EQ(client->pendingEventSubscriptions().isEmpty(),
-              expected == LogosSubscriptionState::Armed);
+    ASSERT_FALSE(client->pendingEventSubscriptions().isEmpty());
 
     EXPECT_TRUE(client->cancelEventSubscription(id));
     EXPECT_EQ(client->eventSubscriptionState(id), LogosSubscriptionState::Unknown);
@@ -607,7 +535,6 @@ TEST_P(EventDeliveryMatrix, CancelWhilePending_LeavesTheRegistry)
 TEST_P(EventDeliveryMatrix, LpUnsubscribeWhilePending_LeavesTheRegistry)
 {
     Module mod = makeModule("lpcancel");
-    ASSERT_TRUE(mod.hostReady());
 
     lp_client* client = makeLpClient(mod);
     ASSERT_NE(client, nullptr);
@@ -622,10 +549,7 @@ TEST_P(EventDeliveryMatrix, LpUnsubscribeWhilePending_LeavesTheRegistry)
     // pending subscription. That visibility is the point — it did not exist
     // before, which is why a subscription that silently never armed was
     // undetectable from Rust, Nim or a universal C++ module.
-    const std::string expectedPending =
-        defersWhenModuleAbsent(GetParam().transport)
-            ? "[\"" + mod.name().toStdString() + "::ev\"]"
-            : "[]";
+    const std::string expectedPending = "[\"" + mod.name().toStdString() + "::ev\"]";
     EXPECT_EQ(lpPending(client), expectedPending);
 
     lp_unsubscribe(sub);
@@ -641,8 +565,7 @@ TEST_P(EventDeliveryMatrix, LpUnsubscribeWhilePending_LeavesTheRegistry)
 
     // The ABI's own promise, and the half that IS observable on every transport
     // including the ones that armed immediately: bring the module up, fire
-    // repeatedly, and the cancelled callback must stay silent. Without this the
-    // plain leg above asserts "[] before, [] after" and proves nothing.
+    // repeatedly, and the cancelled callback must stay silent.
     mod.bringUp();
     ASSERT_TRUE(pumpUntil([&] { return mod.canEmit(); }, 5000));
     for (int i = 0; i < 20; ++i) { mod.emitEvent(QStringLiteral("ev"), 9); pump(25); }
@@ -661,7 +584,6 @@ TEST_P(EventDeliveryMatrix, LpUnsubscribeWhilePending_LeavesTheRegistry)
 TEST_P(EventDeliveryMatrix, ReconnectReArmsAnArmedSubscription)
 {
     Module mod = makeModule("recon");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -699,7 +621,6 @@ TEST_P(EventDeliveryMatrix, ReconnectReArmsAnArmedSubscription)
 TEST_P(EventDeliveryMatrix, ReconnectWhileModuleIsDown_StillReArmsWhenItReturns)
 {
     Module mod = makeModule("recondown");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -746,7 +667,6 @@ TEST_P(EventDeliveryMatrix, ReconnectWhileModuleIsDown_StillReArmsWhenItReturns)
 TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
 {
     Module mod = makeModule("aftercall");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -755,12 +675,9 @@ TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
     // the module, which is the state the regression needs (on qt_remote it is
     // what drives the node's replica for this object to Valid).
     //
-    // ASYNC deliberately. A synchronous call would deadlock on the plain
-    // transport in this harness: PlainTransportHost::onCall dispatches to the
-    // ModuleProxy's thread, which here is the calling thread, so the call would
-    // sit until its timeout waiting for an event loop it is itself blocking.
-    // That is a property of the fixture, not of the product — the plain suite's
-    // own LiveHost puts the proxy on a worker thread for the same reason.
+    // ASYNC deliberately: the ModuleProxy's thread here is the calling thread,
+    // so a synchronous call could sit until its timeout waiting for an event loop
+    // it is itself blocking. A property of the fixture, not of the product.
     std::atomic<int> called{0};
     client->invokeRemoteMethodAsync(mod.name(), QStringLiteral("echo"), QVariantList() << 5,
         LogosAPIClient::AsyncResultCallback([&](QVariant) { called.fetch_add(1); }));
@@ -775,23 +692,15 @@ TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
         [&](const QString&, const QVariantList&) { got.fetch_add(1); });
     ASSERT_NE(id, 0u);
 
-    if (subscriptionIsLocallyRegistered(GetParam().transport)) {
-        // Fire ONCE, right now, without returning to the event loop first.
-        // Re-firing would hide exactly the gap under test.
-        mod.emitEvent(QStringLiteral("ev"), 1);
-        pump(500);
-        EXPECT_GE(got.load(), 1)
-            << "an event emitted immediately after subscribing to an ALREADY-REACHABLE "
-               "module was dropped: the subscription had not armed yet. A consumer that "
-               "calls a module and then subscribes is the common shape, and it used to "
-               "arm synchronously.";
-    } else {
-        // plain: the subscribe frame has to reach the host first, so instant
-        // delivery was never on offer. What must hold is that it arms shortly
-        // and delivers -- i.e. the deferral did not break it.
-        EXPECT_TRUE(fireUntilDelivered(mod, QStringLiteral("ev"), 1, got, 10000))
-            << "subscribing right after a call never armed at all on this transport";
-    }
+    // Fire ONCE, right now, without returning to the event loop first.
+    // Re-firing would hide exactly the gap under test.
+    mod.emitEvent(QStringLiteral("ev"), 1);
+    pump(500);
+    EXPECT_GE(got.load(), 1)
+        << "an event emitted immediately after subscribing to an ALREADY-REACHABLE "
+           "module was dropped: the subscription had not armed yet. A consumer that "
+           "calls a module and then subscribes is the common shape, and it used to "
+           "arm synchronously.";
 }
 
 // ── readiness, the call-path counterpart ─────────────────────────────────────
@@ -804,7 +713,6 @@ TEST_P(EventDeliveryMatrix, SubscribeRightAfterACall_DeliversImmediately)
 TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAlreadyUp_FiresTrue)
 {
     Module mod = makeModule("rdyctl");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -823,7 +731,6 @@ TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAlreadyUp_FiresTrue)
 TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAppearsLater_FiresExactlyOnce)
 {
     Module mod = makeModule("rdylate");
-    ASSERT_TRUE(mod.hostReady());
     // NOT brought up.
 
     auto client = makeClient(mod);
@@ -834,11 +741,9 @@ TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAppearsLater_FiresExactlyO
         fired.fetch_add(1);
     }), 0u);
 
-    if (defersWhenModuleAbsent(GetParam().transport)) {
-        pump(300);
-        EXPECT_EQ(fired.load(), 0) << "answered 'not reachable' for a module that is "
-                                      "merely not up YET -- that is the defect, not the answer";
-    }
+    pump(300);
+    EXPECT_EQ(fired.load(), 0) << "answered 'not reachable' for a module that is "
+                                  "merely not up YET -- that is the defect, not the answer";
 
     mod.bringUp();
     ASSERT_TRUE(pumpUntil([&] { return fired.load() > 0; }, 10000))
@@ -857,7 +762,6 @@ TEST_P(EventDeliveryMatrix, WhenObjectAvailable_ModuleAppearsLater_FiresExactlyO
 TEST_P(EventDeliveryMatrix, WhenObjectAvailable_NotReArmedOnReconnect)
 {
     Module mod = makeModule("rdyrecon");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -884,7 +788,6 @@ TEST_P(EventDeliveryMatrix, WhenObjectAvailable_NotReArmedOnReconnect)
 TEST_P(EventDeliveryMatrix, ReservedEvent_NamedSubscriptionIsRefused)
 {
     Module mod = makeModule("resvname");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -913,7 +816,6 @@ TEST_P(EventDeliveryMatrix, ReservedEvent_NamedSubscriptionIsRefused)
 TEST_P(EventDeliveryMatrix, ReservedEvent_WildcardDoesNotCarryIt)
 {
     Module mod = makeModule("resvwild");
-    ASSERT_TRUE(mod.hostReady());
     mod.bringUp();
 
     auto client = makeClient(mod);
@@ -941,8 +843,6 @@ INSTANTIATE_TEST_SUITE_P(
         MatrixCase{TransportKind::QtRemote, ProviderKind::Universal},
         MatrixCase{TransportKind::QtLocal,  ProviderKind::Qt},
         MatrixCase{TransportKind::QtLocal,  ProviderKind::Universal},
-        MatrixCase{TransportKind::Plain,    ProviderKind::Qt},
-        MatrixCase{TransportKind::Plain,    ProviderKind::Universal},
         MatrixCase{TransportKind::QtRemotePlain, ProviderKind::Qt},
         MatrixCase{TransportKind::QtRemotePlain, ProviderKind::Universal}),
     [](const ::testing::TestParamInfo<MatrixCase>& i) {

@@ -12,7 +12,7 @@ in
   pname = "logos-protocol";
   inherit isWindows;
   # Tracks LOGOS_PROTOCOL_VERSION_STRING in cpp/logos_protocol.h.
-  version = "0.14.0";
+  version = "0.15.0";
 
   # Common native build inputs
   nativeBuildInputs = [
@@ -27,8 +27,8 @@ in
   buildInputs = [
     pkgs.qt6.qtbase
     pkgs.qt6.qtremoteobjects
-    pkgs.boost                # Boost.Asio for plain-C++ TCP transports
-    pkgs.openssl              # TLS for TcpSsl
+    pkgs.boost                # Boost.Asio for the plain runtime's sockets
+    pkgs.openssl              # TLS for tls_tcp sessions
     pkgs.nlohmann_json        # JSON data model of the C ABI + wire codec
   ];
 

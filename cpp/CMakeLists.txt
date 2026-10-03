@@ -48,7 +48,6 @@ set(LOGOS_PLAIN_NETWORK_SOURCES
     implementations/plain/json_codec.cpp
     implementations/plain/cbor_codec.cpp
     implementations/plain/rpc_framing.cpp
-    implementations/plain/rpc_server.cpp
     implementations/plain/io_context_pool.cpp
 )
 
@@ -316,18 +315,10 @@ set(PROTOCOL_SOURCES
     implementations/plain/rpc_framing.cpp
     implementations/plain/incoming_call_handler.h
     implementations/plain/rpc_connection.h
-    implementations/plain/rpc_server.h
-    implementations/plain/rpc_server.cpp
     implementations/plain/io_context_pool.h
     implementations/plain/io_context_pool.cpp
     implementations/plain/qvariant_rpc_value.h
     implementations/plain/qvariant_rpc_value.cpp
-    implementations/plain/plain_logos_object.h
-    implementations/plain/plain_logos_object.cpp
-    implementations/plain/plain_transport_host.h
-    implementations/plain/plain_transport_host.cpp
-    implementations/plain/plain_transport_connection.h
-    implementations/plain/plain_transport_connection.cpp
 )
 
 add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
@@ -337,7 +328,7 @@ add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
 # in libboost_system — see the matching note in logos-cpp-sdk.
 # Boost.Asio's IOCP backend calls the Winsock EXTENSION functions AcceptEx and
 # GetAcceptExSockaddrs, which live in mswsock rather than ws2_32. Without this
-# the plain TCP transport compiles cleanly and then fails at link with
+# the tls_tcp listener compiles cleanly and then fails at link with
 # "undefined reference to `AcceptEx'" out of
 # win_iocp_socket_service_base::start_accept_op. ws2_32 supplies core Winsock
 # and is listed explicitly rather than relied upon arriving via Qt::Network.
@@ -543,7 +534,7 @@ configure_package_config_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/logos-protocolConfigVersion.cmake"
-    VERSION 0.14.0
+    VERSION 0.15.0
     COMPATIBILITY SameMajorVersion
 )
 install(FILES

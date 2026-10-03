@@ -4,18 +4,14 @@
 // uses (a universal `type: ui_qml` backend running in the out-of-process
 // ui-host subscribes to a dependency module's typed events via
 // modules().<dep>.on<Event>(...), which lands on RemoteLogosObject::onEvent).
-// Method calls over this transport are exercised throughout, but typed event
-// delivery was only ever covered over the plain/TCP transport
-// (test_plain_transport_tcp.cpp, currently #if 0) and the mock transport —
-// never over qt_remote. This test closes that gap and reproduces the reported
-// bug "UI plugins cannot subscribe to module events".
+// Method calls over this transport are exercised throughout; this test covers
+// typed event delivery over qt_remote, and reproduces the reported bug "UI
+// plugins cannot subscribe to module events".
 //
-// Unlike the plain transport (whose in-process fixture deadlocks because
-// callMethod blocks on a std::future while the provider's queued dispatch
-// needs the same event loop), the pure-event qt_remote path has no blocking
-// future: requestObject()'s waitForSource() pumps its own nested event loop,
-// and onEvent() is a local signal-connect onto the replica. So we can drive
-// host + consumer on one event loop in-process.
+// The pure-event qt_remote path has no blocking future: requestObject()'s
+// waitForSource() pumps its own nested event loop, and onEvent() is a local
+// signal-connect onto the replica. So we can drive host + consumer on one event
+// loop in-process.
 
 #include <gtest/gtest.h>
 
