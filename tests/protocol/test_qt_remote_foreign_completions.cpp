@@ -63,6 +63,9 @@ private:
     QObject m_timers;
 };
 
+// Each deferred call arms a timeout of this length on its replica.
+constexpr int kCallTimeoutMs = 1000;
+
 void pump(int ms) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     while (std::chrono::steady_clock::now() < end) {
@@ -81,7 +84,7 @@ QVariant callAndWait(LogosAPIConsumer& consumer, const QString& value) {
             got = std::move(v);
             delivered.fetch_add(1);
         },
-        Timeout(3000));
+        Timeout(kCallTimeoutMs));
     for (int i = 0; i < 60 && delivered.load() == 0; ++i) pump(50);
     return got;
 }
@@ -112,4 +115,8 @@ TEST(QtRemoteForeignCompletions, AnotherReplicasCompletionIsNotHandedToTheNextCa
     pump(100);
 
     EXPECT_EQ(callAndWait(a, QStringLiteral("a-2")).toString(), QStringLiteral("a-2"));
+
+    // Let those timeouts fire while the consumers still exist: one that outlives
+    // its object touches freed memory, which crashed a later test in this process.
+    pump(kCallTimeoutMs + 300);
 }
