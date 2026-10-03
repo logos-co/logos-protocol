@@ -66,7 +66,10 @@ bool RpcServerTcp::start()
     // first one is armed below — and callers must not overlap start() with
     // stop() (PlainTransportHost holds its own mutex across both).
     m_acceptor.open(ep.protocol(), ec);       if (ec) return false;
+#ifndef _WIN32
+    // Rebinding past TIME_WAIT. On Windows it would let a second listener share the port.
     m_acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
+#endif
     m_acceptor.bind(ep, ec);                  if (ec) return false;
     m_acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
     if (ec) return false;
@@ -216,7 +219,10 @@ bool RpcServerSsl::start()
     if (ec) return false;
 
     m_acceptor.open(ep.protocol(), ec);       if (ec) return false;
+#ifndef _WIN32
+    // Rebinding past TIME_WAIT. On Windows it would let a second listener share the port.
     m_acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
+#endif
     m_acceptor.bind(ep, ec);                  if (ec) return false;
     m_acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
     if (ec) return false;

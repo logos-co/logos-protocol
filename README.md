@@ -21,9 +21,13 @@ versioned boundary instead of re-wrapping the C++/Qt SDK.
   `lp_protocol_abi_major()`). JSON-in-strings data model; bytes cross the
   boundary as `{"_bytes":"<base64url>"}` (lossless, NUL-safe).
 - **Transports** — plain TCP / TCP+TLS (Boost.Asio + OpenSSL + nlohmann,
-  Qt-free), `qt_local`, in-memory mock, Qt Remote Objects (`qt_remote`), and
+  Qt-free), `qt_local`, in-memory mock, Qt Remote Objects (`qt_remote`),
   `qt_remote_plain`, a Qt-free implementation of the QtRO 2.0 wire profile used
-  by Logos modules.
+  by Logos modules, `inproc` for a provider in the same process, and `tls_tcp`,
+  a session between runtimes: mutual TLS 1.3 against trust anchors the embedder
+  supplies, a Hello the provider's authenticator turns into the caller, and no
+  per-call tokens (`lp_provider_set_tls_credential` and the other session
+  functions in `logos_protocol.h`; plain runtime only).
 - **Consumer core** — `LogosAPIClient` / `LogosAPIConsumer` including the
   automatic `capability_module.requestModule` token-fetch flow (behind the
   protocol boundary: every language gets it for free).

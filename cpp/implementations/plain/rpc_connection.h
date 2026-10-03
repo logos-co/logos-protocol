@@ -14,12 +14,14 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/error_code.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -222,6 +224,19 @@ public:
         return m_nextId.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Session settings, set before start(): the negotiated frame limit, and a
+    // Ping every `interval` with the connection dropped after `timeout` of silence.
+    void setMaxFrameLength(uint32_t limit)
+    {
+        m_maxFrame = limit;
+        m_reader.setLimit(limit);
+    }
+    void enableKeepalive(std::chrono::milliseconds interval, std::chrono::milliseconds timeout)
+    {
+        m_keepaliveInterval = interval;
+        m_keepaliveTimeout = timeout;
+    }
+
     // A stopping server's side: calls arriving from now on are not started.
     void beginDrain() { m_draining.store(true); }
     // Every call it started has answered and every frame it queued is written.
@@ -234,6 +249,11 @@ private:
     void writeFrame(std::vector<uint8_t> frame);
     void doWrite();
     void fail(const std::string& reason);
+    void armKeepalive();
+    static std::int64_t nowTicks()
+    {
+        return std::chrono::steady_clock::now().time_since_epoch().count();
+    }
 
     // Close the socket. MUST run on m_strand — see closeStreamOnStrand().
     void closeStream();
@@ -279,6 +299,13 @@ private:
     std::atomic<bool>                            m_draining{false};
     std::atomic<std::size_t>                     m_callsRunning{0};
     std::atomic<std::size_t>                     m_framesUnwritten{0};
+
+    uint32_t                                     m_maxFrame = kMaxFrameLength;
+    std::chrono::milliseconds                    m_keepaliveInterval{0};
+    std::chrono::milliseconds                    m_keepaliveTimeout{0};
+    // Touched only on m_strand.
+    std::unique_ptr<boost::asio::steady_timer>   m_keepaliveTimer;
+    std::atomic<std::int64_t>                    m_lastRead{0};
 };
 
 // ── Template implementation (must be visible at instantiation sites) ─────
@@ -300,8 +327,35 @@ void RpcConnection<Stream>::start()
 {
     bool expected = false;
     if (!m_started.compare_exchange_strong(expected, true)) return;
+    m_lastRead.store(nowTicks());
     auto self = this->shared_from_this();
-    boost::asio::post(m_strand, [self] { self->doRead(); });
+    boost::asio::post(m_strand, [self] {
+        self->doRead();
+        self->armKeepalive();
+    });
+}
+
+// Runs on m_strand. A Ping goes out every interval whatever else is written, and
+// a peer silent for longer than the timeout is dropped: a half-open TCP
+// connection is otherwise never noticed.
+template <typename Stream>
+void RpcConnection<Stream>::armKeepalive()
+{
+    if (m_keepaliveInterval.count() <= 0 || m_stopped.load()) return;
+    if (!m_keepaliveTimer) m_keepaliveTimer = std::make_unique<boost::asio::steady_timer>(m_strand);
+    auto self = this->shared_from_this();
+    m_keepaliveTimer->expires_after(m_keepaliveInterval);
+    m_keepaliveTimer->async_wait(boost::asio::bind_executor(m_strand,
+        [self](const boost::system::error_code& ec) {
+            if (ec || self->m_stopped.load()) return;
+            const auto silent = std::chrono::steady_clock::duration(nowTicks() - self->m_lastRead.load());
+            if (silent > self->m_keepaliveTimeout) {
+                self->fail("keepalive timeout");
+                return;
+            }
+            self->writeFrame(encodeFrame(MessageType::Ping, {}, self->m_maxFrame));
+            self->armKeepalive();
+        }));
 }
 
 template <typename Stream>
@@ -326,11 +380,18 @@ void RpcConnection<Stream>::doRead()
                 // dispatched into an IncomingCallHandler its owner may already
                 // have torn down. The connection is dead either way — drop it.
                 if (self->m_stopped.load()) return;
+                self->m_lastRead.store(nowTicks());
                 try {
                     self->m_reader.append(self->m_readBuf.data(), n);
                     MessageType tag;
                     std::vector<uint8_t> payload;
                     while (self->m_reader.next(tag, payload)) {
+                        // Keepalive frames never reach the codec.
+                        if (tag == MessageType::Ping) {
+                            self->writeFrame(encodeFrame(MessageType::Pong, {}, self->m_maxFrame));
+                            continue;
+                        }
+                        if (tag == MessageType::Pong) continue;
                         self->handleFrame(tag, std::move(payload));
                     }
                 } catch (const std::exception& e) {
@@ -424,19 +485,42 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
             auto self = this->shared_from_this();
             m_callsRunning.fetch_add(1);
             m_handler->onCall(m, [self](ResultMessage res) {
+                // A result over the connection's frame limit is answered as a
+                // failure, not dropped: the caller would otherwise wait out its deadline.
+                const uint64_t id = res.id;
+                std::vector<uint8_t> frame;
+                try {
+                    frame = encodeFrame(*self->m_codec, AnyMessage{std::move(res)}, self->m_maxFrame);
+                } catch (const std::exception& e) {
+                    ResultMessage failure;
+                    failure.id = id;
+                    failure.err = std::string("the result could not be sent: ") + e.what();
+                    failure.errCode = "METHOD_FAILED";
+                    frame = encodeFrame(*self->m_codec, AnyMessage{std::move(failure)}, self->m_maxFrame);
+                }
                 // Queue the reply before the count drops, so drained() can't miss it.
-                self->writeFrame(encodeFrame(*self->m_codec, AnyMessage{std::move(res)}));
+                self->writeFrame(std::move(frame));
                 self->m_callsRunning.fetch_sub(1);
-            });
+            }, static_cast<const void*>(this));
 
         } else if constexpr (std::is_same_v<T, MethodsMessage>) {
             if (!m_handler || m_draining.load()) return;
             auto self = this->shared_from_this();
             m_callsRunning.fetch_add(1);
             m_handler->onMethods(m, [self](MethodsResultMessage res) {
-                self->writeFrame(encodeFrame(*self->m_codec, AnyMessage{std::move(res)}));
+                const uint64_t id = res.id;
+                std::vector<uint8_t> frame;
+                try {
+                    frame = encodeFrame(*self->m_codec, AnyMessage{std::move(res)}, self->m_maxFrame);
+                } catch (const std::exception& e) {
+                    MethodsResultMessage failure;
+                    failure.id = id;
+                    failure.err = std::string("the methods could not be sent: ") + e.what();
+                    frame = encodeFrame(*self->m_codec, AnyMessage{std::move(failure)}, self->m_maxFrame);
+                }
+                self->writeFrame(std::move(frame));
                 self->m_callsRunning.fetch_sub(1);
-            });
+            }, static_cast<const void*>(this));
 
         } else if constexpr (std::is_same_v<T, SubscribeMessage>) {
             if (!m_handler) return;
@@ -455,7 +539,7 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                 m_handler->onUnsubscribe(m, static_cast<const void*>(this));
 
         } else if constexpr (std::is_same_v<T, TokenMessage>) {
-            if (m_handler) m_handler->onToken(m);
+            if (m_handler) m_handler->onToken(m, static_cast<const void*>(this));
         }
     }, std::move(msg));
 }
@@ -561,6 +645,25 @@ void RpcConnection<Stream>::sendCallAsync(CallMessage msg, ResultHandler handler
 {
     if (!handler) return;
     const uint64_t id = msg.id;
+    // Encoded before anything is registered: a call that cannot be sent is
+    // answered at once and never enters the pending map.
+    std::vector<uint8_t> frame;
+    try {
+        frame = encodeFrame(*m_codec, AnyMessage{std::move(msg)}, m_maxFrame);
+    } catch (const FramingError&) {
+        ResultMessage r;
+        r.id = id; r.ok = false;
+        r.err = "the call exceeds the connection's frame limit"; r.errCode = "PAYLOAD_TOO_LARGE";
+        handler(std::move(r));
+        return;
+    } catch (const std::exception& e) {
+        ResultMessage r;
+        r.id = id; r.ok = false;
+        r.err = std::string("the call could not be encoded: ") + e.what();
+        r.errCode = "INVALID_ARGUMENT";
+        handler(std::move(r));
+        return;
+    }
     {
         std::lock_guard<std::mutex> g(m_mu);
         m_pendingCalls[id] = std::move(handler);
@@ -596,7 +699,7 @@ void RpcConnection<Stream>::sendCallAsync(CallMessage msg, ResultHandler handler
         return;
     }
 
-    writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
+    writeFrame(std::move(frame));
 }
 
 // The same register-then-re-check as sendCallAsync, for the same reason and
@@ -642,7 +745,7 @@ RpcConnection<Stream>::sendMethods(MethodsMessage msg)
         return f;
     }
 
-    writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
+    writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}, m_maxFrame));
     return f;
 }
 
@@ -716,10 +819,18 @@ void RpcConnection<Stream>::sendUnsubscribe(SubscriptionId id)
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
 }
 
+// An event over the frame limit is dropped for this subscriber only; it must
+// not stop the emitter from reaching the others.
 template <typename Stream>
 void RpcConnection<Stream>::sendEvent(EventMessage msg)
 {
-    writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
+    std::vector<uint8_t> frame;
+    try {
+        frame = encodeFrame(*m_codec, AnyMessage{std::move(msg)}, m_maxFrame);
+    } catch (const std::exception&) {
+        return;
+    }
+    writeFrame(std::move(frame));
 }
 
 template <typename Stream>
@@ -773,6 +884,7 @@ void RpcConnection<Stream>::doWrite()
 template <typename Stream>
 void RpcConnection<Stream>::closeStream()
 {
+    if (m_keepaliveTimer) m_keepaliveTimer->cancel();
     boost::system::error_code ignore;
     try {
         // lowest_layer() works for plain asio::ip::tcp::socket (returns

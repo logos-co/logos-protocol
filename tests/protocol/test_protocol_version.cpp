@@ -94,3 +94,24 @@ TEST(ProtocolVersion, TheInProcessWaveHasFeatureMacros)
     FAIL() << "an addition of the 0.13 wave has no feature macro";
 #endif
 }
+
+// And those of 0.14.
+TEST(ProtocolVersion, TheSessionWaveHasFeatureMacros)
+{
+#if defined(LOGOS_PROTOCOL_HAS_REMOTE_SESSIONS)
+    const void* symbols[] = {reinterpret_cast<const void*>(&lp_provider_set_tls_credential),
+                             reinterpret_cast<const void*>(&lp_provider_set_trust_anchors),
+                             reinterpret_cast<const void*>(&lp_provider_set_session_authenticator),
+                             reinterpret_cast<const void*>(&lp_provider_set_session_options),
+                             reinterpret_cast<const void*>(&lp_provider_endpoints_json),
+                             reinterpret_cast<const void*>(&lp_provider_close_sessions),
+                             reinterpret_cast<const void*>(&lp_provider_extend_sessions),
+                             reinterpret_cast<const void*>(&lp_provider_add_endpoint),
+                             reinterpret_cast<const void*>(&lp_client_set_tls_credential),
+                             reinterpret_cast<const void*>(&lp_client_set_session_hook)};
+    for (const void* symbol : symbols) EXPECT_NE(symbol, nullptr);
+    EXPECT_GE(LOGOS_PROTOCOL_VERSION_MINOR, 14);
+#else
+    FAIL() << "an addition of the 0.14 wave has no feature macro";
+#endif
+}

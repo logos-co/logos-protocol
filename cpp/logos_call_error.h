@@ -93,6 +93,11 @@ inline CallError callErrorFromWire(const std::string& origin,
         return callErrorTransport(origin, detail);
     // A bound in-process connection presented another caller's token.
     if (wireCode == "BINDING_MISMATCH") return {"unauthorized", detail, origin};
+    // A session refused the call: a token message, or no session on the connection.
+    if (wireCode == "UNAUTHORIZED") return {"unauthorized", detail, origin};
+    // The caller's own arguments cannot be sent: over the frame limit, or unencodable.
+    if (wireCode == "PAYLOAD_TOO_LARGE" || wireCode == "INVALID_ARGUMENT")
+        return {"invalid_arg", detail, origin};
     return callErrorCallFailed(origin, detail);
 }
 

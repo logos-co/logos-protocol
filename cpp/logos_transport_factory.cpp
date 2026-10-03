@@ -22,7 +22,7 @@ LogosProtocol resolve(LogosProtocol protocol)
 {
 #ifdef _WIN32
     if (protocol != LogosProtocol::Tcp && protocol != LogosProtocol::TcpSsl
-        && protocol != LogosProtocol::Inproc)
+        && protocol != LogosProtocol::Inproc && protocol != LogosProtocol::TlsTcp)
         return LogosProtocol::QtRemotePlain;
 #endif
     return protocol;
@@ -57,6 +57,10 @@ createHost(const LogosTransportConfig& cfg, const QString& registryUrl)
     case LogosProtocol::Inproc:
         // Served by the plain runtime only; never another transport in its place.
         qCritical() << "LogosTransportFactory: the Qt runtime cannot serve inproc";
+        return nullptr;
+    case LogosProtocol::TlsTcp:
+        // Sessions between runtimes: the plain runtime only.
+        qCritical() << "LogosTransportFactory: the Qt runtime cannot serve tls_tcp";
         return nullptr;
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl: {
@@ -93,8 +97,9 @@ createConnection(const LogosTransportConfig& cfg, const QString& registryUrl)
         return std::make_unique<logos::qt_remote_plain::QtRemotePlainTransportConnection>(registryUrl);
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl:
-    // Refuses to connect ("unsupported protocol") rather than fall back to QtRO.
+    // Refuse to connect ("unsupported protocol") rather than fall back to QtRO.
     case LogosProtocol::Inproc:
+    case LogosProtocol::TlsTcp:
         return std::make_unique<logos::plain::PlainTransportConnection>(cfg);
     case LogosProtocol::LocalSocket:
     default:
@@ -125,6 +130,7 @@ bool needsQtEventLoop(const LogosTransportConfig& cfg)
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl:
     case LogosProtocol::Inproc:
+    case LogosProtocol::TlsTcp:
         return false;
     case LogosProtocol::LocalSocket:
     default:
