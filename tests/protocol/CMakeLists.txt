@@ -169,6 +169,9 @@ add_executable(protocol_tests
     # On the same transport, a completion of another replica's call must not be
     # kept for this one: a reloaded "multi" module repeats its call ids.
     test_qt_remote_foreign_completions.cpp
+    # A deferred call still waiting when its object is released is answered
+    # once, as abandoned, and its timeout dies with the object.
+    test_qt_remote_release_deferred.cpp
     # Teardown of a PlainLogosObject with a call still IN FLIGHT. Written when
     # in-flight calls were threads: joining them closed a use-after-free but left
     # release() blocking for the remainder of the call's timeout, so they were

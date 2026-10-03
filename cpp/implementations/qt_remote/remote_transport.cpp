@@ -145,6 +145,18 @@ public:
             m_helper->deleteLater();
             m_helper = nullptr;
         }
+        // A deferred call still waiting for its completion is answered now, once,
+        // on the next event-loop turn: its timeout dies with m_timerScope, and
+        // every other transport answers a released call as abandoned.
+        const std::string origin = m_objectName.toStdString();
+        for (auto it = m_asyncCompletionCbs.cbegin(); it != m_asyncCompletionCbs.cend(); ++it) {
+            AsyncResultErrorCallback cb = it.value();
+            if (!cb) continue;
+            const logos::CallError err = logos::callErrorTransport(
+                origin, "deferred call " + it.key().toStdString() + " to '" + origin
+                        + "' was abandoned: the object was released while it was in flight");
+            QTimer::singleShot(0, [cb, err]() { cb(QVariant(), err); });
+        }
     }
 
     // Adapter over the error-carrying implementation: discards the diagnosis,
@@ -356,7 +368,7 @@ public:
                     pruneCompletions();
                     // Bound the wait: a completion that never lands is a timeout,
                     // reported as one instead of as an empty result.
-                    QTimer::singleShot(timeoutMs, m_helper, [this, callId, origin, method, timeoutMs]() {
+                    QTimer::singleShot(timeoutMs, &m_timerScope, [this, callId, origin, method, timeoutMs]() {
                         if (m_asyncCompletionCbs.contains(callId)) {
                             auto cb = m_asyncCompletionCbs.take(callId);
                             if (cb)
@@ -581,6 +593,9 @@ private:
     // sentinel, so others are buffered only while this is non-zero. Shared so a
     // late timeout never touches a destroyed object.
     std::shared_ptr<int> m_awaitingReply = std::make_shared<int>(0);
+    // Context for timers that use `this`. m_helper is deleted later than this
+    // object (and never, without a running event loop), so it cannot be theirs.
+    QObject m_timerScope;
     QString m_objectName;
     std::shared_ptr<SourceWatchState> m_watch = std::make_shared<SourceWatchState>();
 };
