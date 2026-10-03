@@ -145,10 +145,19 @@ public:
             m_helper->deleteLater();
             m_helper = nullptr;
         }
-        // A deferred call still waiting for its completion is answered now, once,
-        // on the next event-loop turn: its timeout dies with m_timerScope, and
-        // every other transport answers a released call as abandoned.
+        // A call still waiting for its reply or its completion is answered now,
+        // once, on the next event-loop turn: its handlers and timeouts die with
+        // m_timerScope, and every other transport answers a released call as
+        // abandoned.
         const std::string origin = m_objectName.toStdString();
+        for (auto it = m_unanswered.cbegin(); it != m_unanswered.cend(); ++it) {
+            AsyncResultErrorCallback cb = it.value().second;
+            if (!cb) continue;
+            const logos::CallError err = logos::callErrorTransport(
+                origin, "call to '" + origin + "." + it.value().first
+                        + "' was abandoned: the object was released while the call was in flight");
+            QTimer::singleShot(0, [cb, err]() { cb(QVariant(), err); });
+        }
         for (auto it = m_asyncCompletionCbs.cbegin(); it != m_asyncCompletionCbs.cend(); ++it) {
             AsyncResultErrorCallback cb = it.value();
             if (!cb) continue;
@@ -304,7 +313,9 @@ public:
             }
         };
 
-        auto* watcher = new QRemoteObjectPendingCallWatcher(pendingCall);
+        // A child of m_timerScope: released with this object, so neither handler
+        // below can run after it is gone.
+        auto* watcher = new QRemoteObjectPendingCallWatcher(pendingCall, &m_timerScope);
 
         // Timeout timer -- parented to the watcher so it is auto-deleted
         // when the watcher is destroyed, preventing late timeout callbacks.
@@ -326,12 +337,16 @@ public:
                 if (callback)
                     callback(std::move(result), err);
             };
+        // Until its reply arrives; then it is answered or deferred (below).
+        const quint64 serial = ++m_nextCall;
+        m_unanswered.insert(serial, {method, deliverOnce});
 
         // Success handler -- delivers result on the consumer's thread
         QObject::connect(watcher, &QRemoteObjectPendingCallWatcher::finished,
-                         watcher, [this, deliverOnce, timer, timeoutMs, origin, method, delivered, settle](QRemoteObjectPendingCallWatcher* w) {
+                         watcher, [this, deliverOnce, timer, timeoutMs, origin, method, delivered, settle, serial](QRemoteObjectPendingCallWatcher* w) {
             timer->stop(); // cancel timeout
             settle();
+            m_unanswered.remove(serial);
             // Timeout may already have won the race and deleteLater'd us; if
             // the slot still runs, do not enter the deferred-completion path
             // or we would arm a second delivery after the caller already saw
@@ -384,9 +399,10 @@ public:
         }, Qt::QueuedConnection);
 
         // Timeout handler -- stops the watcher and reports the elapsed deadline
-        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, deliverOnce, origin, method, timeoutMs, settle]() {
+        QObject::connect(timer, &QTimer::timeout, watcher, [this, watcher, deliverOnce, origin, method, timeoutMs, settle, serial]() {
             qWarning() << "RemoteLogosObject: async callMethod timed out";
             settle();
+            m_unanswered.remove(serial);
             deliverOnce(QVariant(), logos::callErrorTimeout(origin, method, timeoutMs));
             watcher->deleteLater(); // also destroys the timer (child)
         });
@@ -593,8 +609,11 @@ private:
     // sentinel, so others are buffered only while this is non-zero. Shared so a
     // late timeout never touches a destroyed object.
     std::shared_ptr<int> m_awaitingReply = std::make_shared<int>(0);
-    // Context for timers that use `this`. m_helper is deleted later than this
-    // object (and never, without a running event loop), so it cannot be theirs.
+    // Async calls whose reply has not arrived: method name and their callback.
+    QHash<quint64, std::pair<std::string, AsyncResultErrorCallback>> m_unanswered;
+    quint64 m_nextCall = 0;
+    // Context for timers and watchers that use `this`. m_helper is deleted later
+    // than this object (and never, without a running event loop).
     QObject m_timerScope;
     QString m_objectName;
     std::shared_ptr<SourceWatchState> m_watch = std::make_shared<SourceWatchState>();

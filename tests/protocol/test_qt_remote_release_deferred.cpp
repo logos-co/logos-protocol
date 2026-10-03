@@ -58,24 +58,24 @@ void pump(int ms) {
     }
 }
 
-} // namespace
-
-TEST(QtRemoteReleaseDeferred, AReleasedDeferredCallIsAnsweredOnceAsAbandoned)
+// One deferred call released at `releaseAfterMs`: answered once, as abandoned,
+// well before its own timeout, and nothing after it.
+void expectAnsweredOnceAsAbandoned(const char* module, int releaseAfterMs)
 {
-    ensureApp();
-    const QString registryUrl = LogosInstance::id("qtro_never_completes");
+    const QString name = QString::fromLatin1(module);
+    const QString registryUrl = LogosInstance::id(module);
 
     RemoteTransportHost host(registryUrl);
     NeverCompletesProvider provider;
     ModuleProxy proxy(&provider);
     ASSERT_TRUE(proxy.saveToken(QStringLiteral("origin"), QStringLiteral("tok-1")));
-    ASSERT_TRUE(host.publishObject("qtro_never_completes", &proxy));
+    ASSERT_TRUE(host.publishObject(module, &proxy));
 
     // The object itself, not a LogosAPIConsumer: a consumer drops callbacks
     // once it is gone, which would hide what the transport does.
     RemoteTransportConnection conn(registryUrl);
     ASSERT_TRUE(conn.connectToHost());
-    LogosObject* obj = conn.requestObject(QStringLiteral("qtro_never_completes"), 5000);
+    LogosObject* obj = conn.requestObject(name, 5000);
     ASSERT_NE(obj, nullptr);
     auto* ch = dynamic_cast<LogosObjectErrorChannel*>(obj);
     ASSERT_NE(ch, nullptr);
@@ -83,19 +83,36 @@ TEST(QtRemoteReleaseDeferred, AReleasedDeferredCallIsAnsweredOnceAsAbandoned)
     auto count = std::make_shared<std::atomic<int>>(0);
     auto code = std::make_shared<std::string>();
     ch->callMethodAsyncWithError(
-        QStringLiteral("tok-1"), QStringLiteral("defer"), QVariantList{}, 600,
+        QStringLiteral("tok-1"), QStringLiteral("defer"), QVariantList{}, 3000,
         [count, code](QVariant, const logos::CallError& e) {
             *code = e.code;
             count->fetch_add(1);
         });
-    pump(150);  // the sentinel is back: the call now waits for its completion
+    if (releaseAfterMs > 0) pump(releaseAfterMs);
     ASSERT_EQ(count->load(), 0);
 
     obj->release();
-    pump(100);  // well before the 600 ms timeout
+    pump(200);  // well before the 3 s timeout
     EXPECT_EQ(count->load(), 1) << "the released call was never answered";
     EXPECT_EQ(*code, "transport_error");
 
-    pump(800);  // past the timeout: nothing more, and nothing touches the freed object
+    pump(3300);  // past the timeout: nothing more, and nothing touches the freed object
     EXPECT_EQ(count->load(), 1);
+}
+
+} // namespace
+
+// Released before its reply arrived.
+TEST(QtRemoteReleaseDeferred, ReleasedWhileTheReplyIsInFlight)
+{
+    ensureApp();
+    expectAnsweredOnceAsAbandoned("qtro_released_in_flight", 0);
+}
+
+// Released after the sentinel, while waiting for the completion. Most of the
+// wait goes here, so either stage is covered however fast the reply comes.
+TEST(QtRemoteReleaseDeferred, ReleasedWhileWaitingForTheCompletion)
+{
+    ensureApp();
+    expectAnsweredOnceAsAbandoned("qtro_released_deferred", 1000);
 }
