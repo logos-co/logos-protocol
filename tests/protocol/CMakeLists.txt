@@ -697,3 +697,29 @@ target_link_libraries(transport_resolution_tests PRIVATE
 )
 gtest_discover_tests(transport_resolution_tests)
 endif()
+
+# exit() while a module image keeps a tls_tcp session open through its host's
+# runtime; POSIX only, where exit runs the runtime's statics before threads end.
+if(NOT WIN32)
+add_library(plain_exit_session_image MODULE plain_exit_session_image.cpp)
+target_link_libraries(plain_exit_session_image PRIVATE logos_protocol_plain)
+set_target_properties(plain_exit_session_image PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+if(APPLE)
+    target_link_options(plain_exit_session_image PRIVATE
+        "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/plain_exit_session_image.exports")
+else()
+    target_link_options(plain_exit_session_image PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plain_exit_session_image.map")
+endif()
+add_executable(plain_exit_session_child plain_exit_session_child.cpp)
+target_link_libraries(plain_exit_session_child PRIVATE logos_protocol_plain_shared ${CMAKE_DL_LIBS})
+add_executable(plain_exit_session_tests test_plain_exit_session.cpp)
+target_link_libraries(plain_exit_session_tests PRIVATE GTest::gtest_main)
+target_compile_definitions(plain_exit_session_tests PRIVATE
+    PLAIN_EXIT_SESSION_CHILD="$<TARGET_FILE:plain_exit_session_child>"
+    PLAIN_EXIT_SESSION_IMAGE="$<TARGET_FILE:plain_exit_session_image>")
+add_dependencies(plain_exit_session_tests plain_exit_session_child plain_exit_session_image)
+gtest_discover_tests(plain_exit_session_tests PROPERTIES TIMEOUT 120)
+endif()
