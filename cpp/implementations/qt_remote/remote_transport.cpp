@@ -99,6 +99,11 @@ public:
                     if (data.size() != 2) return;
                     const QString id = data.at(0).toString();
                     const QVariant result = data.at(1);
+                    // Every replica of the module gets every completion. Keep one
+                    // only while a call of ours may be waiting for its sentinel.
+                    if (!m_completionWaiters.contains(id) && !m_asyncCompletionCbs.contains(id)
+                        && *m_awaitingReply == 0)
+                        return;
                     m_completions.insert(id, result);
                     if (QEventLoop* loop = m_completionWaiters.value(id, nullptr))
                         loop->quit();                       // wake a sync waiter
@@ -192,7 +197,9 @@ public:
             return QVariant();
         }
 
+        ++*m_awaitingReply;
         pendingCall.waitForFinished(timeoutMs);
+        --*m_awaitingReply;
 
         // Two distinct outcomes that used to collapse into one empty QVariant:
         // the deadline elapsed with the call still in flight (timeout), and QtRO
@@ -200,6 +207,7 @@ public:
         if (!pendingCall.isFinished()) {
             qWarning() << "RemoteLogosObject: callRemoteMethod timed out";
             if (err) *err = logos::callErrorTimeout(origin, method, timeoutMs);
+            pruneCompletions();
             return QVariant();
         }
         if (pendingCall.error() != QRemoteObjectPendingCall::NoError) {
@@ -209,13 +217,16 @@ public:
                     origin, "QtRO call to '" + origin + "." + method
                             + "' failed with error "
                             + std::to_string(static_cast<int>(pendingCall.error())));
+            pruneCompletions();
             return QVariant();
         }
 
         // A "multi" provider may have deferred the result (returned a pending
         // sentinel); resolveDeferred waits for the completion event, or returns
         // the value unchanged for an ordinary (synchronous) result.
-        return resolveDeferred(pendingCall.returnValue(), timeoutMs, methodName, err);
+        const QVariant rv = resolveDeferred(pendingCall.returnValue(), timeoutMs, methodName, err);
+        pruneCompletions();
+        return rv;
     }
 
     // Adapter over the error-carrying implementation: discards the diagnosis,
@@ -272,6 +283,15 @@ public:
             return;
         }
 
+        // Counted until the reply or the timeout, whichever comes first.
+        ++*m_awaitingReply;
+        auto settle = [awaiting = m_awaitingReply, replied = std::make_shared<bool>(false)]() {
+            if (!*replied) {
+                *replied = true;
+                --*awaiting;
+            }
+        };
+
         auto* watcher = new QRemoteObjectPendingCallWatcher(pendingCall);
 
         // Timeout timer -- parented to the watcher so it is auto-deleted
@@ -297,14 +317,16 @@ public:
 
         // Success handler -- delivers result on the consumer's thread
         QObject::connect(watcher, &QRemoteObjectPendingCallWatcher::finished,
-                         watcher, [this, deliverOnce, timer, timeoutMs, origin, method, delivered](QRemoteObjectPendingCallWatcher* w) {
+                         watcher, [this, deliverOnce, timer, timeoutMs, origin, method, delivered, settle](QRemoteObjectPendingCallWatcher* w) {
             timer->stop(); // cancel timeout
+            settle();
             // Timeout may already have won the race and deleteLater'd us; if
             // the slot still runs, do not enter the deferred-completion path
             // or we would arm a second delivery after the caller already saw
             // a timeout.
             if (delivered->load()) {
                 w->deleteLater();
+                pruneCompletions();
                 return;
             }
             QVariant result;
@@ -325,10 +347,13 @@ public:
                 QString callId;
                 if (logos::isPendingCallSentinel(result, &callId)) {
                     if (m_completions.contains(callId)) {
-                        deliverOnce(m_completions.take(callId), logos::CallError{});
+                        const QVariant done = m_completions.take(callId);
+                        pruneCompletions();
+                        deliverOnce(done, logos::CallError{});
                         return;
                     }
                     m_asyncCompletionCbs.insert(callId, deliverOnce);
+                    pruneCompletions();
                     // Bound the wait: a completion that never lands is a timeout,
                     // reported as one instead of as an empty result.
                     QTimer::singleShot(timeoutMs, m_helper, [this, callId, origin, method, timeoutMs]() {
@@ -342,12 +367,14 @@ public:
                     return;
                 }
             }
+            pruneCompletions();
             deliverOnce(result, err);
         }, Qt::QueuedConnection);
 
         // Timeout handler -- stops the watcher and reports the elapsed deadline
-        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, deliverOnce, origin, method, timeoutMs]() {
+        QObject::connect(timer, &QTimer::timeout, watcher, [watcher, deliverOnce, origin, method, timeoutMs, settle]() {
             qWarning() << "RemoteLogosObject: async callMethod timed out";
+            settle();
             deliverOnce(QVariant(), logos::callErrorTimeout(origin, method, timeoutMs));
             watcher->deleteLater(); // also destroys the timer (child)
         });
@@ -503,6 +530,17 @@ public:
     }
 
 private:
+    // Once no reply of ours is outstanding, only a sync waiter can still claim a
+    // buffered completion: the rest belong to other replicas' calls.
+    void pruneCompletions()
+    {
+        if (*m_awaitingReply > 0) return;
+        for (auto it = m_completions.begin(); it != m_completions.end();) {
+            if (m_completionWaiters.contains(it.key())) ++it;
+            else it = m_completions.erase(it);
+        }
+    }
+
     // Resolve a possibly-deferred result. If `rv` is a pending sentinel from a
     // "multi" provider, wait (up to timeoutMs) for the completion event keyed by
     // callId, pumping the consumer event loop; otherwise return `rv` unchanged.
@@ -539,6 +577,10 @@ private:
     QHash<QString, QVariant> m_completions;
     QHash<QString, QEventLoop*> m_completionWaiters;
     QHash<QString, AsyncResultErrorCallback> m_asyncCompletionCbs;
+    // Calls of ours whose reply has not arrived. A completion can come before its
+    // sentinel, so others are buffered only while this is non-zero. Shared so a
+    // late timeout never touches a destroyed object.
+    std::shared_ptr<int> m_awaitingReply = std::make_shared<int>(0);
     QString m_objectName;
     std::shared_ptr<SourceWatchState> m_watch = std::make_shared<SourceWatchState>();
 };
